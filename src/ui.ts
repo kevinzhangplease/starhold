@@ -369,9 +369,9 @@ export class UI {
     this.killGame();
     this.clearUI();
     audio.stopMusic();
-    const sc = el('div', 'screen title-screen');
+    const sc = el('div', 'screen');
     const logo = el('div', 'title-logo', `<h1>STARHOLD</h1><div class="tag">Hold the line at the edge of a pastel galaxy.</div>${this.save.seen['warmaster'] ? '<div class="warmaster-tag">👑 WARMASTER — every sector held at Ascension V</div>' : ''}`);
-    const play = el('button', 'btn primary', 'Play') as HTMLButtonElement;
+    const play = el('button', 'btn primary play-btn', 'Play') as HTMLButtonElement;
     play.style.fontSize = '22px'; play.style.padding = '14px 52px';
     play.onclick = () => { audio.ensure(); audio.ui('click'); this.showLevelSelect(); };
     const note = el('div', 'tiny-note', 'Ctrl+Shift+D — developer mode');

@@ -161,6 +161,8 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 .btn:active { transform: translateY(2px); box-shadow: 0 1px 0 rgba(5,6,18,0.5); }
 .btn.primary { background: var(--mint); color: #123326; box-shadow: 0 4px 0 #5fae92; }
 .btn.primary:hover { background: #baf0dc; }
+.btn.primary.play-btn { background: #ffffff; color: #123326; box-shadow: 0 4px 0 #c9cce0; }
+.btn.primary.play-btn:hover { background: #f2f2f6; }
 .btn.pink { background: var(--pink); color: #4a1523; box-shadow: 0 4px 0 #c97c92; }
 .btn.subtle { font-size: 14px; padding: 7px 16px; }
 .btn:disabled { opacity: 0.45; cursor: default; transform: none; }
@@ -175,10 +177,6 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
   animation: screen-in 0.35s ease both;
 }
 @keyframes screen-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
-
-.screen.title-screen { background: #ffffff; }
-.screen.title-screen .title-logo .tag { color: #5a5f8a; }
-.screen.title-screen .tiny-note { color: #8388ad; }
 
 .title-logo { text-align: center; }
 .title-logo h1 {
