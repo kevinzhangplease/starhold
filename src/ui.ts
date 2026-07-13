@@ -369,7 +369,7 @@ export class UI {
     this.killGame();
     this.clearUI();
     audio.stopMusic();
-    const sc = el('div', 'screen');
+    const sc = el('div', 'screen title-screen');
     const logo = el('div', 'title-logo', `<h1>STARHOLD</h1><div class="tag">Hold the line at the edge of a pastel galaxy.</div>${this.save.seen['warmaster'] ? '<div class="warmaster-tag">👑 WARMASTER — every sector held at Ascension V</div>' : ''}`);
     const play = el('button', 'btn primary', 'Play') as HTMLButtonElement;
     play.style.fontSize = '22px'; play.style.padding = '14px 52px';
