@@ -1,0 +1,375 @@
+// Run with: node --experimental-strip-types validate.ts
+import { LEVELS } from './src/levels.ts';
+import { ENEMIES, TOWERS, META, UNLOCKS, TUNING, fmt, MUTATORS, MODIFIER_INFO, ZONES, CHALLENGE_POOL } from './src/data.ts';
+import { RESUME_VERSION } from './src/resume.ts';
+import { mulberry32, hashString, seededInt, seededPick } from './src/rng.ts';
+// computeDailyOp itself lives in daily.ts, but daily.ts internally imports from './rng' and
+// './data' WITHOUT extensions (required for the app's own tsc/Vite build — adding extensions
+// there breaks `npm run build`). Node's strict ESM resolver can't follow those extensionless
+// specifiers when executing a .ts file directly, so daily.ts can't be imported transitively
+// here. Instead, this reimplements its (short, stable) orchestration using the SAME real,
+// directly-imported primitives (mulberry32/hashString/seededInt/seededPick/MODIFIER_INFO) —
+// both leaf modules with no internal imports, so they resolve fine — giving full fidelity to
+// the actual production RNG behavior while only duplicating ~10 lines of glue logic.
+function computeDailyOp(dateStr: string, eligibleLevelIds: number[]) {
+  if (eligibleLevelIds.length === 0) return null;
+  const sorted = [...eligibleLevelIds].sort((a, b) => a - b);
+  const rand = mulberry32(hashString(dateStr));
+  const levelId = seededPick(rand, sorted);
+  const modPool = Object.keys(MODIFIER_INFO);
+  const n = seededInt(rand, 1, 2);
+  const pool = [...modPool];
+  const modifiers: string[] = [];
+  while (modifiers.length < n && pool.length) {
+    const idx = seededInt(rand, 0, pool.length - 1);
+    modifiers.push(pool.splice(idx, 1)[0]);
+  }
+  return { dateStr, levelId, modifiers, mutatorBonus: 0.25, difficulty: 3 };
+}
+import { SEEN_UNLOCK_LEVELS, migrateSave, defaultSave } from './src/save.ts';
+
+let errors = 0;
+const err = (m: string) => { console.error('✗ ' + m); errors++; };
+
+// 1. every wave references a real enemy; every path is in-bounds and long enough
+for (const lv of LEVELS) {
+  for (const [wi, wave] of lv.waves.entries()) {
+    for (const grp of wave) {
+      if (!ENEMIES[grp.e]) err(`Level ${lv.id} wave ${wi + 1}: unknown enemy '${grp.e}'`);
+      if (grp.p !== undefined && grp.p >= lv.paths.length) err(`Level ${lv.id} wave ${wi + 1}: path index ${grp.p} out of range`);
+    }
+  }
+  for (const [pi, path] of lv.paths.entries()) {
+    if (path.length < 2) err(`Level ${lv.id} path ${pi}: too few waypoints`);
+    let len = 0;
+    for (let i = 0; i < path.length - 1; i++) {
+      len += Math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]);
+      const [x, y] = path[i];
+      if (i > 0 && (x < -50 || x > 1330 || y < 60 || y > 680)) err(`Level ${lv.id} path ${pi} waypoint ${i} out of playfield: ${x},${y}`);
+    }
+    if (len < 700) err(`Level ${lv.id} path ${pi}: suspiciously short (${Math.round(len)}px)`);
+    if (path[0][0] > 0) err(`Level ${lv.id} path ${pi}: should start off-screen left`);
+    if (path[path.length - 1][0] < 1280) err(`Level ${lv.id} path ${pi}: should end off-screen right`);
+  }
+  if (!lv.waves.length) console.warn(`  (level ${lv.id} has no waves — endless only)`);
+}
+
+// 2. enemy splits/minions reference real enemies
+for (const e of Object.values(ENEMIES)) {
+  if (e.splits && !ENEMIES[e.splits.id]) err(`Enemy ${e.id}: splits into unknown '${e.splits.id}'`);
+  if (e.spawnMinion && !ENEMIES[e.spawnMinion.id]) err(`Enemy ${e.id}: spawns unknown '${e.spawnMinion.id}'`);
+}
+
+// 3. towers: 3 stages + 2 branches of 2 each, costs positive
+for (const t of TOWERS) {
+  if (t.stages.length !== 3) err(`Tower ${t.id}: expected 3 stages`);
+  if (t.branches.length !== 3 || t.branches.some(b => b.length !== 2)) err(`Tower ${t.id}: expected 3 branches × 2 stages`);
+  for (const s of [...t.stages, ...t.branches.flat()]) {
+    if (!(s.cost > 0)) err(`Tower ${t.id} stage ${s.name}: bad cost`);
+    if (!(s.range > 0)) err(`Tower ${t.id} stage ${s.name}: bad range`);
+  }
+}
+
+// 4. meta requirements resolve
+for (const m of META) {
+  if (m.requires && !META.find(x => x.id === m.requires)) err(`Meta ${m.id}: unknown requirement`);
+}
+
+// 5. rough campaign economy sanity: income per level vs a reasonable defense cost
+for (const lv of LEVELS) {
+  let income = lv.startCredits;
+  for (const [wi, wave] of lv.waves.entries()) {
+    income += 30 + wi * 4; // wave-clear bonus
+    for (const grp of wave) {
+      const spec = ENEMIES[grp.e];
+      const rewardMul = 1 + (lv.hpMul - 1) * 0.22;
+      income += Math.round(spec.reward * rewardMul) * grp.n;
+      if (spec.splits) income += ENEMIES[spec.splits.id].reward * spec.splits.count * grp.n;
+    }
+  }
+  console.log(`Level ${lv.id} (${lv.name}): ~${income} total credits, ${lv.waves.length} waves, hp×${lv.hpMul}`);
+}
+
+// ---- Phase 1: unlock gating / tuning / save migration / formatter ----
+
+// (a) UNLOCKS <-> SEEN_UNLOCK_LEVELS sync. Every gated system needs a first-time toast
+// flag at the same level, except pure difficulty escalations which have no toast.
+const NO_TOAST = new Set(['mutators_hard', 'mod_combo']);
+for (const [id, lvl] of Object.entries(UNLOCKS)) {
+  if (lvl < 1 || lvl > 15) err(`UNLOCKS['${id}'] level ${lvl} outside 1..15`);
+  if (NO_TOAST.has(id)) {
+    if (id in SEEN_UNLOCK_LEVELS) err(`'${id}' is no-toast but appears in SEEN_UNLOCK_LEVELS`);
+    continue;
+  }
+  if (!(id in SEEN_UNLOCK_LEVELS)) err(`UNLOCKS['${id}'] missing from SEEN_UNLOCK_LEVELS (save.ts)`);
+  else if (SEEN_UNLOCK_LEVELS[id] !== lvl) err(`'${id}' level mismatch: UNLOCKS=${lvl} vs SEEN=${SEEN_UNLOCK_LEVELS[id]}`);
+}
+
+// (b) TUNING sanity
+if (TUNING.combo.milestones.length !== TUNING.combo.bonuses.length) err('TUNING.combo milestones/bonuses length mismatch');
+if (!(TUNING.combo.window > 0)) err('TUNING.combo.window must be > 0');
+if (!(TUNING.interest.rate > 0 && TUNING.interest.rate < 1)) err('TUNING.interest.rate out of (0,1)');
+if (!(TUNING.interest.cap > 0)) err('TUNING.interest.cap must be > 0');
+if (!(TUNING.nova.killsToCharge > 0)) err('TUNING.nova.killsToCharge must be > 0');
+if (TUNING.mutators.fromWave < 2) err('TUNING.mutators.fromWave must be >= 2');
+{
+  const w = TUNING.drops.weights;
+  const sum = w.credits + w.recharge + w.overclock + w.hull;
+  if (sum !== 100) err(`TUNING.drops.weights must sum to 100 (got ${sum})`);
+}
+
+// (c) migrateSave: idempotent, v1 endlessBest relocation, veteran seen pre-marking
+const stable = (o: any): string => JSON.stringify(o, (_k, v) =>
+  v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.keys(v).sort().map(k => [k, v[k]])) : v);
+{
+  // empty object -> defaults; second pass identical
+  const a1 = migrateSave({});
+  const a2 = migrateSave(JSON.parse(JSON.stringify(a1)));
+  if (stable(a1) !== stable(a2)) err('migrateSave not idempotent on {}');
+
+  // realistic v1 veteran save
+  const v1 = { stars: { 1: 3, 2: 2, 15: 3 }, unlocked: 16, meta: ['hull1'], endlessBest: 7,
+               settings: { master: 0.5, tileSize: 58 } };
+  const m1 = migrateSave(v1);
+  const m2 = migrateSave(JSON.parse(JSON.stringify(m1)));
+  if (stable(m1) !== stable(m2)) err('migrateSave not idempotent on v1 save');
+  if (m1.endlessBest[2] !== 7) err(`v1 endlessBest should land at tier 2 (got ${JSON.stringify(m1.endlessBest)})`);
+  if (m1.stars[15] !== 3 || m1.unlocked !== 16 || m1.meta[0] !== 'hull1') err('migrateSave lost v1 fields');
+  if (m1.settings.master !== 0.5 || m1.settings.tileSize !== 58) err('migrateSave lost v1 settings');
+  if (m1.settings.pauseOnBuild !== false || m1.settings.meander !== 0) err('migrateSave missing new setting defaults');
+  for (const key of ['combo', 'interest', 'nova', 'mod_ionstorms']) {
+    if (!m1.seen[key]) err(`veteran save (unlocked 16) should pre-mark seen['${key}']`);
+  }
+
+  // low-progress save must NOT be pre-marked
+  const fresh = migrateSave({ unlocked: 1, endlessBest: 0 });
+  if (Object.keys(fresh.seen).length !== 0) err('fresh save should have no pre-marked seen flags');
+  const mid = migrateSave({ unlocked: 5, endlessBest: 0 });
+  if (!mid.seen['drops'] || mid.seen['nova']) err('unlocked=5 save should pre-mark drops but not nova');
+
+  // migrating an already-default save changes nothing
+  const d1 = defaultSave();
+  if (stable(migrateSave(JSON.parse(JSON.stringify(d1)))) !== stable(migrateSave(migrateSave(JSON.parse(JSON.stringify(d1)))))) {
+    err('migrateSave not stable on defaultSave');
+  }
+}
+
+// ---- Phase 3: modifiers / mutators / counters ----
+
+// level modifier ids must exist, with gates registered in UNLOCKS
+for (const lv of LEVELS) {
+  for (const m of lv.modifiers || []) {
+    const info = MODIFIER_INFO[m];
+    if (!info) { err(`Level ${lv.id} references unknown modifier '${m}'`); continue; }
+    if (!(info.gate in UNLOCKS)) err(`Modifier '${m}' gate '${info.gate}' missing from UNLOCKS`);
+    if (lv.id < UNLOCKS[info.gate]) err(`Level ${lv.id} uses '${m}' before its unlock level ${UNLOCKS[info.gate]}`);
+  }
+}
+// assignment sanity per plan: L4/6/8/10/12/13/14/15 carry modifiers, L1-3/5/7/9/11 do not
+for (const lv of LEVELS) {
+  const expectMods = [4, 6, 8, 10, 12, 13, 14, 15].includes(lv.id);
+  const has = (lv.modifiers || []).length > 0;
+  if (expectMods !== has) err(`Level ${lv.id}: modifier presence mismatch (expected ${expectMods})`);
+}
+
+// every enemy has at least one valid counter; counters reference real towers
+const towerIds = new Set(TOWERS.map(t => t.id));
+for (const spec of Object.values(ENEMIES)) {
+  if (!spec.counters || spec.counters.length === 0) { err(`Enemy '${spec.id}' has no counters`); continue; }
+  for (const c of spec.counters) if (!towerIds.has(c)) err(`Enemy '${spec.id}' counter '${c}' is not a tower id`);
+}
+
+// mutator table sanity
+{
+  const ids = Object.keys(MUTATORS);
+  if (ids.length < 6) err(`Expected 6 mutators, got ${ids.length}`);
+  const hard = ids.filter(i => MUTATORS[i].hard);
+  if (hard.length !== 2) err(`Expected exactly 2 hard mutators (got ${hard.join(',')})`);
+  if (!('mutators_hard' in UNLOCKS)) err(`'mutators_hard' gate missing from UNLOCKS`);
+  for (const m of Object.values(MUTATORS)) {
+    if (!m.icon || !m.name || !m.blurb) err(`Mutator '${m.id}' missing display fields`);
+  }
+}
+
+// ---- Phase 4: spectacle sanity ----
+
+// boss_theater / boss_phase2 gates registered
+for (const g of ['boss_theater', 'boss_phase2']) {
+  if (!(g in UNLOCKS)) err(`'${g}' gate missing from UNLOCKS`);
+}
+if (!('nova' in UNLOCKS)) err(`'nova' gate missing from UNLOCKS`);
+
+// NOVA tuning sanity
+if (!(TUNING.nova.killsToCharge > 0)) err('TUNING.nova.killsToCharge must be > 0');
+if (!(TUNING.nova.rechargeGrowth > 1)) err('TUNING.nova.rechargeGrowth must be > 1 (recharge should get harder each use)');
+if (!(TUNING.nova.buildup > 0 && TUNING.nova.buildup < 3)) err('TUNING.nova.buildup should be a short buildup (0-3s)');
+if (!(TUNING.nova.bossFrac > 0 && TUNING.nova.bossFrac <= 1)) err('TUNING.nova.bossFrac out of (0,1]');
+
+// every boss enemy exists and is referenced by exactly the three named zone finales
+{
+  const bosses = Object.values(ENEMIES).filter(e => e.boss);
+  if (bosses.length !== 3) err(`Expected 3 bosses, found ${bosses.length}`);
+  for (const id of ['mothership', 'colossus', 'leviathan']) {
+    if (!ENEMIES[id]) err(`Expected boss enemy '${id}' to exist`);
+    else if (!ENEMIES[id].boss) err(`Enemy '${id}' should have boss:true`);
+  }
+}
+
+// ---- Phase 5: challenges / zone flavor / guide keys / progression smoothing ----
+
+// every level L2-L15 has exactly 2 challenges, valid ids, no duplicate id within a level
+for (const lv of LEVELS) {
+  if (lv.id < 2) {
+    if (lv.challenges?.length) err(`Level ${lv.id} should have no challenges (gate is L2+)`);
+    continue;
+  }
+  const chs = lv.challenges || [];
+  if (chs.length !== 2) err(`Level ${lv.id} has ${chs.length} challenges, expected exactly 2`);
+  const seen = new Set<string>();
+  for (const c of chs) {
+    if (!CHALLENGE_POOL[c.id]) err(`Level ${lv.id} references unknown challenge '${c.id}'`);
+    if (seen.has(c.id)) err(`Level ${lv.id} has duplicate challenge '${c.id}'`);
+    seen.add(c.id);
+    if (c.param !== undefined && (!Number.isInteger(c.param) || c.param < 1)) err(`Level ${lv.id} challenge '${c.id}' has invalid param ${c.param}`);
+  }
+}
+// 28 total challenge instances expected (14 levels x 2)
+{
+  const total = LEVELS.filter(l => l.id >= 2).reduce((a, l) => a + (l.challenges?.length || 0), 0);
+  if (total !== 28) err(`Expected 28 total challenge instances across L2-L15, got ${total}`);
+}
+
+// zone taglines present and non-trivial
+if (ZONES.length !== 3) err(`Expected 3 zones, got ${ZONES.length}`);
+for (const z of ZONES) {
+  if (!z.tagline || z.tagline.length < 10) err(`Zone '${z.name}' missing/too-short tagline`);
+}
+// zone_N seen-keys should align with each zone's first level (1, 6, 11)
+{
+  const starts = [1, 6, 11];
+  for (let i = 0; i < 3; i++) {
+    const key = `zone_${i + 1}`;
+    if (SEEN_UNLOCK_LEVELS[key] !== starts[i]) err(`SEEN_UNLOCK_LEVELS['${key}'] should be ${starts[i]}, got ${SEEN_UNLOCK_LEVELS[key]}`);
+  }
+}
+// guide_* keys present at level 1
+for (const key of ['guide_build', 'guide_confirm', 'guide_launch']) {
+  if (SEEN_UNLOCK_LEVELS[key] !== 1) err(`SEEN_UNLOCK_LEVELS['${key}'] should be 1, got ${SEEN_UNLOCK_LEVELS[key]}`);
+}
+
+// progression smoothing sanity
+if (!(TUNING.smoothing.earlyLevels > 0 && TUNING.smoothing.earlyLevels < 1)) err('TUNING.smoothing.earlyLevels should be in (0,1)');
+if (!(TUNING.smoothing.compensationMax > 1)) err('TUNING.smoothing.compensationMax should be > 1');
+if (!(TUNING.smoothing.compensationFrom < TUNING.smoothing.compensationFull)) err('TUNING.smoothing.compensationFrom should be < compensationFull');
+
+// ---- Phase 8: final balance sweep, difficulty x ascension grid ----
+// Prints the effective HP multiplier, starting credits, and interest cap across every
+// difficulty tier and ascension tier, for three representative levels (early/mid/late
+// campaign). This is the deliverable PLAN.md calls for ("final TUNING table in PROGRESS.md")
+// — captured into PROGRESS.md verbatim by the phase that runs this.
+{
+  const DIFF_HP = [0.7, 0.85, 1, 1.25, 1.55];
+  const DIFF_NAMES = ['Relaxed', 'Easy', 'Normal', 'Hard', 'Brutal'];
+  const SM = TUNING.smoothing;
+  const AS = TUNING.ascension;
+
+  function progressionMul(levelId: number): number {
+    if (levelId <= 2) return SM.earlyLevels;
+    if (levelId >= SM.compensationFrom) {
+      const t = Math.min(1, Math.max(0, (levelId - SM.compensationFrom) / (SM.compensationFull - SM.compensationFrom)));
+      return 1 + (SM.compensationMax - 1) * t;
+    }
+    return 1;
+  }
+  function effectiveHpMul(levelBaseHpMul: number, levelId: number, diffTier: number, ascTier: number): number {
+    return levelBaseHpMul * DIFF_HP[diffTier] * progressionMul(levelId) * (ascTier >= 1 ? AS.hpMul : 1);
+  }
+  function effectiveStartCredits(baseCredits: number, ascTier: number): number {
+    return Math.round(baseCredits * (ascTier >= 4 ? AS.startCreditMul : 1));
+  }
+  function effectiveInterestCap(levelId: number, ascTier: number): number {
+    return ascTier >= 4 ? AS.interestCapTier4 : TUNING.interest.cap + levelId * 3;
+  }
+
+  const sampleIds = [1, 8, 15];
+  console.log('\n---- Balance sweep: difficulty x ascension (levels 1, 8, 15) ----');
+  for (const id of sampleIds) {
+    const lv = LEVELS.find(l => l.id === id);
+    if (!lv) { err(`balance sweep: level ${id} not found`); continue; }
+    console.log(`\nLevel ${id} (${lv.name}) — base hpMul ${lv.hpMul}, startCredits ${lv.startCredits}:`);
+    for (let diffTier = 0; diffTier < 5; diffTier++) {
+      const row: string[] = [];
+      for (let ascTier = 0; ascTier <= 5; ascTier++) {
+        const hp = effectiveHpMul(lv.hpMul, id, diffTier, ascTier);
+        row.push(`A${ascTier}:${hp.toFixed(2)}x`);
+      }
+      console.log(`  ${DIFF_NAMES[diffTier].padEnd(8)} hpMul  ${row.join('  ')}`);
+    }
+    // credits/interest only vary by ascension, not difficulty, so print once per level
+    const creditRow = [0, 1, 2, 3, 4, 5].map(a => `A${a}:${effectiveStartCredits(lv.startCredits, a)}◆/cap${effectiveInterestCap(id, a)}`);
+    console.log(`  startCredits/interestCap  ${creditRow.join('  ')}`);
+    // sanity bounds: nothing in the grid should be a degenerate cliff
+    for (let diffTier = 0; diffTier < 5; diffTier++) {
+      for (let ascTier = 0; ascTier <= 5; ascTier++) {
+        const hp = effectiveHpMul(lv.hpMul, id, diffTier, ascTier);
+        if (hp <= 0) err(`Level ${id} diff=${diffTier} asc=${ascTier}: hpMul is non-positive (${hp})`);
+        if (hp > lv.hpMul * 5) err(`Level ${id} diff=${diffTier} asc=${ascTier}: hpMul (${hp.toFixed(2)}) looks like a runaway multiplier`);
+      }
+    }
+    const minCredits = effectiveStartCredits(lv.startCredits, 4);
+    if (minCredits < lv.startCredits * 0.5) err(`Level ${id}: Ascension IV starting credits (${minCredits}) cut by more than half — too severe`);
+  }
+}
+
+// (d) fmt spot checks
+const fmtCases: [number, string][] = [[950, '950'], [9999, '9999'], [12400, '12.4k'], [150000, '150k'], [3400000, '3.4M']];
+for (const [n, want] of fmtCases) {
+  if (fmt(n) !== want) err(`fmt(${n}) = '${fmt(n)}', expected '${want}'`);
+}
+
+// ---- Phase 6: ascension / daily op / resume / chroma ----
+
+// ascension tuning sanity
+{
+  const A = TUNING.ascension;
+  if (!(A.hpMul > 1)) err('TUNING.ascension.hpMul should be > 1');
+  if (!(A.mutationBonus > 0 && A.mutationBonus < 1)) err('TUNING.ascension.mutationBonus should be in (0,1)');
+  if (!(A.mutatorFromWave >= 1)) err('TUNING.ascension.mutatorFromWave should be >= 1');
+  if (!(A.eliteMul > 1)) err('TUNING.ascension.eliteMul should be > 1');
+  if (!(A.dualAffixChance > 0 && A.dualAffixChance < 1)) err('TUNING.ascension.dualAffixChance should be in (0,1)');
+  if (!(A.startCreditMul > 0 && A.startCreditMul < 1)) err('TUNING.ascension.startCreditMul should be in (0,1)');
+  if (!(A.interestCapTier4 > 0 && A.interestCapTier4 < TUNING.interest.cap)) err('TUNING.ascension.interestCapTier4 should be a real reduction from the base cap');
+  if (!(A.intermissionMul > 0 && A.intermissionMul < 1)) err('TUNING.ascension.intermissionMul should be in (0,1)');
+}
+
+// daily op: every level in the campaign is a valid pick if it's the only one eligible;
+// modifier draws always come from the real MODIFIER_INFO set
+for (const lv of LEVELS) {
+  const op = computeDailyOp('2026-01-01', [lv.id]);
+  if (!op || op.levelId !== lv.id) err(`Daily Op should be able to pick level ${lv.id} when it's the only eligible one`);
+  if (op) for (const m of op.modifiers) if (!MODIFIER_INFO[m]) err(`Daily Op produced unknown modifier '${m}'`);
+}
+// determinism: same date + same pool -> identical composition, across repeated calls
+{
+  const pool = LEVELS.map(l => l.id);
+  const a = computeDailyOp('2026-03-15', pool);
+  const b = computeDailyOp('2026-03-15', pool);
+  if (JSON.stringify(a) !== JSON.stringify(b)) err('Daily Op is not deterministic for the same date+pool');
+}
+if (computeDailyOp('2026-01-01', []) !== null) err('Daily Op should return null for an empty eligible pool');
+
+// resume version stamp sanity
+if (!(RESUME_VERSION >= 1 && Number.isInteger(RESUME_VERSION))) err('RESUME_VERSION must be a positive integer');
+
+// save migration: ascension.unlocked derives correctly from an old-format save that only had `current`
+{
+  const oldFormat = { ascension: { current: 3, bestPerLevel: { 15: 3 } } };
+  const migrated = migrateSave(oldFormat);
+  if (migrated.ascension.unlocked < 3) err(`migrateSave should backfill ascension.unlocked from current (got ${migrated.ascension.unlocked})`);
+  if (migrated.ascension.current !== 3) err('migrateSave should preserve ascension.current');
+  const twice = migrateSave(JSON.parse(JSON.stringify(migrated)));
+  if (JSON.stringify(twice.ascension) !== JSON.stringify(migrated.ascension)) err('migrateSave not idempotent on ascension after backfill');
+}
+
+console.log(errors ? `\n${errors} error(s)` : '\nAll checks passed ✓');
+process.exit(errors ? 1 : 0);

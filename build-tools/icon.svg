@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="75%">
+      <stop offset="0%" stop-color="#242a52"/>
+      <stop offset="100%" stop-color="#14152a"/>
+    </radialGradient>
+  </defs>
+  <!-- solid background fills the full canvas — required for maskable icons, which get
+       cropped to a circle/squircle/etc by the OS and must not show transparency at the edge -->
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <!-- keep all meaningful artwork inside the ~80% "safe zone" (a 410px circle centered
+       at 256,256) so maskable crops on any launcher shape never clip the tower -->
+  <g>
+    <circle cx="256" cy="278" r="132" fill="#a8e6cf"/>
+    <circle cx="256" cy="256" r="132" fill="#ffb3c6"/>
+    <circle cx="256" cy="238" r="86" fill="#1a1b2e"/>
+    <circle cx="228" cy="216" r="14" fill="#ffe9c7"/>
+    <circle cx="286" cy="216" r="14" fill="#ffe9c7"/>
+    <circle cx="228" cy="216" r="6" fill="#241626"/>
+    <circle cx="286" cy="216" r="6" fill="#241626"/>
+  </g>
+</svg>

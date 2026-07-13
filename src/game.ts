@@ -1,0 +1,3589 @@
+// ================= Starhold engine (unified grid, top-down) =================
+import { TOWERS, ENEMIES, ABILITIES, ZONES, TowerSpec, StageStats, EnemySpec, TUNING, isUnlocked, MUTATORS, MODIFIER_INFO, fmt } from './data';
+import { LevelSpec, WaveGroup } from './levels';
+import { mulberry32, hashString, seededInt } from './rng';
+import { audio } from './audio';
+
+export const W = 1280, H = 720;
+
+const dist = (ax: number, ay: number, bx: number, by: number) => Math.hypot(ax - bx, ay - by);
+
+// Evenly resample a level's wave list to a different length (game-length setting).
+// Always keeps the final (boss) wave last.
+function resampleWaves<T>(waves: T[], factor: number): T[] {
+  const L = waves.length;
+  const N = Math.max(3, Math.round(L * factor));
+  if (N === L || L === 0) return waves;
+  const out: T[] = [];
+  for (let i = 0; i < N; i++) out.push(waves[Math.round(i * (L - 1) / Math.max(1, N - 1))]);
+  return out;
+}
+const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+
+// Horizontal mirror for Daily Op: flips a path's pixel waypoints left-right. Endpoint
+// x-values don't actually matter (buildGrid always pins them to the off-grid sentinel
+// columns), so a plain per-point flip is sufficient and keeps portal-left/base-right intact.
+function mirrorPts(pts: number[][]): number[][] {
+  // Flipping x alone isn't enough: the engine always pins the FIRST waypoint to the
+  // off-grid-left portal column and the LAST to the off-grid-right base column. A pure
+  // per-point x-flip keeps the original traversal order, which reverses the shape's
+  // natural left-to-right flow and fights that fixed convention — producing a path that
+  // self-crosses. Reversing the point order after flipping restores a proper mirror image
+  // that still starts near the left and ends near the right, matching the convention.
+  return pts.map(([x, y]) => [W - x, y]).reverse();
+}
+
+// ---------- meander (path directness) ----------
+interface CPt { c: number; r: number; }
+const ptKey = (p: CPt) => `${p.c},${p.r}`;
+// Inserts a corner point wherever two consecutive points differ on both axes,
+// so the result stays a strictly rectilinear (grid-aligned) polyline.
+function rectilinearize(pts: CPt[]): CPt[] {
+  const out: CPt[] = [pts[0]];
+  for (let i = 1; i < pts.length; i++) {
+    const prev = out[out.length - 1];
+    const next = pts[i];
+    if (prev.c !== next.c && prev.r !== next.r) out.push({ c: next.c, r: prev.r });
+    out.push(next);
+  }
+  return out;
+}
+// Every tile visited walking a strictly-rectilinear polyline, in order (duplicates kept).
+function walkTiles(pts: CPt[]): CPt[] {
+  const out: CPt[] = [pts[0]];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    const dc = Math.sign(b.c - a.c), dr = Math.sign(b.r - a.r);
+    let c = a.c, r = a.r;
+    while (!(c === b.c && r === b.r)) { c += dc; r += dr; out.push({ c, r }); }
+  }
+  return out;
+}
+// Builds one candidate zigzag detour between a and b at the given bump count/depth.
+function buildBumps(a: CPt, b: CPt, bumps: number, depth: number, cols: number, rows: number): CPt[] {
+  const horiz = a.r === b.r;
+  const total = horiz ? b.c - a.c : b.r - a.r;
+  const dir = Math.sign(total);
+  const mainLen = Math.abs(total);
+  const baseline = horiz ? a.r : a.c;
+  const raw: CPt[] = [a];
+  let sign = 1;
+  for (let i = 1; i <= bumps; i++) {
+    const travelled = Math.round((mainLen * i) / (bumps + 1));
+    const mainCoord = (horiz ? a.c : a.r) + dir * travelled;
+    const offRaw = baseline + depth * sign;
+    const off = horiz ? clamp(offRaw, 1, rows - 2) : clamp(offRaw, 1, cols - 2);
+    raw.push(horiz ? { c: mainCoord, r: off } : { c: off, r: mainCoord });
+    sign *= -1;
+  }
+  raw.push(b);
+  return rectilinearize(raw);
+}
+// Replaces one straight a→b run with a zigzagging detour when `tier` > 0 and the run is
+// long enough — more/deeper zigzags at higher tiers. `forbidden` is every tile the path's
+// original spine ever needs (past AND future segments) plus every tile any other detour has
+// already claimed, so a bump can never cross or backtrack over any part of the path — not
+// even a part that hasn't been walked yet. Falls back to progressively gentler detours, and
+// finally the plain straight line, rather than ever risk a self-crossing path.
+function meanderSegment(a: CPt, b: CPt, tier: number, cols: number, rows: number, forbidden: Set<string>): CPt[] {
+  const straight = [a, b];
+  if (tier <= 0 || (a.c !== b.c && a.r !== b.r)) return straight;
+  const horiz = a.r === b.r;
+  const mainLen = Math.abs(horiz ? b.c - a.c : b.r - a.r);
+  const minLen = tier >= 2 ? 5 : 7;
+  if (mainLen < minLen) return straight;
+
+  const maxBumps = tier >= 2 ? Math.max(2, Math.round(mainLen / 4)) : Math.max(1, Math.round(mainLen / 6));
+  const maxDepth = tier >= 2 ? 2 : 1;
+
+  // Try the full detour first, then ease off bumps/depth, then give up and go straight.
+  for (let depth = maxDepth; depth >= 1; depth--) {
+    for (let bumps = maxBumps; bumps >= 1; bumps--) {
+      const candidate = buildBumps(a, b, bumps, depth, cols, rows);
+      const tiles = walkTiles(candidate);
+      const seen = new Set<string>();
+      let collides = false;
+      // endpoints (index 0 and last) are the shared a/b boundary tiles — always allowed
+      for (let i = 1; i < tiles.length - 1; i++) {
+        const k = ptKey(tiles[i]);
+        if (forbidden.has(k) || seen.has(k)) { collides = true; break; }
+        seen.add(k);
+      }
+      if (!collides) return candidate;
+    }
+  }
+  return straight;
+}
+// Applies meander to every leg of an already-rectilinear waypoint chain. The original
+// (un-meandered) path's full tile footprint is reserved up front as off-limits to every
+// detour, so no segment's zigzag can ever cross or backtrack over the path itself —
+// including parts of the path that haven't been generated yet.
+function applyMeander(cellsPts: CPt[], tier: number, cols: number, rows: number): CPt[] {
+  if (cellsPts.length < 2 || tier <= 0) return cellsPts;
+  const spine = new Set(walkTiles(cellsPts).map(ptKey));
+  const claimed = new Set<string>(); // tiles actual (possibly-bumped) segments have committed to
+  const markClaimed = (pts: CPt[]) => { for (const p of walkTiles(pts)) claimed.add(ptKey(p)); };
+  const out: CPt[] = [cellsPts[0]];
+  markClaimed([cellsPts[0]]);
+  for (let i = 0; i < cellsPts.length - 1; i++) {
+    const a = cellsPts[i], b = cellsPts[i + 1];
+    const segSpine = new Set(walkTiles([a, b]).map(ptKey)); // this segment's own straight run — it's replacing this, not colliding with it
+    const forbidden = new Set<string>();
+    for (const k of spine) if (!segSpine.has(k)) forbidden.add(k);
+    for (const k of claimed) forbidden.add(k);
+    const seg = meanderSegment(a, b, tier, cols, rows, forbidden);
+    markClaimed(seg);
+    for (let j = 1; j < seg.length; j++) out.push(seg[j]);
+  }
+  return out;
+}
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+const rand = (a: number, b: number) => a + Math.random() * (b - a);
+
+class Path {
+  pts: number[][];
+  segLens: number[] = [];
+  total = 0;
+  constructor(pts: number[][]) {
+    this.pts = pts;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const l = dist(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]);
+      this.segLens.push(l); this.total += l;
+    }
+  }
+  at(d: number): { x: number; y: number; a: number } {
+    d = clamp(d, 0, this.total);
+    let i = 0;
+    while (i < this.segLens.length - 1 && d > this.segLens[i]) { d -= this.segLens[i]; i++; }
+    const [ax, ay] = this.pts[i], [bx, by] = this.pts[i + 1];
+    const t = this.segLens[i] ? d / this.segLens[i] : 0;
+    return { x: lerp(ax, bx, t), y: lerp(ay, by, t), a: Math.atan2(by - ay, bx - ax) };
+  }
+}
+
+interface Particle {
+  x: number; y: number; vx: number; vy: number;
+  life: number; max: number; size: number; color: string;
+  kind: 'dot' | 'spark' | 'ring' | 'shock' | 'text' | 'smoke' | 'shard' | 'flash' | 'fire';
+  text?: string; grav?: number; rot?: number; vr?: number;
+}
+
+interface Patch { x: number; y: number; r: number; until: number; kind: 'burn' | 'stasis'; dps?: number; slow?: number }
+
+// ---------- enemy ----------
+export class Enemy {
+  spec: EnemySpec;
+  hp: number; maxHp: number;
+  shield = 0; maxShield = 0; shieldRegenAt = 0;
+  path: Path; pathIdx: number;
+  d = 0;
+  x = 0; y = 0; angle = 0;
+  fx0 = 0; fy0 = 0; fx1 = 0; fy1 = 0; fT = 0; fDur = 1;
+  slowPct = 0; slowUntil = 0;
+  frozenUntil = 0;
+  burnDps = 0; burnUntil = 0;
+  dead = false; leaked = false;
+  wobble = Math.random() * 10;
+  flashT = 0;
+  phaseT = Math.random() * 2;
+  phased = false;
+  healT = 0; minionT = 0; empT = 0;
+  hpMul = 1;
+  brittle = false;
+  isElite = false;
+  eliteAffixes: ('shielded' | 'swift' | 'vampiric')[] = []; // 1 normally, 2 at Ascension III+
+  eliteSparkT = 0;
+  lastHitBy: Tower | null = null;   // for rich-vein kill attribution (burn/patch DoT excluded)
+  mutRegen = false;                 // Regenerating wave mutator
+  bossPhase = 1;                    // bosses flip to 2 at 50% HP (gate boss_phase2)
+  arcA = 0;                         // leviathan phase-2: center angle of the shield GAP
+  phase2BaseSpeed = 0;              // colossus phase-2: speed growth cap reference
+  dmgAccum = 0;                     // damage-number batching
+  dmgFlushAt = 0;
+
+  constructor(spec: EnemySpec, path: Path, pathIdx: number, hpMul: number, rewardMul: number, flyFrom?: { x: number; y: number }, flyTo?: { x: number; y: number }) {
+    this.spec = spec;
+    this.hpMul = hpMul;
+    this.maxHp = Math.round(spec.hp * hpMul);
+    this.hp = this.maxHp;
+    if (spec.shield) { this.maxShield = Math.round(this.maxHp * spec.shield); this.shield = this.maxShield; }
+    this.path = path; this.pathIdx = pathIdx;
+    (this as any).reward = Math.max(1, Math.round(spec.reward * rewardMul));
+    if (spec.flying && flyFrom && flyTo) {
+      this.fx0 = flyFrom.x; this.fy0 = flyFrom.y; this.fx1 = flyTo.x; this.fy1 = flyTo.y;
+      this.fDur = Math.max(0.1, dist(this.fx0, this.fy0, this.fx1, this.fy1) / spec.speed);
+      this.x = this.fx0; this.y = this.fy0;
+    } else {
+      const p = path.at(0); this.x = p.x; this.y = p.y;
+    }
+  }
+
+  // Promote this enemy to an elite: clones the spec so size/speed/leak changes stay
+  // per-instance, multiplies HP and bounty, and applies one random affix.
+  makeElite(affixes: ('shielded' | 'swift' | 'vampiric')[]) {
+    const E = TUNING.elites;
+    this.isElite = true;
+    this.eliteAffixes = affixes;
+    const swift = affixes.includes('swift');
+    this.spec = {
+      ...this.spec,
+      size: this.spec.size * E.sizeMul,
+      speed: swift ? this.spec.speed * E.affixSpeedMul : this.spec.speed,
+      leak: this.spec.leak + E.extraLeak,
+    };
+    this.maxHp = Math.round(this.maxHp * E.hpMul);
+    this.hp = this.maxHp;
+    if (affixes.includes('shielded')) {
+      this.maxShield = Math.max(this.maxShield, Math.round(this.maxHp * E.affixShieldFrac));
+      this.shield = this.maxShield;
+    }
+    (this as any).reward = Math.round((this as any).reward * E.bountyMul);
+    // recompute flight duration for swift fliers (fDur was set from the old speed)
+    if (this.spec.flying && swift) this.fDur = Math.max(0.1, this.fDur / E.affixSpeedMul);
+  }
+
+  get targetable() { return !this.dead && !this.phased; }
+  get progress() {
+    return this.spec.flying ? (this.fT / this.fDur) * 10000 + this.pathIdx : this.d + this.pathIdx * 0.001;
+  }
+  effSpeed(now: number) {
+    if (now < this.frozenUntil) return 0;
+    let s = this.spec.speed;
+    if (now < this.slowUntil) s *= 1 - this.slowPct;
+    return s;
+  }
+  applySlow(pct: number, dur: number, now: number) {
+    if (pct >= this.slowPct || now >= this.slowUntil) { this.slowPct = pct; this.slowUntil = now + dur; }
+  }
+  ignite(dps: number, dur: number, now: number) {
+    this.burnDps = Math.max(this.burnDps, dps);
+    this.burnUntil = Math.max(this.burnUntil, now + dur);
+  }
+  update(dt: number, now: number, game: Game) {
+    if (this.dead) return;
+    this.wobble += dt * (4 + this.spec.speed / 24);
+    if (this.flashT > 0) this.flashT -= dt;
+    if (this.spec.phase) {
+      this.phaseT += dt;
+      const cyc = this.phaseT % 3.6;
+      const wasPhased = this.phased;
+      this.phased = cyc > 2.5;
+      if (this.phased && !wasPhased) game.spark(this.x, this.y, '#b0fff4', 6);
+    }
+    if (this.mutRegen && this.hp < this.maxHp) {
+      this.hp = Math.min(this.maxHp, this.hp + this.maxHp * TUNING.mutators.regenPerSec * dt);
+    }
+    if (now < this.burnUntil && this.burnDps > 0) {
+      this.hurt(this.burnDps * dt, game, true);
+      if (Math.random() < dt * 10) game.fireFx(this.x + rand(-6, 6), this.y + rand(-6, 6));
+    }
+    if (this.maxShield && this.shield < this.maxShield && now > this.shieldRegenAt) {
+      this.shield = Math.min(this.maxShield, this.shield + this.maxShield * 0.28 * dt);
+    }
+    if (this.isElite) {
+      this.eliteSparkT += dt;
+      if (this.eliteSparkT > 0.28) {
+        this.eliteSparkT = 0;
+        game.parts.push({ x: this.x + rand(-this.spec.size, this.spec.size), y: this.y - this.spec.size, vx: rand(-8, 8), vy: rand(-34, -16), life: 0.5, max: 0.5, size: rand(1.6, 2.8), color: '#ffd97a', kind: 'spark' });
+      }
+      if (this.eliteAffixes.includes('vampiric')) {
+        this.healT += dt;
+        if (this.healT > 1) {
+          this.healT = 0;
+          let healed = false;
+          for (const e of game.enemies) {
+            if (e !== this && !e.dead && dist(e.x, e.y, this.x, this.y) < 90 && e.hp < e.maxHp) {
+              e.hp = Math.min(e.maxHp, e.hp + TUNING.elites.affixHealPerSec * this.hpMul);
+              game.healFx(e.x, e.y);
+              healed = true;
+            }
+          }
+          if (healed) game.ringFx(this.x, this.y, 90, '#ffd97a');
+        }
+      }
+    }
+    if (this.spec.healAura) {
+      this.healT += dt;
+      if (this.healT > 1.4) {
+        this.healT = 0;
+        let healed = false;
+        for (const e of game.enemies) {
+          if (e !== this && !e.dead && dist(e.x, e.y, this.x, this.y) < 95 && e.hp < e.maxHp) {
+            e.hp = Math.min(e.maxHp, e.hp + this.spec.healAura * this.hpMul);
+            game.healFx(e.x, e.y);
+            healed = true;
+          }
+        }
+        if (healed) game.ringFx(this.x, this.y, 95, '#c0f5b3');
+      }
+    }
+    if (this.spec.spawnMinion) {
+      this.minionT += dt;
+      if (this.minionT > this.spec.spawnMinion.every) {
+        this.minionT = 0;
+        for (let i = 0; i < this.spec.spawnMinion.count; i++) game.spawnAt(this.spec.spawnMinion.id, this);
+        game.ringFx(this.x, this.y, 44, this.spec.color);
+      }
+    }
+    if (this.spec.emp) {
+      this.empT += dt;
+      if (this.empT > this.spec.emp) {
+        this.empT = 0;
+        game.empPulse(this.x, this.y, 160 * (this.bossPhase === 2 && this.spec.id === 'colossus' ? 2 : 1), 3);
+        if (this.bossPhase === 2 && this.spec.id === 'colossus') {
+          const cap = this.phase2BaseSpeed * 1.8;
+          const ns = Math.min(this.spec.speed * 1.2, cap);
+          if (ns > this.spec.speed) {
+            this.spec = { ...this.spec, speed: ns };
+            game.floater(this.x, this.y - this.spec.size - 14, 'RAGING', '#ff8fa3');
+          }
+        }
+      }
+    }
+    if (this.bossPhase === 2 && this.spec.id === 'leviathan') this.arcA += dt * (Math.PI / 6); // 30°/s
+    const sp = this.effSpeed(now);
+    if (this.spec.flying) {
+      this.fT += (sp / this.spec.speed) * dt;
+      const t = clamp(this.fT / this.fDur, 0, 1);
+      this.x = lerp(this.fx0, this.fx1, t);
+      this.y = lerp(this.fy0, this.fy1, t);
+      this.angle = Math.atan2(this.fy1 - this.fy0, this.fx1 - this.fx0);
+      if (t >= 1) this.leak(game);
+    } else {
+      this.d += sp * dt;
+      const p = this.path.at(this.d);
+      this.x = p.x; this.y = p.y; this.angle = p.a;
+      if (this.d >= this.path.total) this.leak(game);
+    }
+  }
+  leak(game: Game) {
+    if (this.dead) return;
+    this.dead = true; this.leaked = true;
+    game.onLeak(this);
+  }
+  hurt(amount: number, game: Game, silent = false, src?: Tower) {
+    if (this.dead) return;
+    if (src) { this.lastHitBy = src; src.dmgDealt += amount; }
+    if (this.brittle) amount *= 1.25;
+    // Leviathan phase 2: the shield is a rotating 240° barrier. Damage arriving
+    // through the uncovered 120° gap bypasses the shield entirely.
+    let bypass = false;
+    if (this.bossPhase === 2 && this.spec.id === 'leviathan' && this.shield > 0 && src) {
+      const ang = Math.atan2(src.y - this.y, src.x - this.x);
+      let diff = ang - this.arcA;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      if (Math.abs(diff) < Math.PI / 3) {
+        bypass = true;
+        game.spark(this.x + Math.cos(ang) * this.spec.size, this.y + Math.sin(ang) * this.spec.size, '#fff3b0', 3);
+      }
+    }
+    if (this.shield > 0 && !bypass) {
+      this.shield -= amount;
+      this.shieldRegenAt = game.now + 3;
+      if (this.shield < 0) { this.hp += this.shield; this.shield = 0; game.shieldBreak(this); }
+    } else {
+      this.hp -= amount;
+    }
+    this.dmgAccum += amount;
+    this.flashT = 0.08;
+    if (!silent) audio.hit();
+    if (this.hp <= 0) { this.dead = true; game.onKill(this); }
+  }
+}
+
+// ---------- tower ----------
+export class Tower {
+  spec: TowerSpec;
+  x: number; y: number;
+  cell = -1;
+  col = 0; row = 0;
+  stage = 0;
+  branch = -1;
+  branchStage = 0;
+  cool = 0;
+  angle = -Math.PI / 2;
+  recoil = 0;
+  target: Enemy | null = null;
+  mode: 'first' | 'last' | 'strong' | 'weak' | 'close' = 'first';
+  spent = 0;
+  disabledUntil = 0;
+  vein = false;   // built on a Rich Vein cell (+credits per kill landed)
+  dmgDealt = 0;
+  kills = 0;
+  creditsEarned = 0;
+  rampT = 0;
+  beamTargets: Enemy[] = [];
+  bDmg = 0; bRate = 0; bRange = 0; bCrit = 0;
+  auraPulse = Math.random() * 6;
+
+  constructor(spec: TowerSpec, x: number, y: number) {
+    this.spec = spec; this.x = x; this.y = y;
+  }
+  get raw(): StageStats {
+    return this.branch >= 0 ? this.spec.branches[this.branch][this.branchStage] : this.spec.stages[this.stage];
+  }
+  get buffed() { return this.bDmg > 0 || this.bRate > 0 || this.bRange > 0 || this.bCrit > 0; }
+  get displayName() {
+    if (this.branch >= 0) return `${this.spec.name} (${4 + this.branchStage} ${this.raw.name})`;
+    return `${this.spec.name} (${this.stage + 1})`;
+  }
+  rangeT() { return Math.max(1, Math.round(this.raw.range * (1 + this.bRange))); }
+  stats(game: Game) {
+    const r = this.raw;
+    return {
+      ...r,
+      dmg: r.dmg * (1 + this.bDmg) * game.metaDmgMul,
+      burnDps: r.burnDps ? r.burnDps * (1 + this.bDmg) * game.metaDmgMul : r.burnDps,
+      rate: r.rate * (1 + this.bRate) * (game.now < game.overclockUntil ? 1 + TUNING.drops.overclockRate : 1)
+        * (game.stormRow0 >= 0 && game.now > game.stormWarnUntil && this.row >= game.stormRow0 && this.row < game.stormRow0 + TUNING.ionStorms.bandRows ? 1 - TUNING.ionStorms.ratePenalty : 1),
+      range: this.rangeT(),
+      crit: (r.crit || 0) + this.bCrit,
+    };
+  }
+  baseStats(game: Game) {
+    const r = this.raw;
+    return { ...r, dmg: r.dmg * game.metaDmgMul };
+  }
+}
+
+// ---------- projectiles ----------
+interface Bullet {
+  kind: 'bullet'; x: number; y: number; vx: number; vy: number; dmg: number;
+  color: string; pierce: number; hit: Set<Enemy>; life: number; w: number;
+  target?: Enemy | null;
+  slow?: number; slowDur?: number; freeze?: number; crit?: number; trail: number[][];
+  owner?: Tower;
+}
+interface Missile {
+  kind: 'missile'; x: number; y: number; vx: number; vy: number; speed: number;
+  target: Enemy | null; dmg: number; splash: number; airMul: number; color: string;
+  life: number; wig: number; trail: number[][];
+  owner?: Tower;
+}
+interface Shell {
+  kind: 'shell'; x0: number; y0: number; x1: number; y1: number; t: number; T: number;
+  dmg: number; splash: number; color: string; arc: number;
+  burnDps?: number; burnDur?: number; cluster?: number; stun?: number; mini?: boolean;
+  owner?: Tower;
+}
+type Proj = Bullet | Missile | Shell;
+
+interface Bolt { pts: number[][]; life: number; color: string }
+interface RayFx { x0: number; y0: number; x1: number; y1: number; life: number; max: number; color: string; w: number }
+interface Incoming { x: number; y: number; t: number }
+interface CellInfo { x: number; y: number; col: number; row: number; valid: boolean; path: boolean; rock: boolean; vein: boolean }
+
+export type BannerFn = (text: string, color?: string, tier?: 'critical' | 'medium' | 'low', sub?: string) => void;
+
+// ================= GAME =================
+export class Game {
+  cv: HTMLCanvasElement;
+  g: CanvasRenderingContext2D;
+  level: LevelSpec;
+  zone: (typeof ZONES)[0];
+  paths: Path[] = [];
+  endless: boolean;
+  cell: number;
+  k: number; // art scale relative to 48px tiles
+
+  state: 'playing' | 'won' | 'lost' = 'playing';
+  credits = 0; lives = 0; maxLives = 0;
+  waveIdx = -1;
+  totalWaves = 0;
+  waveActive = false;
+  interT = 0;
+  interMax = 1;
+  now = 0;
+  speed = 1;
+  defaultMode: 'first' | 'last' | 'strong' | 'weak' | 'close' = 'first'; // SERIALIZE: not needed (derived from settings)
+  diffTier = 2;                    // difficulty tier 0..4, set by UI (drives elite/mutator chances)
+  ascTier = 0;                      // Ascension tier 0..5, cumulative effects (see TUNING.ascension)
+  mirror = false;                   // Daily Op: horizontally mirror the path geometry
+  extraMutatorChance = 0;           // Daily Op: flat bonus added to the wave-mutator roll
+  hitStopT = 0;                    // SERIALIZE: not needed (sub-100ms transient)
+  slowMoT = 0;                     // remaining slow-motion seconds (real time)
+  slowMoScale = 0.3;
+  flashT = 0;                      // whiteout flash overlay
+  bossVignetteUntil = 0;           // red edge pulse during boss entrances
+  reduceFlash = false;             // accessibility (set by UI)
+  reduceMotion = false;            // accessibility (set by UI)
+  // --- NOVA --- // SERIALIZE: novaCharge, novaNeed, novaFireAt
+  novaCharge = 0;
+  novaNeed: number = TUNING.nova.killsToCharge;
+  novaFireAt = 0;                  // >0 while the 1.2s buildup is running
+  // --- combo --- // SERIALIZE: comboCount, lastKillAt
+  comboCount = 0;
+  lastKillAt = -99;
+  // --- supply drops --- // SERIALIZE: drops, nextDropAt, overclockUntil
+  drops: { x: number; y: number; vx: number; born: number; kind: 'credits' | 'recharge' | 'overclock' | 'hull' | 'fragment'; amount: number }[] = [];
+  nextDropAt = 0;
+  forceNextDrop = false;
+  overclockUntil = -99;
+  // --- scripted first encounters (set by UI for fresh saves) ---
+  scriptElite = false;
+  scriptDrop = false;
+  // --- per-run stat deltas, merged into the save by the UI on teardown --- // SERIALIZE: runStats
+  runStats = { kills: 0, wavesCleared: 0, towersBuilt: {} as Record<string, number>, elitesSlain: 0, bestCombo: 0, novasFired: 0, leaksByEnemy: {} as Record<string, number> };
+  onToast: (key: string, text: string) => void = () => {};
+  onWaveClear: () => void = () => {};   // fired once per wave clear — the UI hooks this to save a resume snapshot
+  peekTower: Tower | null = null;        // touch long-press range peek (mobile) — independent of `selected`
+  dpr = 1;                               // logical-to-physical canvas scale (CSS scale-to-fit x devicePixelRatio), set by UI.fit()
+  perfMode = false;                      // reduced particle cap / starfield / effects for lower-end mobile
+  onPerfDrop: () => void = () => {};     // fired once if the frame watchdog auto-enables perfMode mid-session
+  interestCap: number = TUNING.interest.cap; // real value always set in the constructor (level-scaled, or the flat Ascension IV override)
+  mods = new Set<string>();        // active level modifiers (gated); set before buildGrid runs
+  // --- meteors --- // SERIALIZE: nextMeteorAt, meteorWarn
+  nextMeteorAt = 0;
+  meteorWarn: { cell: number; at: number } | null = null;
+  // --- ion storms --- // SERIALIZE: nextStormAt, stormRow0, stormWarnUntil, stormUntil
+  nextStormAt = 0;
+  stormRow0 = -1;
+  stormWarnUntil = 0;
+  stormUntil = 0;
+  hapticsOn = false;               // set by UI from settings (Android vibration)
+  damageNumbersOn = true;          // set by UI from settings
+  startNova(): boolean {
+    if (!isUnlocked('nova') || this.state !== 'playing' || this.paused) return false;
+    if (this.novaCharge < this.novaNeed || this.novaFireAt > 0) return false;
+    this.novaFireAt = this.now + TUNING.nova.buildup;
+    audio.novaHum();
+    return true;
+  }
+  dmgText(x: number, y: number, amount: number) {
+    this.parts.push({ x, y, vx: rand(-8, 8), vy: -46, life: 0.55, max: 0.55, size: 11, color: 'rgba(238,240,255,0.85)', kind: 'text', text: fmt(Math.round(amount)) });
+  }
+  slowMo(dur: number, scale = 0.3) {
+    if (this.reduceMotion) return;
+    this.slowMoT = Math.max(this.slowMoT, dur);
+    this.slowMoScale = scale;
+  }
+  screenFlash(strength = 1) {
+    this.flashT = Math.max(this.flashT, this.reduceFlash ? strength * 0.25 : strength);
+  }
+  hitStop(t: number) {
+    if (this.reduceMotion) return;
+    this.hitStopT = Math.max(this.hitStopT, t);
+  }
+  buzz(pattern: number[]) {
+    if (!this.hapticsOn) return;
+    try { navigator.vibrate?.(pattern); } catch { /* unsupported */ }
+  }
+  paused = false;
+
+  enemies: Enemy[] = [];
+  towers: Tower[] = [];
+  projs: Proj[] = [];
+  bolts: Bolt[] = [];
+  rays: RayFx[] = [];
+  parts: Particle[] = [];
+  patches: Patch[] = [];
+  incomings: Incoming[] = [];
+  spawnQueue: { t: number; e: string; p: number }[] = [];
+  pendingWave: WaveGroup[] | null = null;   // SERIALIZE: pendingWave, pendingMutator, pending2Wave, pending2Mutator, waveMutator
+  pendingMutator: string | null = null;
+  pending2Wave: WaveGroup[] | null = null;
+  pending2Mutator: string | null = null;
+  waveMutator: string | null = null;        // mutator of the currently active wave
+  firstMutator = false;                     // set by UI when the player has never seen a mutator
+  autoWave = false;
+  diffHp = 1;
+  diffReward = 1;
+  meander = 0; // 0=low(straight) 1=medium 2=high — extra path turns/back-and-forths
+  waves: WaveGroup[][] = [];
+
+  // grid
+  cells: CellInfo[] = [];
+  cols = 0; rows = 0; gx0 = 0; gy0 = 0;
+  occupied: (Tower | null)[] = [];
+  portalPx: { x: number; y: number }[] = [];
+  basePx: { x: number; y: number }[] = [];
+
+  selected: Tower | null = null;
+  focus: Enemy | null = null;
+  armed: 'orbital' | 'stasis' | null = null;
+  cds: Record<string, number> = { orbital: 0, stasis: 0 };
+  mx = -100; my = -100;
+
+  moveArmed: Tower | null = null;
+  pendingMove: { tower: Tower; cellIdx: number } | null = null;
+  pendingBuild: { spec: TowerSpec; cellIdx: number } | null = null;
+  menuCell = -1;
+  menuHover: TowerSpec | null = null;
+
+  shakeMag = 0; shakeT = 0;
+  stars: { x: number; y: number; s: number; p: number }[] = [];
+  bgCanvas: HTMLCanvasElement;
+
+  metaDmgMul = 1; metaCostMul = 1; hasOrbital = false; hasStasis = false;
+  dev = false; devGod = false; devFree = false;
+  shakeOn = true;
+
+  killCount = 0;
+  livesLostTotal = 0;
+  // --- challenge tracking (evaluated once at win) ---
+  lateCallHappened = false;   // a wave was launched by the countdown hitting 0, not a deliberate early click
+  soldAny = false;
+  abilityUsed = false;
+
+  onHud: () => void = () => {};
+  onBanner: BannerFn = () => {};
+  onEnd: (won: boolean, stars: number) => void = () => {};
+  onSelect: () => void = () => {};
+  seenNewEnemy = false;
+
+  private raf = 0;
+  private lastT = 0;
+  destroyed = false;
+
+  constructor(cv: HTMLCanvasElement, level: LevelSpec, endless: boolean,
+              meta: { credits: number; hp: number; costMul: number; dmgMul: number; orbital: boolean; stasis: boolean },
+              cellSize = 48,
+              opts: { hpMul?: number; rewardMul?: number; waveFactor?: number; meander?: number; diffTier?: number; ascTier?: number; mirror?: boolean; forceMods?: string[]; mutatorBonus?: number; perfMode?: boolean } = {}) {
+    this.cv = cv;
+    this.g = cv.getContext('2d')!;
+    this.level = level;
+    this.endless = endless;
+    this.cell = cellSize;
+    this.k = cellSize / 48;
+    this.zone = ZONES[level.zone];
+    this.credits = Math.round((level.startCredits + meta.credits) * ((opts.ascTier ?? 0) >= 4 ? TUNING.ascension.startCreditMul : 1));
+    this.maxLives = this.lives = level.baseHp + meta.hp;
+    this.metaCostMul = meta.costMul;
+    this.metaDmgMul = meta.dmgMul;
+    this.hasOrbital = meta.orbital;
+    this.hasStasis = meta.stasis;
+    // Progression smoothing: L1-2 are gentler (new players are still learning the systems
+    // this session added), then a slow compensation ramp from L5->L10 offsets how much
+    // stronger the player's toolkit (combo/interest/elites/drops/nova) has become by then.
+    const SM = TUNING.smoothing;
+    let progressionMul = 1;
+    if (level.id <= 2) progressionMul = SM.earlyLevels;
+    else if (level.id >= SM.compensationFrom) {
+      const t = clamp((level.id - SM.compensationFrom) / (SM.compensationFull - SM.compensationFrom), 0, 1);
+      progressionMul = 1 + (SM.compensationMax - 1) * t;
+    }
+    this.ascTier = opts.ascTier ?? 0;
+    this.mirror = opts.mirror ?? false;
+    this.extraMutatorChance = opts.mutatorBonus ?? 0;
+    this.perfMode = opts.perfMode ?? false;
+    const AS = TUNING.ascension;
+    this.diffHp = (opts.hpMul ?? 1) * progressionMul * (this.ascTier >= 1 ? AS.hpMul : 1);
+    // Interest cap scales gently with level progress so it stays meaningful against
+    // late-campaign tower costs, not just early-game ones (endless has no level.id beyond
+    // its own fixed id, so it keeps the flat base — scaling it per endless-wave belongs to
+    // a different tuning knob, not this one).
+    this.interestCap = this.endless ? TUNING.interest.cap : TUNING.interest.cap + this.level.id * 3;
+    if (this.ascTier >= 4) this.interestCap = AS.interestCapTier4;
+    // Onslaught (tier 5+): meteors rage on every level, on top of whatever the level already has
+    if (this.ascTier >= 5) this.mods.add('meteors');
+    // Daily Op: 1-2 forced modifiers, added on top of whatever the level already has
+    for (const m of opts.forceMods || []) if (MODIFIER_INFO[m] && isUnlocked(MODIFIER_INFO[m].gate)) this.mods.add(m);
+    this.diffReward = opts.rewardMul ?? 1;
+    this.meander = opts.meander ?? 0;
+    this.diffTier = opts.diffTier ?? 2;
+    // Active modifiers: the level's list (endless: a seeded per-run pick), each behind its unlock gate.
+    const modPool = endless
+      ? (() => {
+          const rng = mulberry32((Math.random() * 1e9) | 0);
+          const all = Object.keys(MODIFIER_INFO);
+          const n = seededInt(rng, 0, 2);
+          const picked: string[] = [];
+          while (picked.length < n && all.length) picked.push(all.splice(seededInt(rng, 0, all.length - 1), 1)[0]);
+          return picked;
+        })()
+      : (level.modifiers || []);
+    for (const m of modPool) {
+      const info = MODIFIER_INFO[m];
+      if (info && (isUnlocked(info.gate) || endless)) this.mods.add(m);
+    }
+    this.waves = resampleWaves(level.waves, opts.waveFactor ?? 1);
+    this.totalWaves = endless ? 9999 : this.waves.length;
+    this.interT = 9 * (this.ascTier >= 5 ? TUNING.ascension.intermissionMul : 1);
+    this.interMax = this.interT;
+    const starCount = this.perfMode ? 66 : 110; // perf mode: -40% starfield density
+    for (let i = 0; i < starCount; i++) this.stars.push({ x: Math.random() * W, y: Math.random() * H, s: rand(0.6, 2.1), p: Math.random() * 7 });
+    this.buildGrid();
+    this.buildBg();
+    this.preparePending();
+    this.lastT = performance.now();
+    let watchTime = 0, watchFrames = 0;
+    const loop = (t: number) => {
+      if (this.destroyed) return;
+      const rawDt = Math.min(0.05, (t - this.lastT) / 1000);
+      this.lastT = t;
+      if (this.hitStopT > 0) this.hitStopT -= rawDt;
+      let timeScale = 1;
+      if (this.slowMoT > 0) { this.slowMoT -= rawDt; timeScale = this.slowMoScale; }
+      if (this.flashT > 0) this.flashT -= rawDt * 1.6;
+      const dt = this.paused || this.state !== 'playing' || this.hitStopT > 0 ? 0 : rawDt * this.speed * timeScale;
+      this.update(dt, rawDt);
+      this.render(rawDt);
+      this.onHud();
+      // Frame-time watchdog: sustained slowness (avg >20ms/frame over ~3s of active play)
+      // auto-enables performance mode once, rather than staying silently janky forever.
+      if (!this.perfMode && this.state === 'playing' && !this.paused && rawDt > 0) {
+        watchTime += rawDt; watchFrames++;
+        if (watchTime >= 3) {
+          const avgMs = (watchTime / watchFrames) * 1000;
+          if (avgMs > 20) { this.perfMode = true; this.onPerfDrop(); }
+          watchTime = 0; watchFrames = 0;
+        }
+      }
+      this.raf = requestAnimationFrame(loop);
+    };
+    this.raf = requestAnimationFrame(loop);
+  }
+  destroy() { this.destroyed = true; cancelAnimationFrame(this.raf); }
+
+  // ---------- unified grid ----------
+  cx(col: number) { return this.gx0 + col * this.cell + this.cell / 2; }
+  cy(row: number) { return this.gy0 + row * this.cell + this.cell / 2; }
+  colOf(x: number) { return Math.floor((x - this.gx0) / this.cell); }
+  rowOf(y: number) { return Math.floor((y - this.gy0) / this.cell); }
+  idx(col: number, row: number) { return row * this.cols + col; }
+
+  buildGrid() {
+    const top = 70, bottom = H - 22;
+    this.cols = Math.floor((W - 12) / this.cell);
+    this.rows = Math.floor((bottom - top) / this.cell);
+    this.gx0 = (W - this.cols * this.cell) / 2;
+    this.gy0 = top + ((bottom - top) - this.rows * this.cell) / 2;
+
+    const pathTiles = new Set<number>();
+    const rockTiles = new Set<number>();
+    const endTiles = new Set<number>();
+
+    // snap each level path to the grid → rectilinear tile path
+    this.paths = [];
+    this.portalPx = [];
+    this.basePx = [];
+    for (const rawPts0 of this.level.paths) {
+      const rawPts = this.mirror ? mirrorPts(rawPts0) : rawPts0;
+      const cellsPts: { c: number; r: number }[] = [];
+      for (let i = 0; i < rawPts.length; i++) {
+        let c = Math.round((rawPts[i][0] - this.gx0 - this.cell / 2) / this.cell);
+        let r = Math.round((rawPts[i][1] - this.gy0 - this.cell / 2) / this.cell);
+        r = clamp(r, 0, this.rows - 1);
+        if (i === 0) c = -2;
+        else if (i === rawPts.length - 1) c = this.cols + 1;
+        else c = clamp(c, 1, this.cols - 2);
+        // enforce rectilinear against previous point
+        if (i > 0) {
+          const prev = cellsPts[cellsPts.length - 1];
+          const horiz = Math.abs(rawPts[i][0] - rawPts[i - 1][0]) >= Math.abs(rawPts[i][1] - rawPts[i - 1][1]);
+          if (horiz) r = prev.r; else c = prev.c;
+          if (c === prev.c && r === prev.r) continue; // dedupe
+        }
+        cellsPts.push({ c, r });
+      }
+      const meandered = applyMeander(cellsPts, this.meander, this.cols, this.rows);
+      // waypoints in px through tile centers
+      const pts = meandered.map(p => [this.cx(p.c), this.cy(p.r)]);
+      this.paths.push(new Path(pts));
+      // carve path tiles
+      let firstIn: { c: number; r: number } | null = null;
+      let lastIn: { c: number; r: number } | null = null;
+      for (let i = 0; i < meandered.length - 1; i++) {
+        const a = meandered[i], b = meandered[i + 1];
+        const dc = Math.sign(b.c - a.c), dr = Math.sign(b.r - a.r);
+        let c = a.c, r = a.r;
+        while (true) {
+          if (c >= 0 && c < this.cols && r >= 0 && r < this.rows) {
+            pathTiles.add(this.idx(c, r));
+            if (!firstIn) firstIn = { c, r };
+            lastIn = { c, r };
+          }
+          if (c === b.c && r === b.r) break;
+          c += dc; r += dr;
+        }
+      }
+      const fi = firstIn || { c: 0, r: meandered[0].r };
+      const li = lastIn || { c: this.cols - 1, r: meandered[meandered.length - 1].r };
+      this.portalPx.push({ x: this.cx(fi.c), y: this.cy(fi.r) });
+      this.basePx.push({ x: this.cx(li.c), y: this.cy(li.r) });
+      endTiles.add(this.idx(fi.c, fi.r));
+      endTiles.add(this.idx(li.c, li.r));
+    }
+
+    // asteroids → rock tiles (mirrored along with the path on Daily Op)
+    const levelAsteroids = this.mirror ? (this.level.asteroids || []).map(a => ({ ...a, x: W - a.x })) : (this.level.asteroids || []);
+    for (const a of levelAsteroids) {
+      for (let r = 0; r < this.rows; r++) for (let c = 0; c < this.cols; c++) {
+        const i = this.idx(c, r);
+        if (pathTiles.has(i)) continue;
+        if (dist(this.cx(c), this.cy(r), a.x, a.y) < a.r + this.cell * 0.2) rockTiles.add(i);
+      }
+    }
+
+    // Asteroid Field modifier: seeded extra rock cells. By construction these can only
+    // land on candidate cells that are NOT path/end/rock, so the path is never blocked.
+    const veinTiles = new Set<number>();
+    if (this.mods.has('asteroids')) {
+      const rng = mulberry32(hashString(`${this.level.id}-ast`) ^ (this.endless ? (Math.random() * 1e9) | 0 : 0));
+      const want = seededInt(rng, TUNING.asteroids.cellsMin, TUNING.asteroids.cellsMax);
+      let placed = 0;
+      for (let attempt = 0; attempt < 400 && placed < want; attempt++) {
+        const c = seededInt(rng, 0, this.cols - 1), r = seededInt(rng, 0, this.rows - 1);
+        const i = this.idx(c, r);
+        if (pathTiles.has(i) || rockTiles.has(i) || endTiles.has(i)) continue;
+        rockTiles.add(i);
+        placed++;
+      }
+    }
+    // Rich Veins modifier: seeded glitter cells (stay buildable; towers there earn per kill)
+    if (this.mods.has('rich-veins')) {
+      const rng = mulberry32(hashString(`${this.level.id}-vein`) ^ (this.endless ? (Math.random() * 1e9) | 0 : 0));
+      const want = seededInt(rng, TUNING.richVeins.cells[0], TUNING.richVeins.cells[1]);
+      let placed = 0;
+      for (let attempt = 0; attempt < 400 && placed < want; attempt++) {
+        const c = seededInt(rng, 1, this.cols - 2), r = seededInt(rng, 1, this.rows - 2);
+        const i = this.idx(c, r);
+        if (pathTiles.has(i) || rockTiles.has(i) || endTiles.has(i) || veinTiles.has(i)) continue;
+        veinTiles.add(i);
+        placed++;
+      }
+    }
+
+    this.cells = [];
+    this.occupied = [];
+    for (let r = 0; r < this.rows; r++) {
+      for (let c = 0; c < this.cols; c++) {
+        const i = this.idx(c, r);
+        const isPath = pathTiles.has(i);
+        const isRock = rockTiles.has(i);
+        const isEnd = endTiles.has(i);
+        this.cells.push({
+          x: this.cx(c), y: this.cy(r), col: c, row: r,
+          path: isPath, rock: isRock, vein: veinTiles.has(i),
+          valid: !isPath && !isRock && !isEnd,
+        });
+        this.occupied.push(null);
+      }
+    }
+  }
+  cellAt(x: number, y: number): number {
+    const c = this.colOf(x), r = this.rowOf(y);
+    if (c < 0 || c >= this.cols || r < 0 || r >= this.rows) return -1;
+    return this.idx(c, r);
+  }
+  cellFree(i: number, ignore: Tower | null = null) {
+    return i >= 0 && this.cells[i].valid && (this.occupied[i] === null || this.occupied[i] === ignore);
+  }
+  // Chebyshev tile range check from a tower (or tile) to a point
+  // A cell is in range if it overlaps a circle of radius R tiles centred on (cx, cy).
+  circCell(cx: number, cy: number, R: number, col: number, row: number) {
+    const x0 = this.gx0 + col * this.cell, y0 = this.gy0 + row * this.cell;
+    const nx = clamp(cx, x0, x0 + this.cell), ny = clamp(cy, y0, y0 + this.cell);
+    const rr = R * this.cell;
+    return (nx - cx) * (nx - cx) + (ny - cy) * (ny - cy) < rr * rr - 0.001;
+  }
+  inRangeT(t: Tower, e: { x: number; y: number }, R: number) {
+    return this.circCell(t.x, t.y, R, this.colOf(e.x), this.rowOf(e.y));
+  }
+
+  // ---------- economy ----------
+  costOf(spec: TowerSpec) { return this.devFree ? 0 : Math.round(spec.stages[0].cost * this.metaCostMul); }
+  upgradeCost(stat: StageStats) { return this.devFree ? 0 : Math.round(stat.cost * this.metaCostMul); }
+
+  // Refund a bought upgrade node (and every purchase that depends on it).
+  // kind 'stage' with idx 1|2, or kind 'branch' with row 0|1 (current branch).
+  refundNode(t: Tower, kind: 'stage' | 'branch', idx: number) {
+    let refund = 0;
+    const costOf = (st: StageStats) => this.upgradeCost(st);
+    if (kind === 'stage') {
+      if (t.branch >= 0) {
+        refund += costOf(t.spec.branches[t.branch][0]);
+        if (t.branchStage >= 1) refund += costOf(t.spec.branches[t.branch][1]);
+        t.branch = -1; t.branchStage = 0;
+      }
+      for (let s = t.stage; s >= idx; s--) refund += costOf(t.spec.stages[s]);
+      t.stage = idx - 1;
+    } else {
+      if (t.branch < 0) return;
+      if (idx === 0) {
+        if (t.branchStage >= 1) refund += costOf(t.spec.branches[t.branch][1]);
+        refund += costOf(t.spec.branches[t.branch][0]);
+        t.branch = -1; t.branchStage = 0;
+      } else {
+        if (t.branchStage < 1) return;
+        refund += costOf(t.spec.branches[t.branch][1]);
+        t.branchStage = 0;
+      }
+    }
+    this.credits += refund;
+    t.spent = Math.max(0, t.spent - refund);
+    t.rampT = 0; t.cool = Math.min(t.cool, 1);
+    audio.ui('sell');
+    this.floater(t.x, t.y - 30, `+${refund} refunded`, '#fff3b0');
+    this.parts.push({ x: t.x, y: t.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 40, color: '#ffb3c6', kind: 'ring' });
+    this.onSelect(); this.onHud();
+  }
+
+  // ---------- waves ----------
+  waveAt(i: number): WaveGroup[] | null {
+    if (!this.endless && i >= this.totalWaves) return null;
+    return this.endless ? this.genEndlessWave(i) : this.waves[i];
+  }
+
+  // Roll a mutator for wave index i. Locked at generation time so the forecast
+  // is always honest — what's previewed is exactly what arrives.
+  rollMutator(i: number, prevMutated: boolean): string | null {
+    if (!isUnlocked('mutators')) return null;
+    const M = TUNING.mutators;
+    const fromWave = this.ascTier >= 2 ? TUNING.ascension.mutatorFromWave : M.fromWave;
+    if (i + 1 < fromWave) return null;
+    if (prevMutated && this.level.id < M.noBackToBackBeforeLevel) return null;
+    const chance = (this.endless && i >= 9 ? M.endlessLate
+      : M.baseChance + this.level.id * M.perLevel + this.diffTier * M.perDifficulty)
+      + (this.ascTier >= 2 ? TUNING.ascension.mutationBonus : 0)
+      + this.extraMutatorChance;
+    if (Math.random() >= chance) return null;
+    if (this.firstMutator) { this.firstMutator = false; return 'bounty'; }
+    const pool = Object.values(MUTATORS).filter(m => !m.hard || isUnlocked('mutators_hard') || this.endless);
+    return pool[Math.floor(Math.random() * pool.length)].id;
+  }
+
+  // Keep both forecast slots filled: pending (next wave) and pending2 (the one after).
+  preparePending() {
+    if (!this.pendingWave) {
+      if (this.pending2Wave) {
+        this.pendingWave = this.pending2Wave; this.pendingMutator = this.pending2Mutator;
+        this.pending2Wave = null; this.pending2Mutator = null;
+      } else {
+        this.pendingWave = this.waveAt(this.waveIdx + 1);
+        this.pendingMutator = this.pendingWave ? this.rollMutator(this.waveIdx + 1, this.waveMutator !== null) : null;
+      }
+    }
+    if (!this.pending2Wave && this.pendingWave) {
+      this.pending2Wave = this.waveAt(this.waveIdx + 2);
+      this.pending2Mutator = this.pending2Wave ? this.rollMutator(this.waveIdx + 2, this.pendingMutator !== null) : null;
+    }
+  }
+
+  callWave(early: boolean) {
+    if (this.state !== 'playing' || this.waveActive || !this.pendingWave) return;
+    if (!early) this.lateCallHappened = true;
+    if (early && this.interT > 0.5) {
+      const bonus = Math.round(this.interT * 3);
+      this.credits += bonus;
+      this.floater(W / 2, 120, `+${bonus} early bonus`, '#fff3b0');
+      audio.ui('coin');
+    }
+    this.waveIdx++;
+    this.waveActive = true;
+    this.interT = 0;
+    const wave = this.pendingWave;
+    this.waveMutator = this.pendingMutator;
+    this.pendingWave = null;
+    this.pendingMutator = null;
+    const hordeMul = this.waveMutator === 'horde' ? TUNING.mutators.hordeCountMul : 1;
+    for (const grp of wave) {
+      const n = ENEMIES[grp.e].boss ? grp.n : Math.round(grp.n * hordeMul);
+      for (let i = 0; i < n; i++) {
+        this.spawnQueue.push({ t: this.now + grp.d + i * grp.iv / hordeMul, e: grp.e, p: grp.p || 0 });
+      }
+    }
+    if (this.scriptDrop && this.waveIdx === 1) {
+      this.scriptDrop = false;
+      this.nextDropAt = this.now + 4;
+      this.forceNextDrop = true;
+    }
+    const hasBoss = wave.some(grp => ENEMIES[grp.e].boss);
+    if (hasBoss) {
+      const bossSpec = ENEMIES[wave.find(grp => ENEMIES[grp.e].boss)!.e];
+      this.onBanner(`⚠ ${bossSpec.name} ⚠`, '#ff8fa3', 'critical');
+      if (isUnlocked('boss_theater')) { audio.klaxon(); this.bossVignetteUntil = this.now + 3; }
+      else audio.ui('boss');
+      this.shake(8);
+    }
+    else { this.onBanner(`Wave ${this.waveIdx + 1}`, '#a0d8ef', 'medium'); audio.ui('wave'); }
+    if (this.waveMutator) {
+      const m = MUTATORS[this.waveMutator];
+      this.onBanner(`${m.icon} ${m.name.toUpperCase()} WAVE`, m.color, 'medium', m.blurb);
+      this.onToast('mutators', 'Mutated waves twist the rules — the forecast up top warns you before you launch.');
+    }
+    this.preparePending(); // so the next wave can be previewed during this one
+  }
+
+  genEndlessWave(i: number): WaveGroup[] {
+    const pool = ['drone', 'dart', 'swarmling', 'brute', 'aegis', 'wisp', 'raptor', 'mender', 'splitter', 'phase'];
+    const gs: WaveGroup[] = [];
+    if ((i + 1) % 10 === 0) {
+      const b = ['mothership', 'colossus', 'leviathan'][Math.min(2, Math.floor(i / 10))];
+      gs.push({ e: b, n: 1, iv: 0, d: 2 });
+    }
+    let budget = 55 + i * 26;
+    let delay = 0;
+    while (budget > 0) {
+      const id = pool[Math.floor(Math.random() * Math.min(pool.length, 3 + Math.floor(i / 1.4)))];
+      const spec = ENEMIES[id];
+      const cost = Math.max(4, spec.hp / 8);
+      const n = clamp(Math.floor(budget / cost / 2) + 1, 2, id === 'swarmling' ? 20 : 9);
+      gs.push({ e: id, n, iv: clamp(1.1 - i * 0.02, 0.2, 1.1), d: delay });
+      budget -= cost * n;
+      delay += rand(1.5, 3.5);
+    }
+    return gs;
+  }
+  endlessHpMul(i: number) { return 1 + i * 0.22 + i * i * 0.012; }
+
+  mkEnemy(id: string, pathIdx: number, hpMul: number, rewardMul: number) {
+    const spec = ENEMIES[id];
+    const pi = Math.min(pathIdx, this.paths.length - 1);
+    return new Enemy(spec, this.paths[pi], pi, hpMul * this.diffHp, rewardMul * this.diffReward, this.portalPx[pi], this.basePx[pi]);
+  }
+
+  spawnAt(id: string, near: Enemy) {
+    const spec = ENEMIES[id];
+    const e = this.mkEnemy(id, near.pathIdx, near.hpMul * 0.7, 1);
+    if (spec.flying) {
+      e.fx0 = near.x; e.fy0 = near.y;
+      e.fDur = Math.max(0.1, dist(near.x, near.y, e.fx1, e.fy1) / spec.speed);
+      e.x = near.x; e.y = near.y;
+    } else {
+      e.d = near.spec.flying ? this.nearestPathD(near) : near.d;
+    }
+    this.enemies.push(e);
+    this.spark(near.x, near.y, spec.color, 8);
+  }
+  nearestPathD(near: Enemy) {
+    let best = 0, bd = Infinity;
+    for (let d = 0; d < near.path.total; d += 24) {
+      const p = near.path.at(d);
+      const dd = dist(p.x, p.y, near.x, near.y);
+      if (dd < bd) { bd = dd; best = d; }
+    }
+    return best;
+  }
+
+  // ---------- update ----------
+  update(dt: number, rawDt: number) {
+    if (dt > 0) this.now += dt;
+    const now = this.now;
+
+    for (let i = this.spawnQueue.length - 1; i >= 0; i--) {
+      const s = this.spawnQueue[i];
+      if (now >= s.t) {
+        this.spawnQueue.splice(i, 1);
+        const spec = ENEMIES[s.e];
+        const hpMul = (this.endless ? this.endlessHpMul(this.waveIdx) : this.level.hpMul) * (1 + this.waveIdx * 0.03);
+        const rewardMul = 1 + (this.level.hpMul - 1) * 0.22 + (this.endless ? this.waveIdx * 0.05 : 0);
+        const e = this.mkEnemy(s.e, s.p, hpMul, rewardMul);
+        if (this.waveMutator) this.applyMutator(e);
+        // --- elite promotion ---
+        if (!e.spec.boss && isUnlocked('elites')) {
+          const E = TUNING.elites;
+          const chance = (E.baseChance + this.level.id * E.perLevel + this.diffTier * E.perDifficulty
+            + (this.endless ? this.waveIdx * E.perEndlessWave : 0)) * (this.ascTier >= 3 ? TUNING.ascension.eliteMul : 1);
+          const forced = this.scriptElite && this.waveIdx === 2;
+          if (forced || Math.random() < chance) {
+            if (forced) this.scriptElite = false;
+            const pool = ['shielded', 'swift', 'vampiric'] as const;
+            const first = forced ? 'shielded' as const : pool[Math.floor(Math.random() * 3)];
+            const affixes: ('shielded' | 'swift' | 'vampiric')[] = [first];
+            if (!forced && this.ascTier >= 3 && Math.random() < TUNING.ascension.dualAffixChance) {
+              const second = pool.filter(a => a !== first)[Math.floor(Math.random() * 2)];
+              affixes.push(second);
+            }
+            e.makeElite(affixes);
+            if (forced) this.onToast('elites', 'A crowned ELITE — tougher, faster to act on, triple bounty. Focus fire it down!');
+          }
+        }
+        this.enemies.push(e);
+        this.portalFx(e);
+        if (this.level.newEnemy && s.e === this.level.newEnemy.id && !this.seenNewEnemy) {
+          this.seenNewEnemy = true;
+          this.onBanner(`New foe: ${spec.name}`, spec.color, 'medium', spec.desc);
+        }
+        if (spec.boss) {
+          this.shake(isUnlocked('boss_theater') ? 10 : 6);
+          if (isUnlocked('boss_theater')) {
+            this.parts.push({ x: e.x, y: e.y, vx: 0, vy: 0, life: 0.6, max: 0.6, size: spec.size * 4, color: spec.color, kind: 'ring' });
+            for (let k = 0; k < 14; k++) this.smoke(e.x + rand(-spec.size, spec.size), e.y + rand(-spec.size * 0.6, spec.size * 0.6));
+            audio.explosion('big');
+          }
+        }
+      }
+    }
+
+    if (this.waveActive && this.spawnQueue.length === 0 && this.enemies.length === 0 && this.state === 'playing') {
+      this.waveActive = false;
+      this.runStats.wavesCleared++;
+      this.slowMo(0.4, 0.3);
+      this.screenFlash(0.3);
+      const bonus = 30 + this.waveIdx * 4;
+      this.credits += bonus;
+      this.floater(W / 2, 120, `Wave clear  +${bonus}`, '#a8e6cf');
+      audio.ui('coin');
+      // banked-credit interest (risk/reward: spend now vs save for the payout)
+      if (isUnlocked('interest')) {
+        const interest = Math.min(Math.floor((this.credits - bonus) * TUNING.interest.rate), this.interestCap);
+        if (interest > 0) {
+          this.credits += interest;
+          this.floater(W / 2, 146, `Interest  +${interest} ◆`, '#fff3b0');
+          this.onToast('interest', 'Banked credits earn 6% interest at each wave clear (capped) — saving up pays.');
+        }
+      }
+      if (!this.endless && this.waveIdx + 1 >= this.totalWaves) { this.win(); return; }
+      this.onWaveClear();
+      this.interMax = (this.endless ? 14 : 13) * (this.ascTier >= 5 ? TUNING.ascension.intermissionMul : 1);
+      this.interT = this.interMax;
+      this.preparePending();
+      if (this.autoWave) this.callWave(true);
+    }
+    // ---------- boss phase 2 (50% HP) ----------
+    if (isUnlocked('boss_phase2')) {
+      for (const e of this.enemies) {
+        if (!e.spec.boss || e.dead || e.bossPhase !== 1 || e.hp > e.maxHp * 0.5) continue;
+        e.bossPhase = 2;
+        e.phase2BaseSpeed = e.spec.speed;
+        this.onBanner(`${e.spec.name} — PHASE 2`, '#ff8fa3', 'medium');
+        this.shake(8);
+        this.ringFx(e.x, e.y, e.spec.size * 3, '#ff8fa3');
+        audio.ui('boss');
+        if (e.spec.id === 'mothership') {
+          e.spec = { ...e.spec, speed: e.spec.speed * 1.3, spawnMinion: e.spec.spawnMinion ? { ...e.spec.spawnMinion, every: e.spec.spawnMinion.every / 2 } : undefined };
+        } else if (e.spec.id === 'leviathan') {
+          e.arcA = Math.random() * Math.PI * 2;
+          e.shield = e.maxShield; // barrier snaps back to full as it reconfigures
+        }
+        // colossus: handled per-EMP (radius ×2, rage stacking)
+      }
+    }
+
+    // ---------- NOVA ----------
+    if (this.novaFireAt > 0 && now >= this.novaFireAt) {
+      this.novaFireAt = 0;
+      this.novaCharge = 0;
+      this.novaNeed = Math.round(this.novaNeed * TUNING.nova.rechargeGrowth);
+      this.runStats.novasFired++;
+      audio.novaBlast();
+      this.screenFlash(1);
+      this.slowMo(0.5, 0.25);
+      this.shake(14);
+      this.buzz([60, 40, 80]);
+      this.parts.push({ x: W / 2, y: H / 2, vx: 0, vy: 0, life: 0.7, max: 0.7, size: W * 0.75, color: '#fff3b0', kind: 'ring' });
+      for (const e of [...this.enemies]) {
+        if (e.dead) continue;
+        e.hurt(TUNING.nova.damage * (e.spec.boss ? TUNING.nova.bossFrac : 1), this, true);
+      }
+      this.onHud();
+    }
+
+    // ---------- floating damage numbers (batched per enemy, ~4/s each) ----------
+    if (this.damageNumbersOn && dt > 0) {
+      for (const e of this.enemies) {
+        if (e.dmgAccum >= 1 && now >= e.dmgFlushAt) {
+          this.dmgText(e.x + rand(-8, 8), e.y - e.spec.size - 6, e.dmgAccum);
+          e.dmgAccum = 0;
+          e.dmgFlushAt = now + 0.28;
+        }
+      }
+    }
+
+    // ---------- combo timeout ----------
+    if (this.comboCount > 0 && now - this.lastKillAt > TUNING.combo.window) {
+      this.comboCount = 0;
+    }
+
+    // ---------- meteor shower modifier ----------
+    if (this.mods.has('meteors') && this.state === 'playing' && dt > 0 && this.waveActive) {
+      const M = TUNING.meteors;
+      if (this.nextMeteorAt === 0) this.nextMeteorAt = now + rand(M.intervalMin, M.intervalMax);
+      if (!this.meteorWarn && now >= this.nextMeteorAt) {
+        // prefer a cell holding a tower; fall back to any buildable cell
+        const occ = this.towers.map(t => t.cell).filter(c => c >= 0);
+        const cell = occ.length && Math.random() < 0.75
+          ? occ[Math.floor(Math.random() * occ.length)]
+          : (() => { const v = this.cells.map((c, i) => c.valid ? i : -1).filter(i => i >= 0); return v[Math.floor(Math.random() * v.length)]; })();
+        this.meteorWarn = { cell, at: now + M.warning };
+        this.nextMeteorAt = now + rand(M.intervalMin, M.intervalMax);
+        audio.ui('boss');
+        this.onToast('mod_meteors', 'METEOR INBOUND — the red ring marks the impact. Towers hit are knocked offline for 6s.');
+      }
+      if (this.meteorWarn && now >= this.meteorWarn.at) {
+        const cellIdx = this.meteorWarn.cell;
+        const c = this.cells[cellIdx];
+        this.meteorWarn = null;
+        this.shake(7);
+        audio.explosion('big');
+        this.parts.push({ x: c.x, y: c.y, vx: 0, vy: 0, life: 0.45, max: 0.45, size: this.cell * 1.6, color: '#ff9d76', kind: 'ring' });
+        for (let i = 0; i < 16; i++) {
+          const a = Math.random() * Math.PI * 2, sp = rand(90, 320);
+          this.parts.push({ x: c.x, y: c.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.3, 0.7), max: 0.7, size: rand(2, 5), color: i % 2 ? '#ff9d76' : '#8d93b8', kind: 'shard', rot: Math.random() * 6, vr: rand(-9, 9) });
+        }
+        const t = this.occupied[cellIdx];
+        if (t) {
+          t.disabledUntil = now + TUNING.meteors.disable;
+          this.floater(c.x, c.y - 24, 'DISABLED', '#ff9d76');
+        }
+        if (Math.random() < TUNING.meteors.fragmentChance) {
+          this.drops.push({ x: c.x, y: c.y, vx: 0, born: now, kind: 'fragment', amount: TUNING.meteors.fragmentCredits });
+        }
+      }
+    }
+
+    // ---------- ion storm modifier ----------
+    if (this.mods.has('ion-storms') && this.state === 'playing' && dt > 0 && this.waveActive) {
+      const S = TUNING.ionStorms;
+      if (this.nextStormAt === 0) this.nextStormAt = now + S.interval * 0.6;
+      if (this.stormRow0 < 0 && now >= this.nextStormAt) {
+        this.stormRow0 = Math.floor(Math.random() * Math.max(1, this.rows - S.bandRows + 1));
+        this.stormWarnUntil = now + S.warning;
+        this.stormUntil = now + S.warning + S.duration;
+        this.nextStormAt = now + S.interval;
+        audio.ui('wave');
+        this.onToast('mod_ionstorms', 'ION STORM — towers inside the highlighted band fire 30% slower while it rages.');
+      }
+      if (this.stormRow0 >= 0 && now >= this.stormUntil) this.stormRow0 = -1;
+    }
+
+    // ---------- supply drops ----------
+    if (this.state === 'playing' && dt > 0 && isUnlocked('drops')) {
+      const D = TUNING.drops;
+      if (this.nextDropAt === 0) this.nextDropAt = now + rand(D.intervalMin, D.intervalMax);
+      if (this.waveActive && now >= this.nextDropAt) {
+        const spawn = this.forceNextDrop || Math.random() < D.chance;
+        this.forceNextDrop = false;
+        this.nextDropAt = now + rand(D.intervalMin, D.intervalMax);
+        if (spawn) this.spawnDrop();
+      }
+      for (let i = this.drops.length - 1; i >= 0; i--) {
+        const d = this.drops[i];
+        d.x += d.vx * dt;
+        if (now - d.born > D.lifetime || d.x < 70 || d.x > W - 70) {
+          this.drops.splice(i, 1);
+          this.parts.push({ x: d.x, y: d.y, vx: 0, vy: 0, life: 0.3, max: 0.3, size: 26, color: '#c5b3f6', kind: 'ring' });
+        }
+      }
+      if (now < this.overclockUntil && Math.random() < dt * 2.5 && this.towers.length) {
+        const t = this.towers[Math.floor(Math.random() * this.towers.length)];
+        this.parts.push({ x: t.x + rand(-10, 10), y: t.y - 14, vx: 0, vy: -30, life: 0.4, max: 0.4, size: 2.2, color: '#ffd97a', kind: 'spark' });
+      }
+    }
+
+    if (!this.waveActive && this.state === 'playing' && dt > 0) {
+      this.interT -= dt;
+      if (this.interT <= 0) this.callWave(false);
+    }
+
+    for (const e of this.enemies) e.update(dt, now, this);
+    this.enemies = this.enemies.filter(e => !e.dead);
+    if (this.focus && (this.focus.dead || !this.enemies.includes(this.focus))) this.focus = null;
+
+    // buffs from amps (Chebyshev tiles)
+    for (const t of this.towers) { t.bDmg = 0; t.bRate = 0; t.bRange = 0; t.bCrit = 0; }
+    for (const a of this.towers) {
+      if (a.spec.kind !== 'amp' || now < a.disabledUntil) continue;
+      const s = a.raw;
+      for (const t of this.towers) {
+        if (t === a || t.spec.kind === 'amp') continue;
+        if (this.circCell(a.x, a.y, s.range, t.col, t.row)) {
+          t.bDmg = Math.max(t.bDmg, s.buffDmg || 0);
+          t.bRate = Math.max(t.bRate, s.buffRate || 0);
+          t.bRange = Math.max(t.bRange, s.buffRange || 0);
+          t.bCrit = Math.max(t.bCrit, s.crit || 0);
+        }
+      }
+    }
+
+    for (const t of this.towers) this.updateTower(t, dt, now);
+    this.updateProjs(dt, now);
+
+    for (const p of this.patches) {
+      if (p.kind === 'burn' && dt > 0) {
+        for (const e of this.enemies) {
+          if (!e.spec.flying && !e.dead && dist(e.x, e.y, p.x, p.y) < p.r) e.hurt(p.dps! * dt, this, true);
+        }
+      }
+      if (p.kind === 'stasis' && dt > 0) {
+        for (const e of this.enemies) {
+          if (!e.dead && dist(e.x, e.y, p.x, p.y) < p.r) e.applySlow(p.slow!, 0.25, now);
+        }
+      }
+    }
+    this.patches = this.patches.filter(p => now < p.until);
+
+    for (let i = this.incomings.length - 1; i >= 0; i--) {
+      const inc = this.incomings[i];
+      inc.t -= dt;
+      if (inc.t <= 0) {
+        this.incomings.splice(i, 1);
+        this.bigExplosion(inc.x, inc.y, ABILITIES.orbital.radius, ABILITIES.orbital.dmg, true);
+      }
+    }
+
+    for (const key of Object.keys(this.cds)) this.cds[key] = Math.max(0, this.cds[key] - dt);
+
+    for (const p of this.parts) {
+      p.life -= rawDt;
+      p.x += p.vx * rawDt; p.y += p.vy * rawDt;
+      if (p.grav) p.vy += p.grav * rawDt;
+      if (p.vr) p.rot = (p.rot || 0) + p.vr * rawDt;
+      if (p.kind === 'smoke' || p.kind === 'fire') { p.vx *= 0.96; p.vy *= 0.96; }
+    }
+    this.parts = this.parts.filter(p => p.life > 0);
+    if (this.perfMode && this.parts.length > 250) this.parts = this.parts.slice(-250); // oldest-culled cap
+    this.bolts = this.bolts.filter(b => (b.life -= rawDt) > 0);
+    this.rays = this.rays.filter(r => (r.life -= rawDt) > 0);
+
+    if (this.shakeT > 0) { this.shakeT -= rawDt; if (this.shakeT <= 0) this.shakeMag = 0; }
+  }
+
+  focusValidFor(t: Tower, R: number) {
+    return this.focus && this.focus.targetable && this.inRangeT(t, this.focus, R) && this.canHit(t, this.focus);
+  }
+
+  updateTower(t: Tower, dt: number, now: number) {
+    const s = t.stats(this);
+    const R = s.range;
+    const disabled = now < t.disabledUntil;
+    t.recoil = Math.max(0, t.recoil - dt * 6);
+    t.auraPulse += dt;
+    if (t.spec.kind === 'amp' || disabled) { t.beamTargets = []; return; }
+
+    if (s.aura) {
+      for (const e of this.enemies) {
+        if (!e.dead && this.inRangeT(t, e, R)) {
+          e.applySlow(s.slow!, 0.3, now);
+          if (s.dmg > 0 && dt > 0) e.hurt(s.dmg * dt, this, true, t);
+        }
+      }
+      return;
+    }
+
+    if (t.spec.kind === 'prism') {
+      const beams = s.beams || 1;
+      const inRange = this.enemies.filter(e => e.targetable && this.inRangeT(t, e, R) && this.canHit(t, e));
+      this.sortTargets(inRange, t);
+      if (this.focus && inRange.includes(this.focus)) {
+        inRange.splice(inRange.indexOf(this.focus), 1);
+        inRange.unshift(this.focus);
+      }
+      const targets = inRange.slice(0, beams);
+      if (targets.length && targets[0] === t.target) t.rampT += dt;
+      else { t.rampT = targets.length ? dt : 0; t.target = targets[0] || null; }
+      t.beamTargets = targets;
+      if (targets.length) {
+        t.angle = Math.atan2(targets[0].y - t.y, targets[0].x - t.x);
+        const mult = 1 + ((s.rampMax || 3) - 1) * clamp(t.rampT / (s.rampTime || 3), 0, 1);
+        for (const e of targets) {
+          const crit = Math.random() < (s.crit || 0) ? 2.5 : 1;
+          e.hurt(s.dmg * mult * crit * dt, this, true, t);
+        }
+        if (dt > 0 && Math.random() < dt * 2.2) audio.shoot('prism');
+        if (dt > 0 && Math.random() < dt * 10) {
+          const e = targets[0];
+          this.spark(e.x + rand(-5, 5), e.y + rand(-5, 5), t.spec.color, 1);
+        }
+      }
+      return;
+    }
+
+    t.cool -= dt * s.rate;
+    if (this.focusValidFor(t, R)) {
+      t.target = this.focus;
+    } else {
+      if (t.target && (t.target.dead || !t.target.targetable || !this.inRangeT(t, t.target, R) || !this.canHit(t, t.target))) t.target = null;
+      if (!t.target || t.mode !== 'first') {
+        const cands = this.enemies.filter(e => e.targetable && this.inRangeT(t, e, R) && this.canHit(t, e));
+        if (cands.length) { this.sortTargets(cands, t); t.target = cands[0]; }
+        else t.target = null;
+      }
+    }
+    if (t.target) {
+      const want = Math.atan2(t.target.y - t.y, t.target.x - t.x);
+      let diff = want - t.angle;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      t.angle += clamp(diff, -8 * dt, 8 * dt);
+      if (t.cool <= 0 && dt > 0) { t.cool = 1; this.fire(t, s); }
+    }
+  }
+
+  canHit(t: Tower, e: Enemy) {
+    if (e.spec.flying && t.raw.groundOnly) return false;
+    return true;
+  }
+  sortTargets(arr: Enemy[], t: Tower) {
+    switch (t.mode) {
+      case 'first': arr.sort((a, b) => b.progress - a.progress); break;
+      case 'last': arr.sort((a, b) => a.progress - b.progress); break;
+      case 'strong': arr.sort((a, b) => (b.hp + b.shield) - (a.hp + a.shield)); break;
+      case 'weak': arr.sort((a, b) => (a.hp + a.shield) - (b.hp + b.shield)); break;
+      case 'close': arr.sort((a, b) => dist(a.x, a.y, t.x, t.y) - dist(b.x, b.y, t.x, t.y)); break;
+    }
+  }
+
+  fire(t: Tower, s: any) {
+    const e = t.target!;
+    const bx = t.x + Math.cos(t.angle) * 14 * this.k, by = t.y + Math.sin(t.angle) * 14 * this.k;
+    t.recoil = 1;
+    this.flash(bx, by, t.spec.color);
+    switch (t.spec.kind) {
+      case 'bullet': {
+        audio.shoot(s.rate > 2.4 ? 'gatling' : (s.pierce ? 'lance' : 'pulse'));
+        const speed = (s.pierce || s.range >= 6) ? 900 : 560;
+        const tt = clamp(dist(e.x, e.y, t.x, t.y) / speed, 0, 1);
+        const px = e.x + Math.cos(e.angle) * e.effSpeed(this.now) * tt;
+        const py = e.y + Math.sin(e.angle) * e.effSpeed(this.now) * tt;
+        const a = Math.atan2(py - by, px - bx);
+        this.projs.push({
+          kind: 'bullet', owner: t, x: bx, y: by, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed,
+          dmg: s.dmg, color: t.spec.color, pierce: s.pierce || 0, hit: new Set(), life: 1.6,
+          w: s.pierce ? 5 : 3.4, crit: s.crit, trail: [], target: e,
+        });
+        break;
+      }
+      case 'cryo': {
+        audio.shoot('cryo');
+        const a = Math.atan2(e.y - by, e.x - bx);
+        this.projs.push({
+          kind: 'bullet', owner: t, x: bx, y: by, vx: Math.cos(a) * 400, vy: Math.sin(a) * 400,
+          dmg: s.dmg, color: t.spec.color, pierce: 0, hit: new Set(), life: 1.4,
+          w: 4, slow: s.slow, slowDur: s.slowDur, freeze: s.freeze, trail: [], target: e,
+        });
+        break;
+      }
+      case 'missile': {
+        audio.shoot('missile');
+        const shots = s.shots || 1;
+        for (let i = 0; i < shots; i++) {
+          const spread = (i - (shots - 1) / 2) * 0.5;
+          const a = t.angle + spread + rand(-0.1, 0.1);
+          this.projs.push({
+            kind: 'missile', owner: t, x: bx, y: by, vx: Math.cos(a) * 120, vy: Math.sin(a) * 120,
+            speed: 150, target: e, dmg: s.dmg, splash: s.splash || 24, airMul: s.airMul || 1,
+            color: t.spec.color, life: 5, wig: Math.random() * 9, trail: [],
+          });
+        }
+        break;
+      }
+      case 'mortar': {
+        audio.shoot('mortar');
+        this.shake(1.6);
+        const T = clamp(dist(e.x, e.y, t.x, t.y) / 220, 0.55, 1.4);
+        const px = e.x + Math.cos(e.angle) * e.effSpeed(this.now) * T;
+        const py = e.y + Math.sin(e.angle) * e.effSpeed(this.now) * T;
+        this.projs.push({
+          kind: 'shell', owner: t, x0: t.x, y0: t.y, x1: px, y1: py, t: 0, T,
+          dmg: s.dmg, splash: s.splash, color: t.spec.color, arc: 90 + T * 60,
+          burnDps: s.burnDps, burnDur: s.burnDur, cluster: s.cluster, stun: s.stun,
+        });
+        break;
+      }
+      case 'tesla': {
+        audio.shoot('tesla');
+        const chainR = this.cell * 2.5;
+        const hitList: Enemy[] = [e];
+        let cur = e;
+        for (let i = 0; i < (s.chains || 0); i++) {
+          let best: Enemy | null = null, bd = chainR;
+          for (const o of this.enemies) {
+            if (o.dead || !o.targetable || hitList.includes(o)) continue;
+            const dd = dist(o.x, o.y, cur.x, cur.y);
+            if (dd < bd) { bd = dd; best = o; }
+          }
+          if (!best) break;
+          hitList.push(best); cur = best;
+        }
+        let px = bx, py = by;
+        const falloff = (s.chains || 0) >= 7 ? 0.92 : 0.8;
+        hitList.forEach((en, i) => {
+          this.bolts.push({ pts: this.mkBolt(px, py, en.x, en.y), life: 0.14, color: t.spec.color });
+          px = en.x; py = en.y;
+          const crit = Math.random() < (s.crit || 0) ? 2.5 : 1;
+          en.hurt(s.dmg * Math.pow(falloff, i) * crit, this, false, t);
+          if (s.stun && Math.random() < s.stun) { en.frozenUntil = Math.max(en.frozenUntil, this.now + 0.8); this.spark(en.x, en.y, '#fff3b0', 4); }
+          this.spark(en.x, en.y, '#fff3b0', 2);
+        });
+        break;
+      }
+      case 'ray': {
+        audio.shoot('ray');
+        const a = Math.atan2(e.y - t.y, e.x - t.x);
+        t.angle = a;
+        const dx = Math.cos(a), dy = Math.sin(a);
+        const len = (s.range + 0.5) * this.cell;
+        const x1 = t.x + dx * len, y1 = t.y + dy * len;
+        const w = s.rayWidth || 10;
+        for (const en of this.enemies) {
+          if (en.dead || !en.targetable || !this.canHit(t, en)) continue;
+          const proj = (en.x - t.x) * dx + (en.y - t.y) * dy;
+          if (proj < 0 || proj > len) continue;
+          const perp = Math.abs((en.x - t.x) * dy - (en.y - t.y) * dx);
+          if (perp < w + en.spec.size * 0.6) {
+            const crit = Math.random() < (s.crit || 0) ? 2.5 : 1;
+            en.hurt(s.dmg * crit, this, false, t);
+            this.spark(en.x, en.y, t.spec.color, 2);
+          }
+        }
+        this.rays.push({ x0: bx, y0: by, x1, y1, life: 0.14, max: 0.14, color: t.spec.color, w });
+        break;
+      }
+      case 'flame': {
+        audio.shoot('flame');
+        const a = Math.atan2(e.y - t.y, e.x - t.x);
+        t.angle = a;
+        const cone = 0.55;
+        for (const en of this.enemies) {
+          if (en.dead || !en.targetable) continue;
+          if (!this.inRangeT(t, en, s.range)) continue;
+          let diff = Math.atan2(en.y - t.y, en.x - t.x) - a;
+          while (diff > Math.PI) diff -= Math.PI * 2;
+          while (diff < -Math.PI) diff += Math.PI * 2;
+          if (Math.abs(diff) < cone) {
+            en.hurt(s.dmg, this, true, t);
+            en.ignite(s.burnDps || 10, s.burnDur || 2.5, this.now);
+            if (Math.random() < 0.5) this.fireFx(en.x + rand(-5, 5), en.y + rand(-5, 5));
+          }
+        }
+        const reach = (s.range + 0.5) * this.cell;
+        for (let i = 0; i < 9; i++) {
+          const pa = a + rand(-cone * 0.8, cone * 0.8);
+          const sp = rand(90, 190);
+          this.parts.push({
+            x: bx, y: by, vx: Math.cos(pa) * sp, vy: Math.sin(pa) * sp,
+            life: rand(0.25, reach / 320), max: 0.6, size: rand(3.5, 7),
+            color: (t.branch === 2 ? ['#8fc9ef', '#c7e6ff', '#ffffff'] : ['#ffb37d', '#ff8a5c', '#ffd9a0'])[i % 3], kind: 'fire',
+          });
+        }
+        break;
+      }
+    }
+  }
+  mkBolt(x0: number, y0: number, x1: number, y1: number) {
+    const pts = [[x0, y0]];
+    const n = 6;
+    for (let i = 1; i < n; i++) {
+      const t = i / n;
+      pts.push([lerp(x0, x1, t) + rand(-9, 9), lerp(y0, y1, t) + rand(-9, 9)]);
+    }
+    pts.push([x1, y1]);
+    return pts;
+  }
+
+  updateProjs(dt: number, now: number) {
+    for (let i = this.projs.length - 1; i >= 0; i--) {
+      const p = this.projs[i];
+      if (p.kind === 'bullet') {
+        p.trail.push([p.x, p.y]); if (p.trail.length > 5) p.trail.shift();
+        // guaranteed hit: home on the intended target until it's struck or gone
+        if (p.target && !p.target.dead && p.target.targetable && !p.hit.has(p.target)) {
+          const sp = Math.hypot(p.vx, p.vy);
+          const a = Math.atan2(p.target.y - p.y, p.target.x - p.x);
+          p.vx = Math.cos(a) * sp; p.vy = Math.sin(a) * sp;
+        } else if (p.target && (p.target.dead || p.hit.has(p.target))) {
+          p.target = null;
+        }
+        p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+        let done = p.life <= 0 || p.x < -40 || p.x > W + 40 || p.y < -40 || p.y > H + 40;
+        for (const e of this.enemies) {
+          if (e.dead || !e.targetable || p.hit.has(e)) continue;
+          // non-piercing homing bullets only connect with their own target
+          if (!p.pierce && p.target && e !== p.target) continue;
+          if (dist(p.x, p.y, e.x, e.y) < e.spec.size + 6) {
+            p.hit.add(e);
+            const crit = Math.random() < (p.crit || 0) ? 2.5 : 1;
+            e.hurt(p.dmg * crit, this, false, p.owner);
+            if (crit > 1) this.floater(e.x, e.y - 22, 'CRIT', '#fff3b0');
+            if (p.slow) { e.applySlow(p.slow, p.slowDur || 2, now); this.spark(e.x, e.y, '#a0d8ef', 3); }
+            if (p.freeze && Math.random() < p.freeze) { e.frozenUntil = now + 1.2; e.brittle = true; audio.freezeCrack(); this.spark(e.x, e.y, '#ffffff', 6); }
+            this.spark(p.x, p.y, p.color, 3);
+            if (p.hit.size > p.pierce) { done = true; }
+            break;
+          }
+        }
+        if (done) this.projs.splice(i, 1);
+      } else if (p.kind === 'missile') {
+        p.trail.push([p.x, p.y]); if (p.trail.length > 9) p.trail.shift();
+        if (p.target && (p.target.dead || !p.target.targetable)) {
+          let best: Enemy | null = null, bd = 240;
+          for (const e of this.enemies) { if (e.dead || !e.targetable) continue; const dd = dist(e.x, e.y, p.x, p.y); if (dd < bd) { bd = dd; best = e; } }
+          p.target = best;
+        }
+        p.speed = Math.min(560, p.speed + 700 * dt);
+        if (p.target) {
+          const a = Math.atan2(p.target.y - p.y, p.target.x - p.x);
+          const cur = Math.atan2(p.vy, p.vx);
+          let diff = a - cur;
+          while (diff > Math.PI) diff -= Math.PI * 2;
+          while (diff < -Math.PI) diff += Math.PI * 2;
+          const na = cur + clamp(diff, -5.5 * dt, 5.5 * dt) + Math.sin(now * 18 + p.wig) * 0.04;
+          p.vx = Math.cos(na) * p.speed; p.vy = Math.sin(na) * p.speed;
+        }
+        p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+        if (Math.random() < dt * 26) this.smoke(p.x, p.y);
+        let boom = p.life <= 0;
+        if (p.target && dist(p.x, p.y, p.target.x, p.target.y) < p.target.spec.size + 8) boom = true;
+        if (boom) {
+          this.projs.splice(i, 1);
+          this.explode(p.x, p.y, p.splash, p.dmg, p.color, p.airMul, false, (p as any).owner);
+        }
+      } else {
+        p.t += dt;
+        const tt = clamp(p.t / p.T, 0, 1);
+        if (tt >= 1) {
+          this.projs.splice(i, 1);
+          this.explode(p.x1, p.y1, p.splash, p.dmg, p.color, 0, true, (p as any).owner);
+          if (p.stun) {
+            for (const en of this.enemies) {
+              if (en.dead || !en.targetable || en.spec.flying) continue;
+              if (dist(en.x, en.y, p.x1, p.y1) < p.splash + en.spec.size && Math.random() < p.stun) {
+                en.frozenUntil = Math.max(en.frozenUntil, now + 0.9);
+                this.spark(en.x, en.y, '#fff3b0', 4);
+              }
+            }
+          }
+          if (p.burnDps) this.patches.push({ x: p.x1, y: p.y1, r: p.splash * 0.95, until: now + (p.burnDur || 3), kind: 'burn', dps: p.burnDps });
+          if (p.cluster) {
+            for (let c = 0; c < p.cluster; c++) {
+              const a = Math.random() * Math.PI * 2, r = rand(26, 64);
+              this.projs.push({
+                kind: 'shell', owner: (p as any).owner, x0: p.x1, y0: p.y1, x1: p.x1 + Math.cos(a) * r, y1: p.y1 + Math.sin(a) * r,
+                t: 0, T: 0.4, dmg: p.dmg * 0.4, splash: 26, color: p.color, arc: 46, mini: true,
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  explode(x: number, y: number, r: number, dmg: number, color: string, airMul: number, groundOnly: boolean, owner?: Tower) {
+    audio.explosion(r > 55 ? 'big' : r > 34 ? 'med' : 'small');
+    this.shake(r > 55 ? 5 : r > 34 ? 3 : 1.4);
+    for (const e of this.enemies) {
+      if (e.dead) continue;
+      if (groundOnly && e.spec.flying) continue;
+      const dd = dist(e.x, e.y, x, y);
+      if (dd < r + e.spec.size) {
+        const fall = 1 - 0.5 * clamp(dd / r, 0, 1);
+        e.hurt(dmg * fall * (e.spec.flying && airMul ? airMul : 1), this, true, owner);
+      }
+    }
+    this.parts.push({ x, y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: r, color, kind: 'shock' });
+    this.parts.push({ x, y, vx: 0, vy: 0, life: 0.12, max: 0.12, size: r * 0.7, color: '#ffffff', kind: 'flash' });
+    for (let i = 0; i < Math.min(18, r / 2.6); i++) {
+      const a = Math.random() * Math.PI * 2, sp = rand(60, 260);
+      this.parts.push({
+        x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+        life: rand(0.3, 0.7), max: 0.7, size: rand(2, 5), color: Math.random() < 0.5 ? color : '#ffd9a0',
+        kind: 'dot',
+      });
+    }
+    for (let i = 0; i < 4; i++) this.smoke(x + rand(-r / 3, r / 3), y + rand(-r / 3, r / 3));
+  }
+
+  bigExplosion(x: number, y: number, r: number, dmg: number, hitsAir: boolean) {
+    this.explode(x, y, r, dmg, '#ffd3b6', hitsAir ? 1 : 0, false);
+    this.parts.push({ x, y, vx: 0, vy: 0, life: 0.5, max: 0.5, size: r * 1.4, color: '#fff3b0', kind: 'shock' });
+    this.shake(9);
+    audio.explosion('big');
+  }
+
+  empPulse(x: number, y: number, r: number, dur: number) {
+    this.parts.push({ x, y, vx: 0, vy: 0, life: 0.6, max: 0.6, size: r, color: '#ffb3c6', kind: 'shock' });
+    audio.ui('boss');
+    this.shake(4);
+    for (const t of this.towers) {
+      if (dist(t.x, t.y, x, y) < r) {
+        t.disabledUntil = this.now + dur;
+        this.spark(t.x, t.y, '#ffb3c6', 6);
+      }
+    }
+    this.floater(x, y - 50, 'EMP PULSE', '#ffb3c6');
+  }
+
+  // ---------- kills / leaks ----------
+  deathFx(e: Enemy) {
+    const spec = e.spec;
+    const push = (p: Partial<Particle> & { life: number; max: number; size: number; color: string; kind: Particle['kind'] }) =>
+      this.parts.push({ x: e.x, y: e.y, vx: 0, vy: 0, ...p } as Particle);
+    switch (spec.id) {
+      case 'dart': case 'raptor': {
+        // fast ones streak apart along their direction of travel
+        for (let i = 0; i < 10; i++) {
+          const a = e.angle + rand(-0.5, 0.5);
+          const sp = rand(160, 340);
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.2, 0.45), max: 0.45, size: rand(1.6, 3.2), color: i % 2 ? spec.color : '#ffffff', kind: 'spark' });
+        }
+        push({ life: 0.2, max: 0.2, size: spec.size * 1.8, color: spec.color, kind: 'ring' });
+        break;
+      }
+      case 'brute': case 'colossus': {
+        // heavy, chunky, slow debris + thud
+        this.shake(spec.boss ? 8 : 3.5);
+        for (let i = 0; i < 14; i++) {
+          const a = Math.random() * Math.PI * 2, sp = rand(30, 120);
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.6, 1.1), max: 1.1, size: rand(4.5, 8.5), color: Math.random() < 0.6 ? spec.color : spec.color2, kind: 'shard', rot: Math.random() * 6, vr: rand(-4, 4) });
+        }
+        push({ life: 0.4, max: 0.4, size: spec.size * 2.4, color: spec.color, kind: 'shock' });
+        for (let i = 0; i < 4; i++) this.smoke(e.x + rand(-10, 10), e.y + rand(-10, 10));
+        break;
+      }
+      case 'swarmling': {
+        for (let i = 0; i < 5; i++) {
+          const a = Math.random() * Math.PI * 2, sp = rand(50, 140);
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0.3, max: 0.3, size: 2, color: spec.color, kind: 'spark' });
+        }
+        break;
+      }
+      case 'aegis': {
+        // armor shatters like glass
+        audio.freezeCrack();
+        for (let i = 0; i < 16; i++) {
+          const a = Math.random() * Math.PI * 2, sp = rand(70, 220);
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.35, 0.7), max: 0.7, size: rand(2, 4.5), color: i % 3 ? '#bfe3ff' : spec.color, kind: 'shard', rot: Math.random() * 6, vr: rand(-12, 12) });
+        }
+        push({ life: 0.3, max: 0.3, size: spec.size * 2.4, color: '#bfe3ff', kind: 'ring' });
+        break;
+      }
+      case 'wisp': case 'mothership': {
+        // dissolves into rising sparkles
+        const n = spec.boss ? 34 : 12;
+        for (let i = 0; i < n; i++) {
+          push({ x: e.x + rand(-spec.size, spec.size), y: e.y + rand(-spec.size, spec.size) * 0.6, vx: rand(-18, 18), vy: rand(-90, -30), life: rand(0.5, 1), max: 1, size: rand(1.8, 3.6), color: i % 2 ? spec.color : '#ffffff', kind: 'dot' });
+        }
+        push({ life: 0.35, max: 0.35, size: spec.size * 2, color: spec.color, kind: 'ring' });
+        break;
+      }
+      case 'mender': {
+        // a burst of failed healing
+        for (let i = 0; i < 4; i++) {
+          push({ x: e.x + rand(-8, 8), y: e.y + rand(-6, 6), vy: -rand(24, 44), life: 0.7, max: 0.7, size: 12, color: '#c0f5b3', kind: 'text', text: '+' });
+        }
+        push({ life: 0.45, max: 0.45, size: 95, color: '#c0f5b3', kind: 'ring' });
+        for (let i = 0; i < 8; i++) {
+          const a = Math.random() * Math.PI * 2, sp = rand(50, 150);
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0.5, max: 0.5, size: 3, color: spec.color, kind: 'dot' });
+        }
+        break;
+      }
+      case 'splitter': {
+        // wet gooey pop (the swarmlings do the rest)
+        for (let i = 0; i < 9; i++) {
+          const a = Math.random() * Math.PI * 2, sp = rand(30, 110);
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.4, 0.8), max: 0.8, size: rand(4, 8), color: spec.color, kind: 'smoke' });
+        }
+        push({ life: 0.3, max: 0.3, size: spec.size * 2.2, color: spec.color, kind: 'ring' });
+        push({ life: 0.45, max: 0.45, size: spec.size * 3, color: spec.color2, kind: 'ring' });
+        break;
+      }
+      case 'phase': {
+        // winks out of reality — converging sparks
+        for (let i = 0; i < 12; i++) {
+          const a = Math.random() * Math.PI * 2, d = rand(18, 34);
+          push({ x: e.x + Math.cos(a) * d, y: e.y + Math.sin(a) * d, vx: -Math.cos(a) * d * 4, vy: -Math.sin(a) * d * 4, life: 0.25, max: 0.25, size: 2.4, color: spec.color, kind: 'spark' });
+        }
+        push({ life: 0.3, max: 0.3, size: spec.size * 2, color: spec.color, kind: 'ring' });
+        push({ life: 0.14, max: 0.14, size: spec.size, color: '#ffffff', kind: 'flash' });
+        break;
+      }
+      default: {
+        const n = clamp(Math.round(spec.size * 0.9), 6, 22);
+        for (let i = 0; i < n; i++) {
+          const a = Math.random() * Math.PI * 2, sp = rand(50, 200) * (spec.boss ? 1.8 : 1);
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.35, 0.8), max: 0.8, size: rand(2.5, 5.5), color: Math.random() < 0.6 ? spec.color : spec.color2, kind: 'shard', rot: Math.random() * 6, vr: rand(-9, 9) });
+        }
+        push({ life: 0.28, max: 0.28, size: spec.size * 2.2, color: spec.color, kind: 'ring' });
+      }
+    }
+  }
+
+  // Apply the active wave mutator to a freshly spawned enemy. Bounty applies to
+  // everything (it's a gift); stat twists spare bosses.
+  applyMutator(e: Enemy) {
+    const M = TUNING.mutators;
+    if (this.waveMutator === 'bounty') {
+      (e as any).reward = Math.round((e as any).reward * M.bountyMul);
+      return;
+    }
+    if (e.spec.boss) return;
+    switch (this.waveMutator) {
+      case 'frenzied':
+        e.spec = { ...e.spec, speed: e.spec.speed * M.frenziedSpeed };
+        if (e.spec.flying) e.fDur = Math.max(0.1, e.fDur / M.frenziedSpeed);
+        break;
+      case 'armored':
+        e.maxShield = Math.max(e.maxShield, Math.round(e.maxHp * M.armoredShieldFrac));
+        e.shield = e.maxShield;
+        break;
+      case 'horde':
+        e.maxHp = Math.max(1, Math.round(e.maxHp * M.hordeHpMul));
+        e.hp = e.maxHp;
+        break;
+      case 'regen':
+        e.mutRegen = true;
+        break;
+      case 'phasing':
+        if (!e.spec.phase && Math.random() < M.phasingFrac) e.spec = { ...e.spec, phase: true };
+        break;
+    }
+  }
+
+  // ---------- supply drops ----------
+  spawnDrop() {
+    const D = TUNING.drops;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const x = rand(110, W - 110), y = rand(100, H - 100);
+      // keep crates off the alien path and away from other crates
+      let ok = true;
+      for (const path of this.paths) {
+        for (let d = 0; d < path.total && ok; d += 24) {
+          const p = path.at(d);
+          if (dist(p.x, p.y, x, y) < 52) ok = false;
+        }
+        if (!ok) break;
+      }
+      if (ok) for (const o of this.drops) if (dist(o.x, o.y, x, y) < 70) { ok = false; break; }
+      if (!ok) continue;
+      // weighted contents roll
+      const w = D.weights;
+      const r = Math.random() * 100;
+      const kind = r < w.credits ? 'credits' : r < w.credits + w.recharge ? 'recharge'
+        : r < w.credits + w.recharge + w.overclock ? 'overclock' : 'hull';
+      const amount = kind === 'credits' ? Math.round(rand(D.creditsMin, D.creditsMax)) : 0;
+      this.drops.push({ x, y, vx: rand(-11, 11), born: this.now, kind, amount });
+      this.parts.push({ x, y, vx: 0, vy: 0, life: 0.4, max: 0.4, size: 44, color: '#c5b3f6', kind: 'ring' });
+      audio.ui('wave');
+      this.onToast('drops', 'A supply crate! Tap crates before they vanish — credits, recharges, and boosts inside.');
+      return;
+    }
+  }
+
+  tryCollectDrop(x: number, y: number): boolean {
+    for (let i = 0; i < this.drops.length; i++) {
+      const d = this.drops[i];
+      if (dist(d.x, d.y, x, y) > 40) continue;
+      this.drops.splice(i, 1);
+      const D = TUNING.drops;
+      audio.ui('coin');
+      this.spark(d.x, d.y, '#fff3b0', 12);
+      this.parts.push({ x: d.x, y: d.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 52, color: '#fff3b0', kind: 'ring' });
+      switch (d.kind) {
+        case 'fragment':
+        case 'credits':
+          this.credits += d.amount;
+          this.floater(d.x, d.y - 26, `+${d.amount} ◆`, '#fff3b0');
+          break;
+        case 'recharge':
+          this.cds.orbital = 0; this.cds.stasis = 0;
+          this.floater(d.x, d.y - 26, 'Abilities recharged!', '#a0d8ef');
+          break;
+        case 'overclock':
+          this.overclockUntil = this.now + D.overclockDur;
+          this.floater(d.x, d.y - 26, `OVERCLOCK  +${Math.round(D.overclockRate * 100)}% rate`, '#ffd97a');
+          this.shake(3);
+          break;
+        case 'hull':
+          this.lives = Math.min(this.maxLives, this.lives + D.hullPatch);
+          this.floater(d.x, d.y - 26, `+${D.hullPatch} hull`, '#a8e6cf');
+          break;
+      }
+      this.buzz([15]);
+      this.onHud();
+      return true;
+    }
+    return false;
+  }
+
+  onKill(e: Enemy) {
+    this.killCount++;
+    this.runStats.kills++;
+    if (isUnlocked('nova') && this.novaCharge < this.novaNeed) {
+      this.novaCharge = Math.min(this.novaNeed, this.novaCharge + (e.spec.boss ? TUNING.nova.bossCharge : e.isElite ? TUNING.nova.eliteCharge : 1));
+    }
+    if (this.damageNumbersOn && e.dmgAccum >= 1) { this.dmgText(e.x, e.y - e.spec.size - 6, e.dmgAccum); e.dmgAccum = 0; }
+    const reward = (e as any).reward as number;
+    this.credits += reward;
+    audio.pop(e.spec.size);
+    this.floater(e.x, e.y - e.spec.size - 12, `+${reward}`, '#fff3b0');
+    if (this.focus === e) this.focus = null;
+    this.deathFx(e);
+    // --- kill combo ---
+    if (isUnlocked('combo')) {
+      const C = TUNING.combo;
+      this.comboCount = this.now - this.lastKillAt <= C.window ? this.comboCount + 1 : 1;
+      this.lastKillAt = this.now;
+      this.runStats.bestCombo = Math.max(this.runStats.bestCombo, this.comboCount);
+      const mi = (C.milestones as readonly number[]).indexOf(this.comboCount);
+      if (mi >= 0) {
+        const bonus = C.bonuses[mi];
+        this.credits += bonus;
+        this.floater(e.x, e.y - e.spec.size - 30, `COMBO ×${this.comboCount}!  +${bonus}◆`, '#ffd97a');
+        audio.comboBlip(mi + 2);
+        this.hitStop(0.05);
+        this.onToast('combo', 'Chained kills build a combo — keep them coming for bonus credits. Leaks break the chain!');
+        this.buzz([20]);
+      } else if (this.comboCount >= 3) {
+        audio.comboBlip(Math.min(1, this.comboCount - 3));
+        if (this.comboCount === 3) this.onToast('combo', 'Chained kills build a combo — keep them coming for bonus credits. Leaks break the chain!');
+      }
+    }
+    // --- per-tower stats: kill + credit attribution (for the side-panel readout) ---
+    if (e.lastHitBy && this.towers.includes(e.lastHitBy)) {
+      e.lastHitBy.kills++;
+      e.lastHitBy.creditsEarned += reward;
+    }
+    // --- rich vein bonus: killing blow landed by a tower on a vein cell ---
+    if (e.lastHitBy && e.lastHitBy.vein && this.towers.includes(e.lastHitBy)) {
+      const v = TUNING.richVeins.creditPerKill;
+      this.credits += v;
+      e.lastHitBy.creditsEarned += v;
+      this.floater(e.lastHitBy.x, e.lastHitBy.y - 26, `+${v}◆`, '#d6f7ff');
+    }
+    // --- elite bonus ---
+    if (e.isElite) {
+      this.runStats.elitesSlain++;
+      this.hitStop(0.05);
+      this.shake(4);
+      this.ringFx(e.x, e.y, e.spec.size * 2.4, '#ffd97a');
+      const shower = Math.max(3, Math.round(reward / 8));
+      for (let i = 0; i < shower; i++) {
+        const a = Math.random() * Math.PI * 2, sp = rand(60, 220);
+        this.parts.push({ x: e.x, y: e.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 60, life: rand(0.5, 0.9), max: 0.9, size: rand(2.5, 4), color: '#ffd97a', kind: 'shard', grav: 190, rot: Math.random() * 6, vr: rand(-8, 8) });
+      }
+      this.buzz([30, 40, 30]);
+    }
+    if (e.spec.boss) {
+      this.shake(12);
+      this.slowMo(1.2, 0.25);
+      this.screenFlash(0.5);
+      this.buzz([80, 60, 120]);
+      audio.explosion('big');
+      this.onBanner(`${e.spec.name} DOWN`, e.spec.color, 'medium');
+      for (let i = 0; i < 40; i++) {
+        const a = Math.random() * Math.PI * 2, sp = rand(80, 380);
+        this.parts.push({ x: e.x, y: e.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.5, 1.3), max: 1.3, size: rand(3, 8), color: ['#a8e6cf', '#ffb3c6', '#fff3b0', '#c5b3f6'][i % 4], kind: 'shard', rot: Math.random() * 6, vr: rand(-10, 10) });
+      }
+    }
+    if (e.spec.splits) {
+      for (let i = 0; i < e.spec.splits.count; i++) {
+        const child = this.mkEnemy(e.spec.splits.id, e.pathIdx, e.hpMul, 1);
+        child.d = Math.max(0, e.d + rand(-16, 16));
+        this.enemies.push(child);
+      }
+    }
+  }
+
+  onLeak(e: Enemy) {
+    if (this.focus === e) this.focus = null;
+    if (this.comboCount >= 3) this.floater(W / 2, 160, 'COMBO BROKEN', '#ff7d7d');
+    this.comboCount = 0;
+    if (this.devGod) return;
+    const dmg = e.spec.leak;
+    this.runStats.leaksByEnemy[e.spec.id] = (this.runStats.leaksByEnemy[e.spec.id] || 0) + dmg;
+    this.lives = Math.max(0, this.lives - dmg);
+    this.livesLostTotal += dmg;
+    audio.ui('leak');
+    this.shake(4);
+    this.buzz([25, 30, 25]);
+    const end = this.basePx[e.pathIdx] || { x: e.x, y: e.y };
+    this.parts.push({ x: end.x, y: end.y, vx: 0, vy: 0, life: 0.4, max: 0.4, size: 56, color: '#ff7d7d', kind: 'ring' });
+    this.floater(end.x, end.y - 40, `-${dmg}`, '#ff7d7d');
+    if (this.lives <= 0 && this.state === 'playing') this.lose();
+  }
+
+  win() {
+    this.state = 'won';
+    if ([5, 10, 15].includes(this.level.id)) {
+      this.onBanner(`${ZONES[this.level.zone].name.toUpperCase()} SECURED`, ZONES[this.level.zone].accent, 'medium');
+    }
+    audio.jingle(true);
+    const frac = this.livesLostTotal / this.maxLives;
+    const stars = frac === 0 ? 3 : frac <= 0.25 ? 2 : 1;
+    for (let i = 0; i < 90; i++) {
+      this.parts.push({
+        x: rand(0, W), y: -20, vx: rand(-40, 40), vy: rand(60, 190),
+        life: rand(1.2, 2.6), max: 2.6, size: rand(3, 7),
+        color: ['#a8e6cf', '#ffb3c6', '#fff3b0', '#c5b3f6', '#a0d8ef'][i % 5],
+        kind: 'shard', grav: 60, rot: Math.random() * 6, vr: rand(-8, 8),
+      });
+    }
+    setTimeout(() => this.onEnd(true, stars), 1400);
+  }
+  lose() {
+    this.state = 'lost';
+    audio.jingle(false);
+    this.shake(10);
+    setTimeout(() => this.onEnd(false, 0), 1400);
+  }
+
+  // Evaluate this level's two challenges against the just-finished (winning) run.
+  // Only ever called from win() — challenges cannot be earned on a loss.
+  evaluateChallenges(): boolean[] {
+    const defs = this.level.challenges || [];
+    return defs.map(d => {
+      switch (d.id) {
+        case 'perfect_hull': return this.livesLostTotal === 0;
+        case 'minimalist': {
+          const total = Object.values(this.runStats.towersBuilt).reduce((a, b) => a + b, 0);
+          return total <= (d.param ?? 6);
+        }
+        case 'specialist': {
+          const types = Object.keys(this.runStats.towersBuilt).length;
+          return types > 0 && types <= (d.param ?? 2);
+        }
+        case 'no_abilities': return !this.abilityUsed;
+        case 'speedrunner': return !this.lateCallHappened;
+        case 'never_sell': return !this.soldAny;
+        case 'hard_plus': return this.diffTier >= 3;
+        default: return false;
+      }
+    });
+  }
+
+  // ---------- input helpers ----------
+  pointer(x: number, y: number) { this.mx = x; this.my = y; }
+  towerAt(x: number, y: number): Tower | null {
+    let best: Tower | null = null, bd = 34 * this.k;
+    for (const t of this.towers) {
+      const dd = dist(t.x, t.y, x, y);
+      if (dd < (t.spec.size + 12) * this.k && dd < bd) { bd = dd; best = t; }
+    }
+    return best;
+  }
+  enemyAt(x: number, y: number): Enemy | null {
+    let best: Enemy | null = null, bd = 34;
+    for (const e of this.enemies) {
+      if (e.dead) continue;
+      const dd = dist(e.x, e.y, x, y);
+      if (dd < e.spec.size + 10 && dd < bd) { bd = dd; best = e; }
+    }
+    return best;
+  }
+  setFocus(e: Enemy | null) {
+    this.focus = e;
+    if (e) {
+      audio.ui('click');
+      this.parts.push({ x: e.x, y: e.y, vx: 0, vy: 0, life: 0.3, max: 0.3, size: e.spec.size * 2, color: '#ff8fa3', kind: 'ring' });
+    }
+  }
+  castAt(x: number, y: number) {
+    if (!this.armed) return;
+    const ab = ABILITIES[this.armed];
+    if (this.cds[this.armed] <= 0) {
+      this.cds[this.armed] = ab.cd;
+      this.abilityUsed = true;
+      audio.ui('ability');
+      if (this.armed === 'orbital') {
+        this.incomings.push({ x, y, t: 0.7 });
+      } else {
+        this.patches.push({ x, y, r: (ab as any).radius, until: this.now + (ab as any).dur, kind: 'stasis', slow: (ab as any).slow });
+        this.parts.push({ x, y, vx: 0, vy: 0, life: 0.5, max: 0.5, size: (ab as any).radius, color: '#a0d8ef', kind: 'shock' });
+      }
+    }
+    this.armed = null;
+    this.onHud();
+  }
+
+  tryBuildAt(cellIdx: number, spec: TowerSpec): boolean {
+    if (this.state !== 'playing' || !this.cellFree(cellIdx)) return false;
+    if (this.credits < this.costOf(spec)) { audio.ui('deny'); return false; }
+    this.pendingBuild = { spec, cellIdx };
+    return true;
+  }
+  cancelBuild() { this.pendingBuild = null; }
+  confirmBuild(): boolean {
+    const pb = this.pendingBuild;
+    if (!pb) return false;
+    this.pendingBuild = null;
+    return this.buildAt(pb.cellIdx, pb.spec);
+  }
+  buildAt(cellIdx: number, spec: TowerSpec): boolean {
+    if (this.state !== 'playing' || !this.cellFree(cellIdx)) return false;
+    const cost = this.costOf(spec);
+    if (this.credits < cost) { audio.ui('deny'); return false; }
+    this.credits -= cost;
+    const c = this.cells[cellIdx];
+    const t = new Tower(spec, c.x, c.y);
+    t.spent = cost;
+    t.mode = this.defaultMode;
+    t.vein = c.vein;
+    t.cell = cellIdx; t.col = c.col; t.row = c.row;
+    this.towers.push(t);
+    this.occupied[cellIdx] = t;
+    this.runStats.towersBuilt[spec.id] = (this.runStats.towersBuilt[spec.id] || 0) + 1;
+    audio.ui('place');
+    this.parts.push({ x: c.x, y: c.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 40, color: spec.color, kind: 'ring' });
+    for (let i = 0; i < 8; i++) this.smoke(c.x + rand(-14, 14), c.y + rand(-10, 10));
+    this.onHud();
+    return true;
+  }
+
+  armMove(t: Tower) {
+    this.selected = null;
+    this.moveArmed = t;
+    this.pendingMove = null;
+    this.onSelect();
+  }
+  cancelMove() {
+    this.moveArmed = null;
+    this.pendingMove = null;
+  }
+  tryMoveTo(cellIdx: number): boolean {
+    const t = this.moveArmed;
+    if (!t || !this.cellFree(cellIdx, t)) return false;
+    this.pendingMove = { tower: t, cellIdx };
+    return true;
+  }
+  confirmMove() {
+    const pm = this.pendingMove;
+    if (!pm) return;
+    const { tower: t, cellIdx } = pm;
+    this.occupied[t.cell] = null;
+    t.cell = cellIdx;
+    const c = this.cells[cellIdx];
+    t.x = c.x; t.y = c.y; t.col = c.col; t.row = c.row;
+    t.vein = c.vein;
+    t.target = null; t.rampT = 0;
+    this.occupied[cellIdx] = t;
+    audio.ui('place');
+    this.parts.push({ x: c.x, y: c.y, vx: 0, vy: 0, life: 0.3, max: 0.3, size: 36, color: t.spec.color, kind: 'ring' });
+    for (let i = 0; i < 6; i++) this.smoke(c.x + rand(-12, 12), c.y + rand(-8, 8));
+    this.moveArmed = null;
+    this.pendingMove = null;
+    this.selected = t;
+    this.onSelect();
+  }
+
+  cancel() {
+    this.armed = null;
+    this.selected = null;
+    this.menuCell = -1;
+    this.menuHover = null;
+    this.moveArmed = null;
+    this.pendingMove = null;
+    this.pendingBuild = null;
+    this.onSelect(); this.onHud();
+  }
+
+  buyUpgrade(t: Tower, branchPick = -1) {
+    let next: StageStats | null = null;
+    if (t.branch >= 0) {
+      if (t.branchStage === 0) next = t.spec.branches[t.branch][1];
+    } else if (t.stage < 2) {
+      next = t.spec.stages[t.stage + 1];
+    } else if (branchPick >= 0) {
+      next = t.spec.branches[branchPick][0];
+    }
+    if (!next) return;
+    const cost = this.upgradeCost(next);
+    if (this.credits < cost) { audio.ui('deny'); return; }
+    this.credits -= cost;
+    t.spent += cost;
+    if (t.branch >= 0) t.branchStage = 1;
+    else if (t.stage < 2) t.stage++;
+    else { t.branch = branchPick; t.branchStage = 0; audio.ui('branch'); }
+    if (t.branch < 0 || t.branchStage !== 0) audio.ui('upgrade');
+    this.parts.push({ x: t.x, y: t.y, vx: 0, vy: 0, life: 0.4, max: 0.4, size: 46, color: t.spec.color, kind: 'ring' });
+    for (let i = 0; i < 10; i++) {
+      const a = Math.random() * Math.PI * 2;
+      this.parts.push({ x: t.x, y: t.y, vx: Math.cos(a) * 90, vy: Math.sin(a) * 90, life: 0.5, max: 0.5, size: 3, color: t.spec.color, kind: 'dot' });
+    }
+    this.onSelect(); this.onHud();
+  }
+
+  sell(t: Tower) {
+    this.soldAny = true;
+    this.credits += t.spent;
+    if (t.cell >= 0) this.occupied[t.cell] = null;
+    this.towers = this.towers.filter(o => o !== t);
+    this.selected = null;
+    audio.ui('sell');
+    this.floater(t.x, t.y - 20, `+${t.spent}`, '#fff3b0');
+    for (let i = 0; i < 8; i++) this.smoke(t.x + rand(-12, 12), t.y + rand(-8, 8));
+    this.onSelect(); this.onHud();
+  }
+
+  // ---------- fx helpers ----------
+  shake(m: number) { if (!this.shakeOn || this.reduceMotion) return; this.shakeMag = Math.max(this.shakeMag, m); this.shakeT = 0.3; }
+  spark(x: number, y: number, color: string, n: number) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, sp = rand(40, 150);
+      this.parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.15, 0.35), max: 0.35, size: rand(1.5, 3), color, kind: 'spark' });
+    }
+  }
+  flash(x: number, y: number, color: string) {
+    this.parts.push({ x, y, vx: 0, vy: 0, life: 0.08, max: 0.08, size: 12, color, kind: 'flash' });
+  }
+  smoke(x: number, y: number) {
+    this.parts.push({ x, y, vx: rand(-16, 16), vy: rand(-16, 16), life: rand(0.4, 0.9), max: 0.9, size: rand(4, 9), color: 'rgba(200,205,235,0.25)', kind: 'smoke' });
+  }
+  fireFx(x: number, y: number) {
+    this.parts.push({ x, y, vx: rand(-14, 14), vy: rand(-26, -6), life: rand(0.25, 0.5), max: 0.5, size: rand(2.5, 5), color: ['#ffb37d', '#ff8a5c'][Math.random() < 0.5 ? 0 : 1], kind: 'fire' });
+  }
+  healFx(x: number, y: number) {
+    this.parts.push({ x, y: y - 10, vx: 0, vy: -34, life: 0.5, max: 0.5, size: 6, color: '#c0f5b3', kind: 'text', text: '+' });
+  }
+  ringFx(x: number, y: number, r: number, color: string) {
+    this.parts.push({ x, y, vx: 0, vy: 0, life: 0.4, max: 0.4, size: r, color, kind: 'ring' });
+  }
+  shieldBreak(e: Enemy) {
+    audio.freezeCrack();
+    for (let i = 0; i < 10; i++) {
+      const a = Math.random() * Math.PI * 2;
+      this.parts.push({ x: e.x, y: e.y, vx: Math.cos(a) * 120, vy: Math.sin(a) * 120, life: 0.4, max: 0.4, size: 3, color: '#9fd0ff', kind: 'shard', rot: 0, vr: 8 });
+    }
+  }
+  floater(x: number, y: number, text: string, color: string) {
+    // Lifetime scales with text length — a short number ("+45") stays snappy, a longer
+    // phrase ("Abilities recharged!") gets real reading time instead of a flat 0.9s
+    // regardless of how much there is to read, capped so nothing lingers too long.
+    const life = Math.min(1.6, 0.6 + text.length * 0.025);
+    this.parts.push({ x, y, vx: 0, vy: -36, life, max: life, size: 15, color, kind: 'text', text });
+  }
+  portalFx(e: Enemy) {
+    const p = this.portalPx[e.pathIdx] || { x: e.x, y: e.y };
+    this.parts.push({ x: p.x, y: p.y, vx: 0, vy: 0, life: 0.3, max: 0.3, size: 26, color: e.spec.color, kind: 'ring' });
+  }
+
+  // ---------- background ----------
+  buildBg() {
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const g = c.getContext('2d')!;
+    g.fillStyle = this.zone.bg;
+    g.fillRect(0, 0, W, H);
+    for (let i = 0; i < 7; i++) {
+      const x = Math.random() * W, y = Math.random() * H, r = rand(140, 340);
+      const grad = g.createRadialGradient(x, y, 0, x, y, r);
+      const col = this.zone.nebula[i % 2];
+      grad.addColorStop(0, col + 'aa');
+      grad.addColorStop(1, col + '00');
+      g.fillStyle = grad;
+      g.beginPath(); g.arc(x, y, r, 0, 7); g.fill();
+    }
+    this.bgCanvas = c;
+  }
+
+  // =================================================================
+  // RENDER
+  // =================================================================
+  render(rawDt: number) {
+    const g = this.g;
+    g.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    g.clearRect(0, 0, W, H);
+    if (this.shakeMag > 0) {
+      const m = this.shakeMag * (this.shakeT / 0.3);
+      g.translate(rand(-m, m), rand(-m, m));
+    }
+    g.drawImage(this.bgCanvas, 0, 0);
+    for (const s of this.stars) {
+      const a = 0.25 + 0.55 * (0.5 + 0.5 * Math.sin(performance.now() / 700 + s.p * 4));
+      g.globalAlpha = a;
+      g.fillStyle = '#dfe4ff';
+      g.fillRect(s.x, s.y, s.s, s.s);
+    }
+    g.globalAlpha = 1;
+
+    this.drawTiles(g);
+    this.drawModFx(g);
+    this.drawPatches(g);
+    this.drawPortalsAndBases(g);
+    this.drawPreviews(g);
+
+    for (const t of this.towers) {
+      const ps = 40 * this.k;
+      g.fillStyle = 'rgba(4,5,14,0.32)';
+      (g as any).beginPath();
+      (g as any).roundRect(t.x - ps / 2 + 4, t.y - ps / 2 + 6, ps, ps, 8 * this.k);
+      g.fill();
+    }
+    for (const e of this.enemies) {
+      if (e.spec.flying) this.shadow(g, e.x + 9, e.y + 13, e.spec.size * 0.85, 0.26);
+      else this.shadow(g, e.x, e.y, e.spec.size + 2, 0.3);
+    }
+
+    // tower bases first, so beams and effects sit on top of them
+    for (const t of this.towers) this.drawTower(g, t, false, 'pad');
+
+    this.drawBeams(g);
+    for (const t of this.towers) this.drawTower(g, t, false, 'body');
+    for (const e of this.enemies) this.drawEnemy(g, e);
+    this.drawDrops(g);
+
+    this.drawProjs(g);
+    this.drawBolts(g);
+    this.drawRays(g);
+    this.drawIncomings(g);
+    this.drawParticles(g);
+    this.drawFocus(g);
+    this.drawSelection(g);
+    this.drawPlacement(g);
+    this.drawOverlays(g);
+  }
+
+  // Full-screen mood/feedback overlays: NOVA buildup darken, whiteout flash,
+  // boss-entrance red vignette, and the persistent low-hull warning vignette.
+  drawOverlays(g: CanvasRenderingContext2D) {
+    g.setTransform(this.dpr, 0, 0, this.dpr, 0, 0); // overlays ignore screen shake (but keep DPR sharpness)
+    // NOVA buildup: world darkens over 1.2s
+    if (this.novaFireAt > 0) {
+      const frac = 1 - clamp((this.novaFireAt - this.now) / TUNING.nova.buildup, 0, 1);
+      g.globalAlpha = frac * 0.55;
+      g.fillStyle = '#05060f';
+      g.fillRect(0, 0, W, H);
+      g.globalAlpha = 1;
+    }
+    // boss entrance vignette: pulsing red edges
+    const bossV = this.state === 'playing' && this.now < this.bossVignetteUntil;
+    const lowHull = this.state === 'playing' && this.lives / this.maxLives < 0.25 && this.lives > 0;
+    if (bossV || lowHull) {
+      const pulse = 0.5 + 0.5 * Math.sin(this.now * (bossV ? 9 : 4));
+      const strength = (bossV ? 0.4 : 0.26) * (0.6 + 0.4 * pulse) * (this.reduceFlash ? 0.55 : 1);
+      const grad = g.createRadialGradient(W / 2, H / 2, H * 0.44, W / 2, H / 2, H * 0.78);
+      grad.addColorStop(0, 'rgba(255,80,90,0)');
+      grad.addColorStop(1, `rgba(255,80,90,${strength})`);
+      g.fillStyle = grad;
+      g.fillRect(0, 0, W, H);
+    }
+    // whiteout flash (NOVA, wave clear, boss death) — reduced mode caps it at a soft glow
+    if (this.flashT > 0) {
+      g.globalAlpha = clamp(this.flashT, 0, this.reduceFlash ? 0.22 : 0.85);
+      g.fillStyle = '#ffffff';
+      g.fillRect(0, 0, W, H);
+      g.globalAlpha = 1;
+    }
+  }
+
+  shadow(g: CanvasRenderingContext2D, x: number, y: number, r: number, alpha = 0.32) {
+    g.fillStyle = `rgba(4,5,14,${alpha})`;
+    g.beginPath();
+    g.arc(x + 5, y + 7, r, 0, 7);
+    g.fill();
+  }
+
+  // --- the unified tile field: buildable outlines, path tiles, rock tiles ---
+  drawTiles(g: CanvasRenderingContext2D) {
+    const cs = this.cell;
+    const gap = Math.max(5, cs * 0.13);
+    const s = cs - gap;
+    const rad = Math.max(6, cs * 0.16);
+    const active = this.menuCell >= 0 || this.moveArmed !== null || this.pendingMove !== null || this.pendingBuild !== null;
+    const base = active ? 0.32 : 0.16;
+    const hoverIdx = this.cellAt(this.mx, this.my);
+
+    for (const c of this.cells) {
+      const i = this.idx(c.col, c.row);
+      if (c.path) {
+        // path tile — soft filled tile with subtle shadow edge
+        g.fillStyle = 'rgba(0,0,0,0.3)';
+        (g as any).beginPath(); (g as any).roundRect(c.x - s / 2 - 2, c.y - s / 2, s + 4, s + 5, rad); g.fill();
+        g.fillStyle = 'rgba(238,240,255,0.085)';
+        (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2, s, s, rad); g.fill();
+        continue;
+      }
+      if (c.rock) {
+        g.fillStyle = 'rgba(4,5,14,0.35)';
+        (g as any).beginPath(); (g as any).roundRect(c.x - s / 2 + 3, c.y - s / 2 + 5, s, s, rad); g.fill();
+        g.fillStyle = '#3a3d5e';
+        (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2, s, s, rad); g.fill();
+        g.fillStyle = '#484b70';
+        (g as any).beginPath(); (g as any).roundRect(c.x - s / 2 + 2, c.y - s / 2 + 2, s - 6, s - 8, rad); g.fill();
+        g.fillStyle = 'rgba(0,0,0,0.25)';
+        g.beginPath(); g.arc(c.x - s * 0.18, c.y + s * 0.1, s * 0.11, 0, 7); g.fill();
+        g.beginPath(); g.arc(c.x + s * 0.2, c.y - s * 0.16, s * 0.08, 0, 7); g.fill();
+        continue;
+      }
+      if (c.vein) {
+        // rich vein: soft cyan glow + twinkling diamonds (visible under towers too)
+        const tw = 0.5 + 0.5 * Math.sin(this.now * 2.6 + i * 1.7);
+        g.globalAlpha = 0.14 + tw * 0.1;
+        g.fillStyle = '#8ff0ff';
+        (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2, s, s, rad); g.fill();
+        g.globalAlpha = 0.55 + tw * 0.45;
+        g.fillStyle = '#d6f7ff';
+        for (let k = 0; k < 3; k++) {
+          const dx = Math.sin(i * 3.1 + k * 2.4) * s * 0.28, dy = Math.cos(i * 5.7 + k * 1.9) * s * 0.28;
+          const dr = 2 + Math.sin(this.now * 3 + k * 2 + i) * 1;
+          g.save(); g.translate(c.x + dx, c.y + dy); g.rotate(Math.PI / 4);
+          g.fillRect(-dr / 2, -dr / 2, dr, dr);
+          g.restore();
+        }
+        g.globalAlpha = 1;
+      }
+      if (!c.valid || this.occupied[i]) continue;
+      const hovered = i === hoverIdx && this.state === 'playing';
+      g.globalAlpha = hovered ? 0.85 : base;
+      g.strokeStyle = '#dfe3ff';
+      g.lineWidth = hovered ? 2 : 1.5;
+      (g as any).beginPath();
+      (g as any).roundRect(c.x - s / 2, c.y - s / 2, s, s, rad);
+      g.stroke();
+      g.globalAlpha = hovered ? 0.16 : base * 0.4;
+      g.fillStyle = '#dfe3ff';
+      g.fill();
+      if (hovered) {
+        g.globalAlpha = 0.14;
+        g.fillStyle = '#c5cbf5';
+        g.fill();
+      }
+      g.globalAlpha = hovered ? 0.9 : base * 2.2;
+      g.fillStyle = '#dfe3ff';
+      g.beginPath(); g.arc(c.x, c.y, 1.6, 0, 7); g.fill();
+    }
+    g.globalAlpha = 1;
+
+    // animated direction dashes along each path polyline
+    for (const path of this.paths) {
+      g.strokeStyle = 'rgba(255,255,255,0.14)';
+      g.lineWidth = 3;
+      g.lineCap = 'round';
+      g.setLineDash([12, 26]);
+      g.lineDashOffset = -(this.now * 40) % 38;
+      g.beginPath();
+      g.moveTo(path.pts[0][0], path.pts[0][1]);
+      for (let i = 1; i < path.pts.length; i++) g.lineTo(path.pts[i][0], path.pts[i][1]);
+      g.stroke();
+      g.setLineDash([]);
+    }
+  }
+
+  // tile-accurate Chebyshev range indicator
+  drawRangeTiles(g: CanvasRenderingContext2D, col: number, row: number, R: number, color: string, fillAlpha = 0.1) {
+    const cs = this.cell;
+    const gap = Math.max(5, cs * 0.13);
+    const s = cs - gap;
+    const rad = Math.max(5, cs * 0.14);
+    const cx = this.cx(col), cy = this.cy(row);
+    const inR = (c: number, r: number) => this.circCell(cx, cy, R, c, r);
+    g.fillStyle = color;
+    const B = Math.ceil(R) + 1;
+    for (let dr = -B; dr <= B; dr++) {
+      for (let dc = -B; dc <= B; dc++) {
+        const c = col + dc, r = row + dr;
+        if (c < 0 || c >= this.cols || r < 0 || r >= this.rows) continue;
+        if (dc === 0 && dr === 0) continue;
+        if (!inR(c, r)) continue;
+        g.globalAlpha = fillAlpha;
+        (g as any).beginPath();
+        (g as any).roundRect(this.cx(c) - s / 2, this.cy(r) - s / 2, s, s, rad);
+        g.fill();
+      }
+    }
+    // jagged boundary: draw edges between in-range and out-of-range cells
+    g.globalAlpha = 0.85;
+    g.strokeStyle = color;
+    g.lineWidth = 2;
+    g.lineCap = 'round';
+    g.beginPath();
+    for (let dr = -B; dr <= B; dr++) {
+      for (let dc = -B; dc <= B; dc++) {
+        const c = col + dc, r = row + dr;
+        if (!inR(c, r) && !(dc === 0 && dr === 0)) continue;
+        const x0 = this.gx0 + c * cs, y0 = this.gy0 + r * cs;
+        if (!inR(c, r - 1) && !(dc === 0 && dr === 1)) { g.moveTo(x0 + 2, y0); g.lineTo(x0 + cs - 2, y0); }
+        if (!inR(c, r + 1) && !(dc === 0 && dr === -1)) { g.moveTo(x0 + 2, y0 + cs); g.lineTo(x0 + cs - 2, y0 + cs); }
+        if (!inR(c - 1, r) && !(dc === 1 && dr === 0)) { g.moveTo(x0, y0 + 2); g.lineTo(x0, y0 + cs - 2); }
+        if (!inR(c + 1, r) && !(dc === -1 && dr === 0)) { g.moveTo(x0 + cs, y0 + 2); g.lineTo(x0 + cs, y0 + cs - 2); }
+      }
+    }
+    g.stroke();
+    g.globalAlpha = 1;
+  }
+
+  drawPatches(g: CanvasRenderingContext2D) {
+    for (const p of this.patches) {
+      const left = clamp((p.until - this.now) / 1.2, 0, 1);
+      if (p.kind === 'burn') {
+        g.globalAlpha = 0.5 * left + 0.15;
+        const grad = g.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r);
+        grad.addColorStop(0, '#ff9a5a');
+        grad.addColorStop(0.6, '#ff6b4a66');
+        grad.addColorStop(1, '#ff6b4a00');
+        g.fillStyle = grad;
+        g.beginPath(); g.arc(p.x, p.y, p.r, 0, 7); g.fill();
+        if (Math.random() < 0.5) this.fireFx(p.x + rand(-p.r, p.r) * 0.7, p.y + rand(-p.r, p.r) * 0.7);
+      } else {
+        g.globalAlpha = 0.4 * left + 0.1;
+        const grad = g.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r);
+        grad.addColorStop(0, '#a0d8ef88');
+        grad.addColorStop(1, '#a0d8ef00');
+        g.fillStyle = grad;
+        g.beginPath(); g.arc(p.x, p.y, p.r, 0, 7); g.fill();
+        g.strokeStyle = '#a0d8ef';
+        g.globalAlpha = 0.5 * left;
+        g.beginPath(); g.arc(p.x, p.y, p.r, 0, 7); g.stroke();
+      }
+      g.globalAlpha = 1;
+    }
+  }
+
+  drawPortalsAndBases(g: CanvasRenderingContext2D) {
+    const t = this.now;
+    const k = this.k;
+    for (let pi = 0; pi < this.paths.length; pi++) {
+      const s = this.portalPx[pi];
+      g.save();
+      g.translate(s.x, s.y);
+      g.scale(k, k);
+      for (let i = 0; i < 2; i++) {
+        g.strokeStyle = i ? '#c5b3f6' : '#a0d8ef';
+        g.globalAlpha = 0.8;
+        g.lineWidth = 3.4;
+        g.beginPath();
+        g.arc(0, 0, 20 + i * 6, t * (i ? 2 : -2.4), t * (i ? 2 : -2.4) + 4.2);
+        g.stroke();
+      }
+      g.globalAlpha = 0.25 + 0.1 * Math.sin(t * 3);
+      g.fillStyle = '#c5b3f6';
+      g.beginPath(); g.arc(0, 0, 14, 0, 7); g.fill();
+      g.globalAlpha = 1;
+      g.restore();
+
+      const e = this.basePx[pi];
+      this.shadow(g, e.x, e.y, 24 * k, 0.4);
+      g.save();
+      g.translate(e.x, e.y);
+      g.scale(k, k);
+      g.strokeStyle = this.zone.accent;
+      g.globalAlpha = 0.5;
+      g.lineWidth = 3.4;
+      g.beginPath(); g.arc(0, 0, 27, 0, 7); g.stroke();
+      g.globalAlpha = 1;
+      g.fillStyle = '#2c3057';
+      g.beginPath(); g.arc(0, 0, 21, 0, 7); g.fill();
+      g.fillStyle = this.zone.accent;
+      g.beginPath(); g.arc(0, 0, 15, 0, 7); g.fill();
+      g.fillStyle = 'rgba(255,255,255,0.35)';
+      g.beginPath(); g.arc(-4, -5, 5, 0, 7); g.fill();
+      g.fillStyle = '#2c3057';
+      g.beginPath(); g.arc(0, 0, 6, 0, 7); g.fill();
+      g.strokeStyle = '#eef0ff';
+      g.globalAlpha = 0.7;
+      g.lineWidth = 2;
+      g.beginPath(); g.moveTo(0, 0); g.lineTo(Math.cos(t * 1.4) * 14, Math.sin(t * 1.4) * 14); g.stroke();
+      g.globalAlpha = 1;
+      g.fillStyle = Math.sin(t * 5) > 0 ? '#ffb3c6' : '#5a5f96';
+      g.beginPath(); g.arc(Math.cos(t * 1.4) * 14, Math.sin(t * 1.4) * 14, 2.6, 0, 7); g.fill();
+      g.restore();
+    }
+  }
+
+  ampRing(g: CanvasRenderingContext2D, x: number, y: number, _r: number, strong = false) {
+    // static tile-shaped highlight (used when previewing/selecting an Amp)
+    const s = this.cell - 8;
+    g.strokeStyle = '#c5b3f6';
+    g.globalAlpha = strong ? 0.9 : 0.5 + 0.15 * Math.sin(this.now * 3);
+    g.lineWidth = 2.4;
+    (g as any).beginPath();
+    (g as any).roundRect(x - s / 2, y - s / 2, s, s, 9);
+    g.stroke();
+    g.globalAlpha = 1;
+  }
+
+  drawPreviews(g: CanvasRenderingContext2D) {
+    if (this.menuCell >= 0) {
+      const c = this.cells[this.menuCell];
+      g.strokeStyle = '#a8e6cf';
+      g.globalAlpha = 0.9;
+      g.lineWidth = 2;
+      const s = this.cell - 8;
+      (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2, s, s, 8); g.stroke();
+      g.globalAlpha = 1;
+      if (this.menuHover) {
+        const st = this.menuHover.stages[0];
+        this.drawRangeTiles(g, c.col, c.row, st.range, this.menuHover.color, 0.1);
+        if (this.menuHover.kind === 'amp') {
+          for (const t of this.towers) {
+            if (t.spec.kind !== 'amp' && Math.max(Math.abs(t.col - c.col), Math.abs(t.row - c.row)) <= st.range) {
+              this.ampRing(g, t.x, t.y, (t.spec.size + 11) * this.k, true);
+            }
+          }
+        }
+      }
+    }
+    if (this.armed && this.mx > -50) {
+      const ab: any = ABILITIES[this.armed];
+      g.strokeStyle = this.armed === 'orbital' ? '#ffd3b6' : '#a0d8ef';
+      g.fillStyle = this.armed === 'orbital' ? 'rgba(255,211,182,0.12)' : 'rgba(160,216,239,0.12)';
+      g.lineWidth = 2.5;
+      g.setLineDash([8, 8]);
+      g.beginPath(); g.arc(this.mx, this.my, ab.radius, 0, 7); g.fill(); g.stroke();
+      g.setLineDash([]);
+    }
+  }
+
+  // ---------- entity drawing ----------
+  shapePath(g: CanvasRenderingContext2D, shape: string, rx: number, ry: number) {
+    g.beginPath();
+    switch (shape) {
+      case 'slim': // pointed teardrop, nose forward (+x)
+        g.moveTo(rx * 1.35, 0);
+        g.quadraticCurveTo(rx * 0.3, -ry * 0.85, -rx * 0.85, -ry * 0.55);
+        g.quadraticCurveTo(-rx * 1.05, 0, -rx * 0.85, ry * 0.55);
+        g.quadraticCurveTo(rx * 0.3, ry * 0.85, rx * 1.35, 0);
+        break;
+      case 'square':
+        (g as any).roundRect(-rx * 0.95, -ry * 0.95, rx * 1.9, ry * 1.9, rx * 0.28);
+        break;
+      case 'hex':
+        for (let i = 0; i < 6; i++) {
+          const a = i * Math.PI / 3;
+          const px = Math.cos(a) * rx * 1.05, py = Math.sin(a) * ry * 1.05;
+          i ? g.lineTo(px, py) : g.moveTo(px, py);
+        }
+        g.closePath();
+        break;
+      case 'diamond':
+        g.moveTo(rx * 1.2, 0); g.lineTo(0, -ry); g.lineTo(-rx * 1.2, 0); g.lineTo(0, ry);
+        g.closePath();
+        break;
+      default: // circle
+        g.ellipse(0, 0, rx, ry, 0, 0, 7);
+    }
+  }
+  drawEnemyBody(g: CanvasRenderingContext2D, e: Enemy, r: number, squash: number) {
+    const spec = e.spec;
+    const shape = spec.shape || 'circle';
+    const flap = Math.sin(e.wobble * 3);
+    g.save();
+    g.rotate(e.angle);
+    // wings for fliers — flapping, drawn under the body
+    if (spec.flying) {
+      g.fillStyle = spec.color2;
+      for (const side of [-1, 1]) {
+        g.save();
+        g.rotate(side * (0.35 + flap * 0.28));
+        g.beginPath();
+        if (shape === 'slim') { // swept raptor wings
+          g.moveTo(r * 0.3, side * r * 0.3);
+          g.lineTo(-r * 1.1, side * r * 1.5);
+          g.lineTo(-r * 0.6, side * r * 0.4);
+        } else { // rounded wisp wings
+          g.ellipse(-r * 0.2, side * r * 1.05, r * 0.85, r * 0.5, side * 0.5, 0, 7);
+        }
+        g.closePath();
+        g.fill();
+        g.restore();
+      }
+    }
+    if (shape === 'lumpy') {
+      // gooey cluster of blobs
+      const lobes = [[0, 0, 1], [-0.55, 0.4, 0.62], [0.5, 0.45, 0.55], [-0.1, -0.55, 0.58]];
+      for (const pass of [0, 1]) {
+        g.fillStyle = pass ? (e.flashT > 0 ? '#ffffff' : spec.color) : spec.color2;
+        const grow = pass ? 0 : 2;
+        for (const [ox, oy, s] of lobes) {
+          g.beginPath();
+          g.arc(ox * r, oy * r, r * s * squash + grow, 0, 7);
+          g.fill();
+        }
+      }
+    } else {
+      g.fillStyle = spec.color2;
+      this.shapePath(g, shape, (r + 2) * squash, (r + 2) / squash);
+      g.fill();
+      g.fillStyle = e.flashT > 0 ? '#ffffff' : spec.color;
+      this.shapePath(g, shape, r * squash, r / squash);
+      g.fill();
+    }
+    g.restore();
+    // sheen
+    g.fillStyle = 'rgba(255,255,255,0.3)';
+    g.beginPath(); g.ellipse(-r * 0.25, -r * 0.28, r * 0.32, r * 0.22, -0.4, 0, 7); g.fill();
+    // medic emblem
+    if (spec.healAura) {
+      g.fillStyle = '#2f6b3f';
+      const cw = r * 0.62, ct = r * 0.24;
+      (g as any).beginPath(); (g as any).roundRect(-cw / 2, -ct / 2, cw, ct, ct * 0.4); g.fill();
+      (g as any).beginPath(); (g as any).roundRect(-ct / 2, -cw / 2, ct, cw, ct * 0.4); g.fill();
+    }
+  }
+
+  // Meteor warning rings and ion-storm bands.
+  drawModFx(g: CanvasRenderingContext2D) {
+    if (this.meteorWarn) {
+      const c = this.cells[this.meteorWarn.cell];
+      const left = this.meteorWarn.at - this.now;
+      const frac = 1 - clamp(left / TUNING.meteors.warning, 0, 1);
+      const pulse = 0.6 + 0.4 * Math.sin(this.now * (6 + frac * 10));
+      g.globalAlpha = 0.5 + frac * 0.4;
+      g.strokeStyle = '#ff7d7d';
+      g.lineWidth = 2.5 + frac * 2;
+      g.beginPath(); g.arc(c.x, c.y, this.cell * (0.9 - frac * 0.3) * pulse, 0, 7); g.stroke();
+      // crosshair
+      g.globalAlpha = 0.85;
+      g.lineWidth = 2;
+      const r = 8;
+      g.beginPath();
+      g.moveTo(c.x - r, c.y); g.lineTo(c.x + r, c.y);
+      g.moveTo(c.x, c.y - r); g.lineTo(c.x, c.y + r);
+      g.stroke();
+      g.globalAlpha = 1;
+    }
+    if (this.stormRow0 >= 0) {
+      const S = TUNING.ionStorms;
+      const y0 = this.gy0 + this.stormRow0 * this.cell;
+      const h = S.bandRows * this.cell;
+      const warning = this.now < this.stormWarnUntil;
+      if (warning) {
+        const blink = 0.5 + 0.5 * Math.sin(this.now * 7);
+        g.globalAlpha = 0.08 + blink * 0.08;
+        g.fillStyle = '#ffd97a';
+        g.fillRect(0, y0, W, h);
+        g.globalAlpha = 0.5;
+        g.strokeStyle = '#ffd97a';
+        g.setLineDash([10, 8]);
+        g.strokeRect(-2, y0, W + 4, h);
+        g.setLineDash([]);
+      } else {
+        g.globalAlpha = 0.13;
+        g.fillStyle = '#8fb7ff';
+        g.fillRect(0, y0, W, h);
+        // drifting static streaks
+        g.globalAlpha = 0.35;
+        g.strokeStyle = '#c9dcff';
+        g.lineWidth = 1.4;
+        for (let k = 0; k < 7; k++) {
+          const sx = ((this.now * (120 + k * 37) + k * 331) % (W + 80)) - 40;
+          const sy = y0 + ((k * 61) % h);
+          g.beginPath(); g.moveTo(sx, sy); g.lineTo(sx + 18 + (k % 3) * 8, sy + (k % 2 ? 3 : -3)); g.stroke();
+        }
+      }
+      g.globalAlpha = 1;
+    }
+  }
+
+  drawDrops(g: CanvasRenderingContext2D) {
+    const D = TUNING.drops;
+    for (const d of this.drops) {
+      const age = this.now - d.born;
+      // blink during the final 3 seconds before despawn
+      if (D.lifetime - age < 3 && Math.floor(this.now * 6) % 2 === 0) continue;
+      const bob = Math.sin(this.now * 2.4 + d.x) * 4;
+      const y = d.y + bob;
+      if (d.kind === 'fragment') {
+        // glowing meteor shard
+        const pulse2 = 1 + Math.sin(this.now * 4 + d.x) * 0.15;
+        g.globalAlpha = 0.3;
+        g.strokeStyle = '#ff9d76';
+        g.lineWidth = 2;
+        g.beginPath(); g.arc(d.x, y, 20 * pulse2, 0, 7); g.stroke();
+        g.globalAlpha = 1;
+        g.fillStyle = '#8d93b8';
+        g.save(); g.translate(d.x, y); g.rotate(this.now * 0.8 + d.x);
+        g.beginPath();
+        g.moveTo(-9, 4); g.lineTo(-3, -9); g.lineTo(7, -5); g.lineTo(9, 6); g.lineTo(0, 10);
+        g.closePath(); g.fill();
+        g.fillStyle = '#ffb37d';
+        g.beginPath(); g.arc(1, 0, 3.4, 0, 7); g.fill();
+        g.restore();
+        continue;
+      }
+      // soft attention ring
+      const pulse = 1 + Math.sin(this.now * 3) * 0.12;
+      g.globalAlpha = 0.28;
+      g.strokeStyle = '#fff3b0';
+      g.lineWidth = 2;
+      g.beginPath(); g.arc(d.x, y, 24 * pulse, 0, 7); g.stroke();
+      g.globalAlpha = 1;
+      // parachute
+      g.fillStyle = '#c5b3f6';
+      g.beginPath();
+      g.moveTo(d.x - 14, y - 16);
+      g.quadraticCurveTo(d.x, y - 34, d.x + 14, y - 16);
+      g.closePath(); g.fill();
+      g.strokeStyle = 'rgba(238,240,255,0.5)'; g.lineWidth = 1.2;
+      g.beginPath(); g.moveTo(d.x - 12, y - 16); g.lineTo(d.x - 7, y - 4); g.moveTo(d.x + 12, y - 16); g.lineTo(d.x + 7, y - 4); g.stroke();
+      // crate body
+      this.shadow(g, d.x, y + 8, 16);
+      g.fillStyle = '#fff3b0';
+      (g as any).beginPath();
+      (g as any).roundRect(d.x - 11, y - 5, 22, 18, 4);
+      g.fill();
+      g.fillStyle = '#ffb3c6';
+      g.fillRect(d.x - 11, y + 1, 22, 4);
+      g.strokeStyle = 'rgba(5,6,18,0.35)'; g.lineWidth = 1.4;
+      (g as any).beginPath();
+      (g as any).roundRect(d.x - 11, y - 5, 22, 18, 4);
+      g.stroke();
+    }
+  }
+
+  drawEnemy(g: CanvasRenderingContext2D, e: Enemy) {
+    const spec = e.spec;
+    const x = e.x, y = e.y;
+    const squash = 1 + Math.sin(e.wobble * 2) * 0.06;
+    g.save();
+    g.translate(x, y);
+    if (e.phased) g.globalAlpha = 0.3;
+
+    const r = spec.size;
+    if (e.bossPhase === 2 && spec.id === 'leviathan') {
+      // rotating 240° barrier: the drawn arc is the SHIELDED span; the gap faces e.arcA
+      const gapHalf = Math.PI / 3;
+      const pulse2 = 0.75 + 0.25 * Math.sin(this.now * 5);
+      g.strokeStyle = '#9fd0ff';
+      g.lineWidth = 5;
+      g.globalAlpha = 0.75 * pulse2 * (e.shield > 0 ? 1 : 0.25);
+      g.beginPath();
+      g.arc(0, 0, r + 13, e.arcA + gapHalf, e.arcA - gapHalf + Math.PI * 2);
+      g.stroke();
+      g.globalAlpha = 0.28;
+      g.lineWidth = 11;
+      g.beginPath();
+      g.arc(0, 0, r + 13, e.arcA + gapHalf, e.arcA - gapHalf + Math.PI * 2);
+      g.stroke();
+      g.globalAlpha = 1;
+    }
+    if (e.isElite) {
+      // pulsing gold aura ring + floating crown
+      const pulse = 1 + Math.sin(this.now * 5 + e.wobble) * 0.1;
+      g.globalAlpha = (e.phased ? 0.2 : 0.75);
+      g.strokeStyle = '#ffd97a';
+      g.lineWidth = 2.6;
+      g.beginPath(); g.arc(0, 0, (r + 7) * pulse, 0, 7); g.stroke();
+      g.globalAlpha = (e.phased ? 0.3 : 1);
+      g.fillStyle = '#ffd97a';
+      const cy = -r - 12 + Math.sin(this.now * 3 + e.wobble) * 2;
+      g.beginPath();
+      g.moveTo(-6, cy + 4); g.lineTo(-6, cy - 2); g.lineTo(-3, cy + 1); g.lineTo(0, cy - 4);
+      g.lineTo(3, cy + 1); g.lineTo(6, cy - 2); g.lineTo(6, cy + 4);
+      g.closePath(); g.fill();
+      g.globalAlpha = e.phased ? 0.3 : 1;
+    }
+    this.drawEnemyBody(g, e, r, squash);
+
+    if (spec.boss) {
+      g.fillStyle = spec.color2;
+      for (let i = 0; i < 7; i++) {
+        const a = e.angle + Math.PI + (i - 3) * 0.42;
+        g.beginPath();
+        g.moveTo(Math.cos(a - 0.14) * r * 0.85, Math.sin(a - 0.14) * r * 0.85);
+        g.lineTo(Math.cos(a) * (r * 1.35 + (i === 3 ? 5 : 0)), Math.sin(a) * (r * 1.35 + (i === 3 ? 5 : 0)));
+        g.lineTo(Math.cos(a + 0.14) * r * 0.85, Math.sin(a + 0.14) * r * 0.85);
+        g.fill();
+      }
+    }
+
+    const n = spec.eyes || 1;
+    const lx = Math.cos(e.angle), ly = Math.sin(e.angle);
+    const pxv = -ly, pyv = lx;
+    for (let i = 0; i < n; i++) {
+      const off = (i - (n - 1) / 2) * r * 0.5;
+      const ex = lx * r * 0.32 + pxv * off, ey = ly * r * 0.32 + pyv * off;
+      const er = clamp(r * 0.26, 2.6, 7);
+      g.fillStyle = '#ffffff';
+      g.beginPath(); g.arc(ex, ey, er, 0, 7); g.fill();
+      g.fillStyle = '#20223c';
+      g.beginPath(); g.arc(ex + lx * 2.2, ey + ly * 2.2, er * 0.5, 0, 7); g.fill();
+    }
+
+    if (this.now < e.frozenUntil) {
+      g.fillStyle = 'rgba(200,236,255,0.5)';
+      g.beginPath(); g.arc(0, 0, r * 1.02, 0, 7); g.fill();
+      g.strokeStyle = '#e8f7ff'; g.lineWidth = 1.6;
+      for (let i = 0; i < 3; i++) {
+        const a = i * 2.1 + 0.5;
+        g.beginPath(); g.moveTo(Math.cos(a) * r * 0.3, Math.sin(a) * r * 0.3);
+        g.lineTo(Math.cos(a) * r * 0.95, Math.sin(a) * r * 0.95); g.stroke();
+      }
+    } else if (this.now < e.slowUntil) {
+      g.strokeStyle = 'rgba(160,216,239,0.8)';
+      g.lineWidth = 2;
+      g.beginPath(); g.arc(0, 0, r + 4, this.now * 3, this.now * 3 + 4); g.stroke();
+    }
+
+    if (e.shield > 0) {
+      g.globalAlpha = (e.phased ? 0.3 : 1) * (0.35 + 0.45 * (e.shield / e.maxShield));
+      g.strokeStyle = '#bfe3ff';
+      g.fillStyle = 'rgba(159,208,255,0.14)';
+      g.lineWidth = 2;
+      g.beginPath(); g.arc(0, 0, r + 7, 0, 7); g.fill(); g.stroke();
+      g.globalAlpha = e.phased ? 0.3 : 1;
+    }
+    g.restore();
+
+    if (e.hp < e.maxHp || spec.boss) {
+      const w = spec.boss ? 66 : clamp(r * 2.4, 22, 44);
+      const bx = x - w / 2, by = y - r - 14;
+      g.fillStyle = 'rgba(6,7,18,0.65)';
+      (g as any).beginPath(); (g as any).roundRect(bx - 1, by - 1, w + 2, 6, 3); g.fill();
+      g.fillStyle = spec.boss ? '#ff8fa3' : '#a8e6cf';
+      const frac = clamp(e.hp / e.maxHp, 0, 1);
+      (g as any).beginPath(); (g as any).roundRect(bx, by, w * frac, 4, 2); g.fill();
+      if (e.maxShield > 0) {
+        g.fillStyle = '#9fd0ff';
+        (g as any).beginPath(); (g as any).roundRect(bx, by - 4, w * clamp(e.shield / e.maxShield, 0, 1), 2.6, 1.3); g.fill();
+      }
+    }
+  }
+
+  drawTower(g: CanvasRenderingContext2D, t: Tower, ghost = false, part: 'all' | 'pad' | 'body' = 'all') {
+    const c = t.spec.color, c2 = t.spec.color2;
+    const disabled = this.now < t.disabledUntil;
+    g.save();
+    g.translate(t.x, t.y);
+    g.scale(this.k, this.k);
+    if (disabled || ghost) g.globalAlpha = ghost ? 0.6 : 0.55;
+
+    if (part !== 'body') {
+      // square pad matching the tile — lavender-tinted when amplified
+      const amped = t.buffed && !ghost;
+      g.fillStyle = amped ? '#2e2a52' : '#20233f';
+      (g as any).beginPath(); (g as any).roundRect(-20, -20, 40, 40, 8); g.fill();
+      g.fillStyle = amped ? '#3d3670' : '#2b2e52';
+      (g as any).beginPath(); (g as any).roundRect(-17, -17, 34, 34, 7); g.fill();
+      if (amped) {
+        g.strokeStyle = 'rgba(197,179,246,0.55)';
+        g.lineWidth = 1.6;
+        (g as any).beginPath(); (g as any).roundRect(-18.5, -18.5, 37, 37, 7.5); g.stroke();
+      }
+      if (part === 'pad') { g.restore(); return; }
+    }
+
+    const tier = t.branch >= 0 ? 3 + t.branchStage : t.stage;
+    const rec = t.recoil * 5;
+    const dx = Math.cos(t.angle), dy = Math.sin(t.angle);
+    const pxv = -dy, pyv = dx;
+
+    // body shadow cast on the pad — follows the tower's rotation
+    if (!ghost) {
+      g.save();
+      g.translate(2.4, 3.2);
+      g.fillStyle = 'rgba(4,5,14,0.30)';
+      g.beginPath(); g.arc(0, 0, 10.5, 0, 7); g.fill();
+      if (t.spec.kind !== 'amp' && t.spec.kind !== 'cryo' && t.spec.kind !== 'tesla') {
+        g.strokeStyle = 'rgba(4,5,14,0.30)';
+        g.lineWidth = 7; g.lineCap = 'round';
+        g.beginPath();
+        g.moveTo(dx * 4, dy * 4);
+        g.lineTo(dx * (t.spec.kind === 'prism' ? 11 : 14), dy * (t.spec.kind === 'prism' ? 11 : 14));
+        g.stroke();
+      }
+      g.restore();
+    }
+
+    switch (t.spec.kind) {
+      case 'bullet': {
+        const long = t.spec.id === 'sentinel';
+        g.fillStyle = c2;
+        g.beginPath(); g.arc(0, 0, 12, 0, 7); g.fill();
+        const barrels = t.spec.id === 'pulse' && t.branch === 0 ? (t.branchStage ? 3 : 2)
+          : (long && t.branch === 1 ? 2 : 1); // Rapid Sentinel: twin barrels
+        const len = long ? 27 : (t.branch === 1 && t.spec.id === 'pulse' ? 25 : 17);
+        g.strokeStyle = c2;
+        g.lineWidth = long ? (t.branch === 1 ? 3 : 4.5) : (t.branch === 1 ? 7 : 5);
+        g.lineCap = 'round';
+        for (let i = 0; i < barrels; i++) {
+          const off = (i - (barrels - 1) / 2) * (long ? 5 : 6);
+          g.beginPath();
+          g.moveTo(pxv * off + dx * (4 - rec), pyv * off + dy * (4 - rec));
+          g.lineTo(pxv * off + dx * (len - rec), pyv * off + dy * (len - rec));
+          g.stroke();
+        }
+        if (long && t.branch === 0) { // Farsight: scope ring mid-barrel
+          g.strokeStyle = c; g.lineWidth = 2.2;
+          g.beginPath(); g.arc(dx * (16 - rec), dy * (16 - rec), 4.4, 0, 7); g.stroke();
+        }
+        if (t.branch === 2) { // Frost Rounds / Warden: icy blue muzzle tip
+          g.fillStyle = '#a0d8ef';
+          g.beginPath(); g.arc(dx * (len - rec), dy * (len - rec), long ? 3.4 : 4, 0, 7); g.fill();
+          if (long) { // Warden fin
+            g.strokeStyle = '#a0d8ef'; g.lineWidth = 3; g.lineCap = 'round';
+            g.beginPath();
+            g.moveTo(dx * 8 + pxv * 5, dy * 8 + pyv * 5);
+            g.lineTo(dx * 8 + pxv * 11, dy * 8 + pyv * 11);
+            g.stroke();
+          }
+        }
+        g.fillStyle = c;
+        g.beginPath(); g.arc(0, 0, 9.4, 0, 7); g.fill();
+        g.fillStyle = 'rgba(255,255,255,0.45)';
+        g.beginPath(); g.arc(-2.6, -3, 3, 0, 7); g.fill();
+        break;
+      }
+      case 'mortar': {
+        g.fillStyle = c2;
+        g.beginPath(); g.arc(0, 0, 13.5, 0, 7); g.fill();
+        g.fillStyle = c;
+        g.beginPath(); g.arc(0, 0, 11.5, 0, 7); g.fill();
+        if (t.branch === 1) { // Magma: molten core glow
+          g.strokeStyle = '#ff8a5c';
+          g.globalAlpha *= 0.5 + 0.3 * Math.sin(t.auraPulse * 4);
+          g.lineWidth = 2.4;
+          g.beginPath(); g.arc(0, 0, 12.6, 0, 7); g.stroke();
+          g.globalAlpha = disabled || ghost ? 0.55 : 1;
+        }
+        if (t.branch === 2) { // Quake: heavy square muzzle + shock ring
+          g.strokeStyle = c2; g.lineWidth = 2;
+          g.globalAlpha *= 0.55;
+          g.beginPath(); g.arc(0, 0, 14.5 + Math.sin(t.auraPulse * 3) * 1.2, 0, 7); g.stroke();
+          g.globalAlpha = disabled || ghost ? 0.55 : 1;
+          const qx = dx * (3 - rec), qy = dy * (3 - rec);
+          g.save(); g.translate(qx, qy); g.rotate(t.angle);
+          g.fillStyle = c2;
+          (g as any).beginPath(); (g as any).roundRect(-6, -6, 12, 12, 2.5); g.fill();
+          g.fillStyle = '#20223c';
+          (g as any).beginPath(); (g as any).roundRect(-3.4, -3.4, 6.8, 6.8, 1.6); g.fill();
+          g.restore();
+          g.fillStyle = 'rgba(255,255,255,0.35)';
+          g.beginPath(); g.arc(-4, -4.5, 2.6, 0, 7); g.fill();
+          break;
+        }
+        if (t.branch === 0) { // Cluster: three small muzzles
+          g.fillStyle = c2;
+          for (let i = 0; i < 3; i++) {
+            const a = t.angle + (i - 1) * 0.8;
+            const ox = Math.cos(a) * 5 - dx * rec, oy = Math.sin(a) * 5 - dy * rec;
+            g.beginPath(); g.arc(ox, oy, 4, 0, 7); g.fill();
+            g.fillStyle = '#20223c';
+            g.beginPath(); g.arc(ox, oy, 2.2, 0, 7); g.fill();
+            g.fillStyle = c2;
+          }
+          g.fillStyle = 'rgba(255,255,255,0.35)';
+          g.beginPath(); g.arc(-4, -4.5, 2.6, 0, 7); g.fill();
+          break;
+        }
+        const mx = dx * (4 - rec), my = dy * (4 - rec);
+        g.fillStyle = c2;
+        g.beginPath(); g.arc(mx, my, 7.4, 0, 7); g.fill();
+        g.fillStyle = '#20223c';
+        g.beginPath(); g.arc(mx, my, 4.6, 0, 7); g.fill();
+        g.fillStyle = 'rgba(255,255,255,0.35)';
+        g.beginPath(); g.arc(-4, -4.5, 2.6, 0, 7); g.fill();
+        break;
+      }
+      case 'cryo': {
+        const spin = t.auraPulse * (t.raw.aura ? 0.9 : 0.4);
+        g.save();
+        g.rotate(spin);
+        g.strokeStyle = c2; g.lineWidth = 4; g.lineCap = 'round';
+        for (let i = 0; i < 3; i++) {
+          const a = i * Math.PI / 3;
+          g.beginPath();
+          g.moveTo(Math.cos(a) * -12, Math.sin(a) * -12);
+          g.lineTo(Math.cos(a) * 12, Math.sin(a) * 12);
+          g.stroke();
+        }
+        g.strokeStyle = c; g.lineWidth = 2.4;
+        for (let i = 0; i < 3; i++) {
+          const a = i * Math.PI / 3;
+          g.beginPath();
+          g.moveTo(Math.cos(a) * -11, Math.sin(a) * -11);
+          g.lineTo(Math.cos(a) * 11, Math.sin(a) * 11);
+          g.stroke();
+        }
+        g.fillStyle = '#ffffff';
+        g.beginPath(); g.arc(0, 0, 3.4, 0, 7); g.fill();
+        if (t.branch === 2) { // Cryo Lance: long ice spike toward the target
+          g.save(); g.rotate(t.angle - spin); // counter the body spin
+          g.fillStyle = '#e8f7ff';
+          g.beginPath(); g.moveTo(19 - rec, 0); g.lineTo(6, -3.4); g.lineTo(6, 3.4); g.closePath(); g.fill();
+          g.restore();
+        }
+        if (t.branch === 0) { // Flash Freeze: bright crystal tips
+          g.fillStyle = '#ffffff';
+          for (let i = 0; i < 6; i++) {
+            const a = i * Math.PI / 3;
+            g.save(); g.translate(Math.cos(a) * 12, Math.sin(a) * 12); g.rotate(a);
+            g.beginPath(); g.moveTo(3.4, 0); g.lineTo(0, -2.2); g.lineTo(-3.4, 0); g.lineTo(0, 2.2); g.closePath(); g.fill();
+            g.restore();
+          }
+        }
+        g.restore();
+        break;
+      }
+      case 'missile': {
+        g.save();
+        g.rotate(t.angle + Math.PI / 2);
+        g.fillStyle = c2;
+        (g as any).beginPath(); (g as any).roundRect(-12, -12 + rec, 24, 24, 6); g.fill();
+        g.fillStyle = c;
+        (g as any).beginPath(); (g as any).roundRect(-10, -10 + rec, 20, 20, 5); g.fill();
+        g.fillStyle = c2;
+        if (t.branch === 2) { // Interceptor: twin slim AA rails
+          g.fillStyle = '#a0d8ef';
+          for (const side of [-1, 1]) {
+            (g as any).beginPath(); (g as any).roundRect(side * 5 - 1.7, -14 + rec, 3.4, 20, 1.7); g.fill();
+          }
+          g.fillStyle = c2;
+          g.beginPath(); g.arc(0, 2 + rec, 3.6, 0, 7); g.fill();
+          g.restore();
+          break;
+        }
+        const tubes = t.branch === 0 ? (t.branchStage ? 8 : 5) : t.branch === 1 ? 1 : 3;
+        if (tubes === 1) {
+          g.beginPath(); g.arc(0, rec, 6, 0, 7); g.fill();
+          g.fillStyle = '#20223c'; g.beginPath(); g.arc(0, rec, 3.4, 0, 7); g.fill();
+        } else {
+          for (let i = 0; i < tubes; i++) {
+            const col = i % 3, row = Math.floor(i / 3);
+            g.beginPath(); g.arc(-5.4 + col * 5.4, -5.4 + row * 5.4 + rec, 2.2, 0, 7); g.fill();
+          }
+        }
+        g.restore();
+        break;
+      }
+      case 'tesla': {
+        g.fillStyle = c2;
+        g.beginPath(); g.arc(0, 0, 11, 0, 7); g.fill();
+        const electrodes = t.branch === 0 ? 5 : t.branch === 2 ? 4 : 3; // Arc Web: more electrodes
+        for (let i = 0; i < electrodes; i++) {
+          // Ion Field: electrodes sit still; others orbit
+          const a = (t.branch === 2 ? Math.PI / 4 : t.auraPulse * 2) + i * (Math.PI * 2 / electrodes);
+          g.fillStyle = c2;
+          g.beginPath(); g.arc(Math.cos(a) * 13, Math.sin(a) * 13, 3, 0, 7); g.fill();
+        }
+        if (t.branch === 2) { // Ion Field: static halo ring
+          g.strokeStyle = c; g.lineWidth = 1.8; g.globalAlpha *= 0.7;
+          g.beginPath(); g.arc(0, 0, 15.5, 0, 7); g.stroke();
+          g.globalAlpha = disabled || ghost ? 0.55 : 1;
+        }
+        g.fillStyle = c;
+        g.beginPath(); g.arc(0, 0, t.branch === 1 ? 10 : 8, 0, 7); g.fill(); // Overload: fat orb
+        g.fillStyle = '#ffffff';
+        g.beginPath(); g.arc(-2, -2.4, 2.6, 0, 7); g.fill();
+        if (Math.random() < 0.06 && !ghost) this.spark(t.x + rand(-8, 8) * this.k, t.y + rand(-8, 8) * this.k, c, 1);
+        break;
+      }
+      case 'amp': {
+        g.save();
+        g.rotate(Math.PI / 4 + Math.sin(t.auraPulse * 1.2) * 0.15);
+        g.fillStyle = c2;
+        (g as any).beginPath(); (g as any).roundRect(-10, -10, 20, 20, 4); g.fill();
+        g.fillStyle = c;
+        (g as any).beginPath(); (g as any).roundRect(-7.4, -7.4, 14.8, 14.8, 3); g.fill();
+        g.restore();
+        g.fillStyle = '#ffffff';
+        g.beginPath(); g.arc(0, 0, 3, 0, 7); g.fill();
+        g.strokeStyle = c; g.lineWidth = 2;
+        g.setLineDash([5, 6]);
+        g.beginPath(); g.arc(0, 0, 15.5, 0, 7); g.stroke();
+        if (t.branch === 0) { // Overclock: second inner ring
+          g.beginPath(); g.arc(0, 0, 12, 0, 7); g.stroke();
+        }
+        g.setLineDash([]);
+        if (t.branch === 1) { // Targeting Array: crosshair ticks
+          g.lineWidth = 2.4;
+          for (let i = 0; i < 4; i++) {
+            const a = i * Math.PI / 2;
+            g.beginPath();
+            g.moveTo(Math.cos(a) * 14, Math.sin(a) * 14);
+            g.lineTo(Math.cos(a) * 19, Math.sin(a) * 19);
+            g.stroke();
+          }
+        }
+        if (t.branch === 2) { // Beacon: antenna mast with blinking light
+          g.strokeStyle = c2; g.lineWidth = 2.6; g.lineCap = 'round';
+          g.beginPath(); g.moveTo(0, -8); g.lineTo(0, -18); g.stroke();
+          g.fillStyle = Math.sin(this.now * 5) > 0 ? '#ffffff' : c;
+          g.beginPath(); g.arc(0, -19.5, 2.6, 0, 7); g.fill();
+        }
+        break;
+      }
+      case 'prism': {
+        // gem points along its firing direction; branch shapes differ
+        g.save();
+        g.rotate(t.angle);
+        if (t.branch === 2) { // Overdrive Lens: trailing booster gems
+          g.fillStyle = c2;
+          for (const off of [12, 18]) {
+            g.save(); g.translate(-off, 0);
+            g.beginPath(); g.moveTo(4, 0); g.lineTo(0, -3.2); g.lineTo(-4, 0); g.lineTo(0, 3.2); g.closePath(); g.fill();
+            g.restore();
+          }
+        }
+        if (t.branch === 1) { // Split Prism: two small side gems
+          g.fillStyle = c2;
+          for (const side of [-1, 1]) {
+            g.save(); g.translate(-6, side * 9);
+            g.beginPath(); g.moveTo(5, 0); g.lineTo(0, -4); g.lineTo(-5, 0); g.lineTo(0, 4); g.closePath(); g.fill();
+            g.restore();
+          }
+        }
+        const ex = t.branch === 0 ? 1.35 : 1; // Focus Prism: elongated lens
+        g.fillStyle = c2;
+        g.beginPath(); g.moveTo(13 * ex, 0); g.lineTo(0, -11); g.lineTo(-13 * ex * 0.8, 0); g.lineTo(0, 11); g.closePath(); g.fill();
+        g.fillStyle = c;
+        g.beginPath(); g.moveTo(10 * ex, 0); g.lineTo(0, -8); g.lineTo(-10 * ex * 0.8, 0); g.lineTo(0, 8); g.closePath(); g.fill();
+        g.fillStyle = '#ffffff88';
+        g.beginPath(); g.moveTo(6 * ex, 0); g.lineTo(0, -3.4); g.lineTo(-6 * ex * 0.8, 0); g.lineTo(0, 3.4); g.closePath(); g.fill();
+        g.restore();
+        break;
+      }
+      case 'ray': {
+        g.fillStyle = c2;
+        g.beginPath(); g.arc(0, 0, 10.5, 0, 7); g.fill();
+        g.save();
+        g.rotate(t.angle);
+        const wide = t.branch === 1 ? 3 : 0; // Annihilator: broader housing
+        const slim = t.branch === 2; // Lancet: extra-long thin barrel
+        const bl = slim ? 32 : 24, bh = slim ? 6.5 : 10;
+        g.fillStyle = c2;
+        (g as any).beginPath(); (g as any).roundRect(-6 - rec, -bh / 2 - wide, bl, bh + wide * 2, 3.4); g.fill();
+        g.fillStyle = c;
+        (g as any).beginPath(); (g as any).roundRect(-4.5 - rec, -bh / 2 + 1.4 - wide, bl - 4, bh - 2.8 + wide * 2, 2.6); g.fill();
+        g.fillStyle = '#ffffff';
+        if (t.branch === 0) { // Strobe: twin lenses
+          g.beginPath(); g.arc(17 - rec, -3, 2.2 + t.recoil * 1.2, 0, 7); g.fill();
+          g.beginPath(); g.arc(17 - rec, 3, 2.2 + t.recoil * 1.2, 0, 7); g.fill();
+        } else {
+          g.beginPath(); g.arc((slim ? 24 : 17) - rec, 0, (slim ? 2.2 : 2.8) + wide * 0.5 + t.recoil * 1.6, 0, 7); g.fill();
+        }
+        g.restore();
+        g.fillStyle = c;
+        g.beginPath(); g.arc(0, 0, 6.4, 0, 7); g.fill();
+        break;
+      }
+      case 'flame': {
+        g.fillStyle = c2;
+        g.beginPath(); g.arc(0, 0, 12, 0, 7); g.fill();
+        g.fillStyle = t.branch === 0 ? '#ff8a5c' : t.branch === 2 ? '#8fc9ef' : c; // Inferno red / Blue Flame
+        g.beginPath(); g.arc(0, 0, 9.4, 0, 7); g.fill();
+        g.save();
+        g.rotate(t.angle);
+        const nozzle = t.branch === 1 ? 22 : 17; // Flarethrower: longer nozzle
+        g.fillStyle = c2;
+        g.beginPath();
+        g.moveTo(6 - rec, -5.4);
+        g.lineTo(nozzle - rec, -8);
+        g.lineTo(nozzle - rec, 8);
+        g.lineTo(6 - rec, 5.4);
+        g.closePath(); g.fill();
+        g.restore();
+        g.fillStyle = t.branch === 2 ? '#ffffff' : '#ffd9a0';
+        g.beginPath(); g.arc(0, 0, 2.6 + Math.sin(t.auraPulse * 9) * 1, 0, 7); g.fill();
+        break;
+      }
+    }
+
+    // upgrade stars — inside the pad so they never overlap neighbours (4 max)
+    if (tier > 0) {
+      for (let i = 0; i < tier; i++) {
+        this.starPip(g, (i - (tier - 1) / 2) * 7.6, 13.5, 2.9);
+      }
+    }
+    if (disabled && !ghost) {
+      g.globalAlpha = 1;
+      g.fillStyle = '#ffb3c6';
+      g.font = '700 13px Nunito';
+      g.textAlign = 'center';
+      g.fillText('⚡ EMP', 0, -28 + Math.sin(this.now * 8) * 2);
+    }
+    g.restore();
+
+    // aura pulse squares (grid-consistent) — cryo fields only; amps stay still
+    if (!ghost && t.raw.aura) {
+      const R = t.rangeT();
+      const prog = (t.auraPulse * 0.5) % 1;
+      const rad = (R + 0.5) * this.cell * (0.3 + 0.7 * prog);
+      g.globalAlpha = (disabled ? 0.4 : 1) * (0.28 * (1 - prog) + 0.05);
+      g.strokeStyle = t.spec.color;
+      g.lineWidth = 2;
+      g.beginPath(); g.arc(t.x, t.y, rad, 0, 7); g.stroke();
+      g.globalAlpha = 1;
+    }
+  }
+  starPip(g: CanvasRenderingContext2D, x: number, y: number, size = 4) {
+    g.save(); g.translate(x, y);
+    g.fillStyle = '#fff3b0';
+    g.beginPath();
+    for (let i = 0; i < 5; i++) {
+      const a = -Math.PI / 2 + i * (Math.PI * 2 / 5);
+      const a2 = a + Math.PI / 5;
+      g.lineTo(Math.cos(a) * size, Math.sin(a) * size);
+      g.lineTo(Math.cos(a2) * size * 0.45, Math.sin(a2) * size * 0.45);
+    }
+    g.closePath(); g.fill();
+    g.restore();
+  }
+
+  drawBeams(g: CanvasRenderingContext2D) {
+    for (const t of this.towers) {
+      if (t.spec.kind !== 'prism' || !t.beamTargets.length) continue;
+      const s: any = t.stats(this);
+      const mult = 1 + ((s.rampMax || 3) - 1) * clamp(t.rampT / (s.rampTime || 3), 0, 1);
+      const w = 1.5 + mult * 1.1;
+      for (const e of t.beamTargets) {
+        g.strokeStyle = t.spec.color;
+        g.globalAlpha = 0.35;
+        g.lineWidth = w * 2.6;
+        g.lineCap = 'round';
+        g.beginPath(); g.moveTo(t.x, t.y); g.lineTo(e.x, e.y); g.stroke();
+        g.globalAlpha = 0.95;
+        g.strokeStyle = '#ffffff';
+        g.lineWidth = w;
+        g.beginPath(); g.moveTo(t.x, t.y); g.lineTo(e.x, e.y); g.stroke();
+        g.globalAlpha = 1;
+        g.fillStyle = t.spec.color;
+        g.globalAlpha = 0.6;
+        g.beginPath(); g.arc(e.x, e.y, w * 1.8 + Math.sin(this.now * 20) * 1.2, 0, 7); g.fill();
+        g.globalAlpha = 1;
+      }
+    }
+  }
+
+  drawProjs(g: CanvasRenderingContext2D) {
+    for (const p of this.projs) {
+      if (p.kind === 'bullet') {
+        g.lineCap = 'round';
+        for (let i = 1; i < p.trail.length; i++) {
+          g.globalAlpha = (i / p.trail.length) * 0.4;
+          g.strokeStyle = p.color;
+          g.lineWidth = p.w * (i / p.trail.length);
+          g.beginPath(); g.moveTo(p.trail[i - 1][0], p.trail[i - 1][1]); g.lineTo(p.trail[i][0], p.trail[i][1]); g.stroke();
+        }
+        g.globalAlpha = 1;
+        g.fillStyle = '#ffffff';
+        g.beginPath(); g.arc(p.x, p.y, p.w, 0, 7); g.fill();
+        g.fillStyle = p.color;
+        g.beginPath(); g.arc(p.x, p.y, p.w * 0.6, 0, 7); g.fill();
+      } else if (p.kind === 'missile') {
+        for (let i = 1; i < p.trail.length; i++) {
+          g.globalAlpha = (i / p.trail.length) * 0.35;
+          g.strokeStyle = '#ffffff';
+          g.lineWidth = 2.4 * (i / p.trail.length);
+          g.beginPath(); g.moveTo(p.trail[i - 1][0], p.trail[i - 1][1]); g.lineTo(p.trail[i][0], p.trail[i][1]); g.stroke();
+        }
+        g.globalAlpha = 1;
+        const a = Math.atan2(p.vy, p.vx);
+        g.save(); g.translate(p.x, p.y); g.rotate(a);
+        g.fillStyle = p.color;
+        (g as any).beginPath(); (g as any).roundRect(-7, -3, 14, 6, 3); g.fill();
+        g.fillStyle = '#ffffff';
+        g.beginPath(); g.moveTo(7, -3); g.lineTo(11, 0); g.lineTo(7, 3); g.fill();
+        g.fillStyle = '#ffd3b6';
+        g.beginPath(); g.arc(-8, 0, 2.4 + Math.random() * 1.4, 0, 7); g.fill();
+        g.restore();
+      } else {
+        const tt = clamp(p.t / p.T, 0, 1);
+        const x = lerp(p.x0, p.x1, tt), y = lerp(p.y0, p.y1, tt);
+        const h = Math.sin(tt * Math.PI);
+        const scale = 1 + h * 0.9;
+        this.shadow(g, x, y, (p.mini ? 3 : 5) * (1.3 - h * 0.5), 0.28);
+        const rr = (p.mini ? 3.4 : 6) * scale;
+        g.fillStyle = p.color;
+        g.beginPath(); g.arc(x - h * 4, y - h * 6, rr, 0, 7); g.fill();
+        g.fillStyle = 'rgba(255,255,255,0.6)';
+        g.beginPath(); g.arc(x - h * 4 - rr * 0.28, y - h * 6 - rr * 0.28, rr * 0.34, 0, 7); g.fill();
+      }
+    }
+  }
+
+  drawBolts(g: CanvasRenderingContext2D) {
+    for (const b of this.bolts) {
+      g.globalAlpha = clamp(b.life / 0.14, 0, 1);
+      g.strokeStyle = b.color;
+      g.lineWidth = 3.4;
+      g.lineJoin = 'round';
+      g.beginPath();
+      g.moveTo(b.pts[0][0], b.pts[0][1]);
+      for (let i = 1; i < b.pts.length; i++) g.lineTo(b.pts[i][0], b.pts[i][1]);
+      g.stroke();
+      g.strokeStyle = '#ffffff';
+      g.lineWidth = 1.4;
+      g.stroke();
+      g.globalAlpha = 1;
+    }
+  }
+
+  drawRays(g: CanvasRenderingContext2D) {
+    for (const r of this.rays) {
+      const lf = clamp(r.life / r.max, 0, 1);
+      g.lineCap = 'round';
+      g.globalAlpha = lf * 0.45;
+      g.strokeStyle = r.color;
+      g.lineWidth = r.w * 2 * lf + 2;
+      g.beginPath(); g.moveTo(r.x0, r.y0); g.lineTo(r.x1, r.y1); g.stroke();
+      g.globalAlpha = lf;
+      g.strokeStyle = '#ffffff';
+      g.lineWidth = Math.max(1.4, r.w * 0.5 * lf);
+      g.beginPath(); g.moveTo(r.x0, r.y0); g.lineTo(r.x1, r.y1); g.stroke();
+      g.globalAlpha = 1;
+    }
+  }
+
+  drawIncomings(g: CanvasRenderingContext2D) {
+    for (const inc of this.incomings) {
+      const p = 1 - inc.t / 0.7;
+      g.strokeStyle = '#ffd3b6';
+      g.lineWidth = 2.4;
+      g.setLineDash([6, 6]);
+      g.globalAlpha = 0.85;
+      const r = ABILITIES.orbital.radius * (1.3 - p * 0.3);
+      g.beginPath(); g.arc(inc.x, inc.y, r, 0, 7); g.stroke();
+      g.setLineDash([]);
+      g.strokeStyle = '#fff3b0';
+      g.lineWidth = 3;
+      const cr = r * (1 - p) + 10;
+      for (let i = 0; i < 4; i++) {
+        const a = i * Math.PI / 2 + this.now * 2;
+        g.beginPath();
+        g.moveTo(inc.x + Math.cos(a) * cr, inc.y + Math.sin(a) * cr);
+        g.lineTo(inc.x + Math.cos(a) * (cr + 12), inc.y + Math.sin(a) * (cr + 12));
+        g.stroke();
+      }
+      g.globalAlpha = 1;
+    }
+  }
+
+  drawParticles(g: CanvasRenderingContext2D) {
+    for (const p of this.parts) {
+      const lf = clamp(p.life / p.max, 0, 1);
+      switch (p.kind) {
+        case 'dot': case 'spark':
+          g.globalAlpha = lf;
+          g.fillStyle = p.color;
+          g.beginPath(); g.arc(p.x, p.y, p.size * (p.kind === 'spark' ? lf : 1), 0, 7); g.fill();
+          break;
+        case 'fire':
+          g.globalAlpha = lf * 0.9;
+          g.fillStyle = p.color;
+          g.beginPath(); g.arc(p.x, p.y, p.size * (0.6 + lf * 0.6), 0, 7); g.fill();
+          break;
+        case 'shard':
+          g.globalAlpha = lf;
+          g.fillStyle = p.color;
+          g.save(); g.translate(p.x, p.y); g.rotate(p.rot || 0);
+          g.fillRect(-p.size / 2, -p.size / 2, p.size, p.size * 0.7);
+          g.restore();
+          break;
+        case 'smoke':
+          g.globalAlpha = lf * 0.5;
+          g.fillStyle = p.color;
+          g.beginPath(); g.arc(p.x, p.y, p.size * (1.6 - lf * 0.6), 0, 7); g.fill();
+          break;
+        case 'ring': {
+          g.globalAlpha = lf;
+          g.strokeStyle = p.color;
+          g.lineWidth = 3 * lf + 1;
+          const r = p.size * (1.25 - lf * 0.25);
+          g.beginPath(); g.arc(p.x, p.y, r, 0, 7); g.stroke();
+          break;
+        }
+        case 'shock': {
+          const r = p.size * (1 - lf);
+          g.globalAlpha = lf * 0.9;
+          g.strokeStyle = p.color;
+          g.lineWidth = 6 * lf + 1;
+          g.beginPath(); g.arc(p.x, p.y, Math.max(2, r), 0, 7); g.stroke();
+          break;
+        }
+        case 'flash':
+          g.globalAlpha = lf * 0.9;
+          g.fillStyle = p.color;
+          g.beginPath(); g.arc(p.x, p.y, p.size * (1.4 - lf * 0.4), 0, 7); g.fill();
+          break;
+        case 'text':
+          g.globalAlpha = Math.min(1, lf * 2);
+          g.fillStyle = p.color;
+          g.font = `800 ${p.size}px Nunito`;
+          g.textAlign = 'center';
+          g.strokeStyle = 'rgba(6,7,18,0.8)';
+          g.lineWidth = 3.4;
+          g.strokeText(p.text!, p.x, p.y);
+          g.fillText(p.text!, p.x, p.y);
+          break;
+      }
+    }
+    g.globalAlpha = 1;
+  }
+
+  drawFocus(g: CanvasRenderingContext2D) {
+    const e = this.focus;
+    if (!e || e.dead) return;
+    const r = e.spec.size + 10;
+    g.save();
+    g.translate(e.x, e.y);
+    g.rotate(this.now * 2.4);
+    g.strokeStyle = '#ff8fa3';
+    g.lineWidth = 2.6;
+    for (let i = 0; i < 4; i++) {
+      const a = i * Math.PI / 2;
+      g.beginPath();
+      g.arc(0, 0, r, a - 0.4, a + 0.4);
+      g.stroke();
+    }
+    g.restore();
+  }
+
+  drawSelection(g: CanvasRenderingContext2D) {
+    // touch long-press range peek — a lighter-weight preview, no pulse, doesn't require
+    // opening the tower panel. Skipped if this tower is already the real selection below.
+    if (this.peekTower && this.peekTower !== this.selected && this.towers.includes(this.peekTower)) {
+      const pt = this.peekTower;
+      this.drawRangeTiles(g, pt.col, pt.row, pt.rangeT(), pt.spec.color, 0.14);
+      g.strokeStyle = pt.spec.color;
+      g.lineWidth = 1.6;
+      g.globalAlpha = 0.7;
+      const ps = this.cell - 6;
+      (g as any).beginPath(); (g as any).roundRect(pt.x - ps / 2, pt.y - ps / 2, ps, ps, 9); g.stroke();
+      g.globalAlpha = 1;
+    }
+    const t = this.selected;
+    if (!t) return;
+    this.drawRangeTiles(g, t.col, t.row, t.rangeT(), t.spec.color, 0.1);
+    const pulse = 1 + Math.sin(performance.now() / 200) * 0.06;
+    g.strokeStyle = t.spec.color;
+    g.lineWidth = 2;
+    const s = (this.cell - 6) * pulse;
+    (g as any).beginPath(); (g as any).roundRect(t.x - s / 2, t.y - s / 2, s, s, 9); g.stroke();
+    if (t.spec.kind === 'amp') {
+      for (const o of this.towers) {
+        if (o !== t && o.spec.kind !== 'amp' && this.circCell(t.x, t.y, t.rangeT(), o.col, o.row)) {
+          this.ampRing(g, o.x, o.y, (o.spec.size + 11) * this.k, true);
+        }
+      }
+    }
+  }
+
+  drawPlacement(g: CanvasRenderingContext2D) {
+    // building: ghost of a not-yet-placed tower, awaiting confirmation
+    if (this.pendingBuild) {
+      const pb = this.pendingBuild;
+      const c = this.cells[pb.cellIdx];
+      const ghost = new Tower(pb.spec, c.x, c.y);
+      ghost.col = c.col; ghost.row = c.row;
+      this.drawRangeTiles(g, c.col, c.row, ghost.rangeT(), pb.spec.color, 0.14);
+      this.shadow(g, c.x, c.y, (pb.spec.size + 6) * this.k);
+      this.drawTower(g, ghost, true);
+      return;
+    }
+    // moving: ghost of the tower at its candidate new cell, awaiting confirmation
+    if (this.pendingMove) {
+      const pm = this.pendingMove;
+      const t = pm.tower;
+      const c = this.cells[pm.cellIdx];
+      this.drawRangeTiles(g, c.col, c.row, t.rangeT(), t.spec.color, 0.14);
+      g.strokeStyle = 'rgba(255,255,255,0.35)';
+      g.setLineDash([5, 7]);
+      g.beginPath(); g.moveTo(t.x, t.y); g.lineTo(c.x, c.y); g.stroke();
+      g.setLineDash([]);
+      this.shadow(g, c.x, c.y, (t.spec.size + 6) * this.k);
+      const saved = { x: t.x, y: t.y };
+      t.x = c.x; t.y = c.y;
+      this.drawTower(g, t, true);
+      t.x = saved.x; t.y = saved.y;
+      return;
+    }
+    // move armed: choosing a destination — live range preview under the cursor
+    if (this.moveArmed) {
+      const t = this.moveArmed;
+      const idx = this.cellAt(this.mx, this.my);
+      if (idx < 0) return;
+      const ok = this.cellFree(idx, t);
+      const c = this.cells[idx];
+      this.drawRangeTiles(g, c.col, c.row, t.rangeT(), ok ? '#a8e6cf' : '#ff7d7d', 0.08);
+      if (ok) {
+        g.globalAlpha = 0.55;
+        this.shadow(g, c.x, c.y, (t.spec.size + 6) * this.k);
+        const saved = { x: t.x, y: t.y };
+        t.x = c.x; t.y = c.y;
+        this.drawTower(g, t, true);
+        t.x = saved.x; t.y = saved.y;
+        g.globalAlpha = 1;
+      } else {
+        g.strokeStyle = '#ff7d7d'; g.lineWidth = 3.4;
+        g.beginPath();
+        g.moveTo(c.x - 12, c.y - 12); g.lineTo(c.x + 12, c.y + 12);
+        g.moveTo(c.x + 12, c.y - 12); g.lineTo(c.x - 12, c.y + 12);
+        g.stroke();
+      }
+    }
+  }
+}

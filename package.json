@@ -1,0 +1,19 @@
+{
+  "name": "starhold",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build && node --experimental-strip-types build-tools/gen-sw.ts",
+    "gen-icons": "node --experimental-strip-types build-tools/gen-icons.ts",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "sharp": "^0.35.3",
+    "typescript": "^5.5.0",
+    "vercel": "^54.18.7",
+    "vite": "^5.4.0",
+    "vite-plugin-singlefile": "^2.3.3"
+  }
+}
