@@ -46,11 +46,11 @@ export function runSelfTest(ui: UI) {
     finish(0);
     return;
   }
-  driveTest();
-
   let tick = 0;
   const maxTicks = 500;
   let intervalId = 0;
+
+  driveTest();
 
   function driveTest() {
     const game: Game | null = ui.game;

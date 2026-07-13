@@ -98,7 +98,7 @@ export const TUNING = {
   asteroids: { cellsMin: 6, cellsMax: 10 },
   nova: {
     killsToCharge: 90, eliteCharge: 4, bossCharge: 20,
-    damage: 400, bossFrac: 0.5, buildup: 1.2, rechargeGrowth: 1.4,
+    fracNormal: 0.30, fracBoss: 0.08, stunDur: 0.6, buildup: 1.2, rechargeGrowth: 1.0,
   },
   ascension: {
     // Tiers are CUMULATIVE — Ascension III has I+II+III's effects all active at once.
@@ -114,6 +114,15 @@ export const TUNING = {
   smoothing: {
     earlyLevels: 0.9,                     // L1–L2 pressure multiplier
     compensationFrom: 5, compensationFull: 10, compensationMax: 1.15,
+  },
+  // ---- Starhold 3.0 Phase 1: economy & scaling foundations ----
+  economy: {
+    sellRefund: 0.72,          // fraction refunded outside the undo window
+    sellUndoWindow: 4,         // seconds of game-time after placement with full refund
+    refundInWaveMul: 0.72,     // upgrade-refund fraction while a wave is active (full between waves)
+    earlyCallPerSec: 0.04,     // early-call bonus: +4% of pending wave bounty per second remaining
+    earlyCallCap: 0.40,        // ...capped at +40% of the wave's bounty
+    bountyCoef: 0.27,          // was 0.22 inline in game.ts — moved here and raised (see PROGRESS-3.md)
   },
 } as const;
 
@@ -454,13 +463,13 @@ export const ENEMIES: Record<string, EnemySpec> = {
 // ================= Meta upgrades (spent with stars) =================
 export interface MetaNode { id: string; name: string; desc: string; cost: number; requires?: string; }
 export const META: MetaNode[] = [
-  { id: 'reactor1', name: 'Reactor I', desc: '+60 starting credits every level.', cost: 1 },
-  { id: 'reactor2', name: 'Reactor II', desc: '+120 starting credits (total).', cost: 2, requires: 'reactor1' },
+  { id: 'reactor1', name: 'Reactor I', desc: '+20% starting credits every level.', cost: 1 },
+  { id: 'reactor2', name: 'Reactor II', desc: '+35% starting credits (total).', cost: 2, requires: 'reactor1' },
   { id: 'hull1', name: 'Hull Plating I', desc: '+5 base integrity.', cost: 1 },
   { id: 'hull2', name: 'Hull Plating II', desc: '+10 base integrity (total).', cost: 2, requires: 'hull1' },
   { id: 'fab', name: 'Fabricators', desc: 'All towers cost 10% less.', cost: 3 },
   { id: 'munitions', name: 'Munitions Lab', desc: 'All towers deal +10% damage.', cost: 3 },
-  { id: 'orbital', name: 'Orbital Strike', desc: 'Unlock ability: aimed strike, heavy area damage. 30s cooldown.', cost: 2 },
+  { id: 'orbital', name: 'Orbital Strike', desc: 'Unlock ability: aimed strike, heavy area damage that scales with the invasion. 30s cooldown.', cost: 2 },
   { id: 'stasis', name: 'Stasis Field', desc: 'Unlock ability: aimed field that slows everything 70% for 4s. 25s cooldown.', cost: 2 },
 ];
 

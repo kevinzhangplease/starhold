@@ -6,11 +6,18 @@ let fails = 0;
 const check = (cond: boolean, msg: string) => { if (!cond) { fails++; console.error('FAIL:', msg); } };
 
 // ---------- NOVA ----------
+// Phase 1 (3.0): NOVA became a %-current-HP-plus-stun blast, and rechargeGrowth dropped
+// from 1.4 to 1.0 — the fixed kill-count charge is now the sole limiter, not an escalating
+// cost. A flat 2-uses-per-level cap is the designated fallback if balance testing finds NOVA
+// spam (see PLAN-3.md 1.8.3) but isn't implemented preemptively.
 const N = TUNING.nova;
 check(N.killsToCharge > 0, 'NOVA needs a positive number of kills to charge');
-check(N.rechargeGrowth > 1, 'each NOVA use makes the next one need more kills (rechargeGrowth > 1)');
+check(N.rechargeGrowth >= 1, 'NOVA recharge requirement should never get EASIER after a use (rechargeGrowth >= 1)');
 check(N.buildup > 0 && N.buildup < 5, 'NOVA buildup is a short, real delay');
-check(N.bossFrac > 0 && N.bossFrac <= 1, 'NOVA deals a fraction (not more) of its damage to bosses');
+check(N.fracNormal > 0 && N.fracNormal <= 1, 'NOVA deals a fraction (not more) of current HP to normal enemies');
+check(N.fracBoss > 0 && N.fracBoss <= 1, 'NOVA deals a fraction (not more) of current HP to bosses');
+check(N.fracNormal > N.fracBoss, 'NOVA is more effective against normal enemies than bosses (crowd control, not a boss cooldown)');
+check(N.stunDur > 0, 'NOVA stuns surviving normal enemies for a real duration');
 check(N.eliteCharge > 1, 'elite kills charge NOVA faster than normal kills');
 check(N.bossCharge > N.eliteCharge, 'boss kills charge NOVA faster than elite kills');
 
@@ -26,10 +33,9 @@ function simulateRecharge(uses: number): number[] {
 }
 {
   const history = simulateRecharge(5);
-  check(history.every((n, i) => i === 0 || n > history[i - 1]), 'NOVA requirement strictly increases with each use');
+  // rechargeGrowth === 1.0 today: the requirement should stay perfectly flat across uses.
+  check(history.every(n => n === N.killsToCharge), 'NOVA requirement stays flat across repeated uses (rechargeGrowth neutralized at 1.0)');
   check(history[0] === N.killsToCharge, 'first requirement matches the base killsToCharge');
-  // sanity: even after 5 uses in one level, requirement shouldn't have exploded to something absurd (>10x)
-  check(history[5] < N.killsToCharge * 10, `after 5 uses, requirement (${history[5]}) hasn't spiraled unreasonably`);
 }
 
 // ---------- Ascension cumulative stacking ----------
@@ -42,7 +48,12 @@ function effectiveMutationBonus(ascTier: number): number { return ascTier >= 2 ?
 function effectiveMutatorFromWave(ascTier: number, normalFromWave: number): number { return ascTier >= 2 ? A.mutatorFromWave : normalFromWave; }
 function effectiveEliteMul(ascTier: number): number { return ascTier >= 3 ? A.eliteMul : 1; }
 function effectiveStartCreditMul(ascTier: number): number { return ascTier >= 4 ? A.startCreditMul : 1; }
-function effectiveInterestCap(ascTier: number, baseCap: number): number { return ascTier >= 4 ? A.interestCapTier4 : baseCap; }
+// Phase 1 (3.0): Ascension IV now halves the (already econ-scaled) cap via the
+// interestCapTier4/base-cap RATIO, rather than overwriting it with a flat constant —
+// mirrors game.ts's constructor exactly (see tests/economy-v3.ts for the full econ-scaled version).
+function effectiveInterestCap(ascTier: number, baseCap: number): number {
+  return ascTier >= 4 ? Math.round(baseCap * (A.interestCapTier4 / TUNING.interest.cap)) : baseCap;
+}
 function effectiveIntermissionMul(ascTier: number): number { return ascTier >= 5 ? A.intermissionMul : 1; }
 
 for (let tier = 0; tier <= 5; tier++) {

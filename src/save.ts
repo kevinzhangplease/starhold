@@ -73,7 +73,7 @@ export const defaultSave = (): SaveData => ({
   chromaOn: false,
   lastSpeed: 1,
   defaultTargeting: 'first',
-  settings: { master: 0.8, music: true, weapons: true, explosions: true, ui: true, shake: true, tileSize: 48, difficulty: 2, length: 2, pauseOnBuild: false, meander: 0, haptics: true, damageNumbers: true, reduceFlash: false, reduceMotion: false, perfMode: 'auto' },
+  settings: { master: 0.8, music: true, weapons: true, explosions: true, ui: true, shake: true, tileSize: 48, difficulty: 2, length: 2, pauseOnBuild: true, meander: 0, haptics: true, damageNumbers: true, reduceFlash: false, reduceMotion: false, perfMode: 'auto' },
 });
 
 // Idempotent: running on an already-migrated save changes nothing.

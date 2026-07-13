@@ -136,7 +136,7 @@ const stable = (o: any): string => JSON.stringify(o, (_k, v) =>
   if (m1.endlessBest[2] !== 7) err(`v1 endlessBest should land at tier 2 (got ${JSON.stringify(m1.endlessBest)})`);
   if (m1.stars[15] !== 3 || m1.unlocked !== 16 || m1.meta[0] !== 'hull1') err('migrateSave lost v1 fields');
   if (m1.settings.master !== 0.5 || m1.settings.tileSize !== 58) err('migrateSave lost v1 settings');
-  if (m1.settings.pauseOnBuild !== false || m1.settings.meander !== 0) err('migrateSave missing new setting defaults');
+  if (m1.settings.pauseOnBuild !== true || m1.settings.meander !== 0) err('migrateSave missing new setting defaults');
   for (const key of ['combo', 'interest', 'nova', 'mod_ionstorms']) {
     if (!m1.seen[key]) err(`veteran save (unlocked 16) should pre-mark seen['${key}']`);
   }
@@ -201,9 +201,13 @@ if (!('nova' in UNLOCKS)) err(`'nova' gate missing from UNLOCKS`);
 
 // NOVA tuning sanity
 if (!(TUNING.nova.killsToCharge > 0)) err('TUNING.nova.killsToCharge must be > 0');
-if (!(TUNING.nova.rechargeGrowth > 1)) err('TUNING.nova.rechargeGrowth must be > 1 (recharge should get harder each use)');
+// Phase 1 (3.0): rechargeGrowth dropped from 1.4 to 1.0 (the use-count cap is designated as
+// the fallback if NOVA spam is found in balance testing — see PLAN-3.md 1.8.3). 1.0 is the
+// valid "no growth" neutral value; the field/code path stay so it remains a tuning lever.
+if (!(TUNING.nova.rechargeGrowth >= 1)) err('TUNING.nova.rechargeGrowth must be >= 1 (recharge should never get easier)');
 if (!(TUNING.nova.buildup > 0 && TUNING.nova.buildup < 3)) err('TUNING.nova.buildup should be a short buildup (0-3s)');
-if (!(TUNING.nova.bossFrac > 0 && TUNING.nova.bossFrac <= 1)) err('TUNING.nova.bossFrac out of (0,1]');
+if (!(TUNING.nova.fracNormal > 0 && TUNING.nova.fracNormal <= 1)) err('TUNING.nova.fracNormal out of (0,1]');
+if (!(TUNING.nova.fracBoss > 0 && TUNING.nova.fracBoss <= 1)) err('TUNING.nova.fracBoss out of (0,1]');
 
 // every boss enemy exists and is referenced by exactly the three named zone finales
 {
@@ -287,8 +291,13 @@ if (!(TUNING.smoothing.compensationFrom < TUNING.smoothing.compensationFull)) er
   function effectiveStartCredits(baseCredits: number, ascTier: number): number {
     return Math.round(baseCredits * (ascTier >= 4 ? AS.startCreditMul : 1));
   }
-  function effectiveInterestCap(levelId: number, ascTier: number): number {
-    return ascTier >= 4 ? AS.interestCapTier4 : TUNING.interest.cap + levelId * 3;
+  function effectiveInterestCap(levelHpMul: number, levelId: number, ascTier: number): number {
+    // Mirrors Game.waveRewardMul() at Normal difficulty (diffReward=1, wave 0) for this
+    // summary table — the real in-game cap also scales slightly with difficulty tier
+    // via diffReward, which this level/ascension-only table doesn't attempt to show.
+    const econScale = 1 + (levelHpMul - 1) * TUNING.economy.bountyCoef;
+    const scaled = Math.round((TUNING.interest.cap + levelId * 3) * econScale);
+    return ascTier >= 4 ? Math.round(scaled * (AS.interestCapTier4 / TUNING.interest.cap)) : scaled;
   }
 
   const sampleIds = [1, 8, 15];
@@ -306,7 +315,7 @@ if (!(TUNING.smoothing.compensationFrom < TUNING.smoothing.compensationFull)) er
       console.log(`  ${DIFF_NAMES[diffTier].padEnd(8)} hpMul  ${row.join('  ')}`);
     }
     // credits/interest only vary by ascension, not difficulty, so print once per level
-    const creditRow = [0, 1, 2, 3, 4, 5].map(a => `A${a}:${effectiveStartCredits(lv.startCredits, a)}◆/cap${effectiveInterestCap(id, a)}`);
+    const creditRow = [0, 1, 2, 3, 4, 5].map(a => `A${a}:${effectiveStartCredits(lv.startCredits, a)}◆/cap${effectiveInterestCap(lv.hpMul, id, a)}`);
     console.log(`  startCredits/interestCap  ${creditRow.join('  ')}`);
     // sanity bounds: nothing in the grid should be a degenerate cliff
     for (let diffTier = 0; diffTier < 5; diffTier++) {
@@ -340,6 +349,21 @@ for (const [n, want] of fmtCases) {
   if (!(A.startCreditMul > 0 && A.startCreditMul < 1)) err('TUNING.ascension.startCreditMul should be in (0,1)');
   if (!(A.interestCapTier4 > 0 && A.interestCapTier4 < TUNING.interest.cap)) err('TUNING.ascension.interestCapTier4 should be a real reduction from the base cap');
   if (!(A.intermissionMul > 0 && A.intermissionMul < 1)) err('TUNING.ascension.intermissionMul should be in (0,1)');
+}
+
+// ---- Phase 1 (3.0): economy & NOVA tuning sanity ----
+{
+  const E = (TUNING as any).economy;
+  if (!E) err('TUNING.economy is missing');
+  else {
+    for (const key of ['sellRefund', 'sellUndoWindow', 'refundInWaveMul', 'earlyCallPerSec', 'earlyCallCap', 'bountyCoef']) {
+      if (!(key in E)) err(`TUNING.economy.${key} is missing`);
+    }
+    if (!(E.sellRefund > 0 && E.sellRefund < 1)) err('TUNING.economy.sellRefund should be in (0,1)');
+    if (!(E.earlyCallCap <= 0.5)) err('TUNING.economy.earlyCallCap should be <= 0.5');
+  }
+  const N = TUNING.nova;
+  if (!(N.fracNormal > N.fracBoss)) err('TUNING.nova.fracNormal should be greater than fracBoss');
 }
 
 // daily op: every level in the campaign is a valid pick if it's the only one eligible;

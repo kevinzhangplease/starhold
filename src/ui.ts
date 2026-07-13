@@ -132,6 +132,7 @@ export class UI {
   notify!: Notifier;
   private hudRefs: Record<string, HTMLElement> = {};
   private lastHud = { credits: -1, lives: -1, wave: -1 };
+  private sellPanelTower: Tower | null = null;   // live sell/undo label refresh target
   private abilityBtns: Record<string, HTMLElement> = {};
 
   // touch/pointer state
@@ -669,7 +670,7 @@ export class UI {
       row.append(tg);
       card.append(row);
     };
-    mkToggle('Pause when building', 'pauseOnBuild', () => {
+    mkToggle('Pause when building (recommended)', 'pauseOnBuild', () => {
       if (!s.pauseOnBuild) this.syncBuildPause();
     });
     mkToggle('Screen shake', 'shake', () => {
@@ -953,10 +954,10 @@ export class UI {
     section('The basics');
     item('Goal', "Aliens march along a fixed path toward your base. Build towers to kill them before they arrive. Every alien that gets through costs hull integrity (your lives) — run out and the level ends.");
     item('Building', "Tap an open cell, pick a tower, then confirm — you'll see a ghost preview and its range before you commit. Each tower costs credits, which you earn by killing aliens and clearing waves.");
-    item('Upgrading', "Select a built tower to see its tech tree: two general upgrades (Mk II, Mk III), then a choice of 3 specialization branches, 2 tiers each. Any upgrade can be refunded in full at any time — experiment freely.");
-    item('Moving & selling', "A selected tower's panel has Move (relocate it for free) and Sell (full refund) buttons.");
+    item('Upgrading', "Select a built tower to see its tech tree: two general upgrades (Mk II, Mk III), then a choice of 3 specialization branches, 2 tiers each. Any upgrade can be refunded in full between waves — experiment freely. Refunding mid-wave returns 72% (closes an interest-payout exploit).");
+    item('Moving & selling', "A selected tower's panel has Move (relocate it for free, anytime) and Sell buttons. Selling returns 72% of its cost, or 100% within 4 seconds of placing it — a brief undo window for a misclick, not a free respec.");
     item('Targeting', "Each tower has a targeting mode — First (furthest along the path), Last, Strong(est), Weak(est), or Close(st) — changeable anytime from its panel. Set a default in Settings for all new towers.");
-    item('Launching waves', "Click Launch to send the next wave — calling it early (before the countdown finishes) pays a bonus based on how much time was left. Toggle Auto-launch to skip the wait entirely.");
+    item('Launching waves', "Click Launch to send the next wave — calling it early (before the countdown finishes) pays a bonus: a percentage of that wave's total bounty, scaled by how much time was left (capped at 40%). Toggle Auto-launch to skip the wait entirely — it launches immediately but earns no early-call bonus, since there's no longer a decision being rewarded.");
     item('The forecast bar', "Top-right shows what's coming: the next wave's alien composition and any twist it carries, plus a dimmed preview of the wave after that — always visible before you commit to a layout.");
 
     section('Making it interesting');
@@ -970,11 +971,12 @@ export class UI {
 
     section('Abilities & big moments');
     item('Orbital Strike & Stasis Field', "Two active abilities, unlocked permanently via the Upgrades screen (spend stars). Click the ability button, then click a spot on the map to cast — a heavy-damage strike or a slowing field, each on its own cooldown.");
-    item('NOVA', "A free ultimate that charges as you rack up kills (elite and boss kills charge it much faster). When full, its button glows — fire it for a screen-wide shockwave. Gets harder to recharge each time you use it within a level. Most effective against groups of regular enemies — bosses take reduced, meaningful-but-not-decisive damage from it, so think of it as crowd control rather than a boss-damage cooldown.");
+    item('NOVA', "A free ultimate that charges as you rack up kills (elite and boss kills charge it much faster). When full, its button glows — fire it to tear 30% of the current health from everything on screen (8% from bosses) and stun the survivors. Most effective against groups of regular enemies — bosses take reduced, meaningful-but-not-decisive damage from it, so think of it as crowd control rather than a boss-damage cooldown.");
     item('Boss fights', "Every 5th level ends in a boss, announced with a klaxon and a screen-wide warning. It gets a persistent health bar, and most bosses change tactics once they drop to 50% HP — read the banner when it happens.");
 
     section('Stars & rewards');
     item('Level challenges', "Most levels carry two optional bonus objectives (shown before you start, and as badges on the level card) — things like winning without losing hull, or without selling a tower. Each earns a bonus star.");
+    item('Completion stars', "3★ — win losing no more than 2 hull. 2★ — no more than 8. 1★ — any win. Measured in absolute hull lost, not a percentage, so Hull Plating meta doesn't make the top rating easier to hit.");
     item('Stars', "Your star total (level completion + challenges + endless milestones) is shown at the top of Sectors and spent in Upgrades.");
     item('Meta upgrades', "Permanent, account-wide upgrades bought with stars: more starting credits, more hull, cheaper towers, stronger towers, and unlocking Orbital Strike / Stasis Field. These apply to every level you play from then on.");
     item('Victory & defeat screens', "Winning punches in your stars, challenge badges, and any new records one at a time — tap to skip. Losing tells you which wave broke you and which alien type did most of the damage, with a counter-tower hint.");
@@ -1106,7 +1108,7 @@ export class UI {
     if (this.save.resume) { this.save.resume = undefined; this.persist(); }
     const owned = (id: string) => this.save.meta.includes(id) || this.devMode;
     const meta = {
-      credits: owned('reactor2') ? 120 : owned('reactor1') ? 60 : 0,
+      creditMul: owned('reactor2') ? 1.35 : owned('reactor1') ? 1.20 : 1.0,
       hp: owned('hull2') ? 10 : owned('hull1') ? 5 : 0,
       costMul: owned('fab') ? 0.9 : 1,
       dmgMul: owned('munitions') ? 1.1 : 1,
@@ -1299,12 +1301,12 @@ export class UI {
       this.persist();
     };
     const auto = el('button', 'icon-btn', '⏩');
-    auto.title = 'Auto-launch the next wave immediately (collects the maximum early bonus)';
+    auto.title = 'Auto-launch each wave the instant the last one clears — no early-call bonus, since there is no decision to reward.';
     auto.onclick = () => {
       audio.ui('click');
       g.autoWave = !g.autoWave;
       auto.classList.toggle('active', g.autoWave);
-      if (g.autoWave && !g.waveActive) g.callWave(true);
+      if (g.autoWave && !g.waveActive) g.callWave(true, true);
     };
     const devBtn = el('button', 'icon-btn', '⚑');
     devBtn.title = 'Developer Mode';
@@ -1345,7 +1347,7 @@ export class UI {
       const nova = el('button', 'nova-btn');
       nova.id = 'nova-btn';
       nova.innerHTML = `<div class="nova-fill"></div><span class="nova-label">☀ NOVA</span>`;
-      nova.title = 'NOVA — charged by kills. Fires a station-wide shockwave.';
+      nova.title = 'NOVA — charged by kills. Tears 30% of the health from everything on screen (8% from bosses) and stuns the survivors.';
       nova.onclick = () => {
         if (g.startNova()) { audio.ui('click'); this.notify.low('NOVA CHARGING — brace!'); }
         else audio.ui('deny');
@@ -1353,7 +1355,7 @@ export class UI {
       this.root.append(nova);
       this.hudRefs.nova = nova;
       this.hudRefs.novaFill = nova.querySelector('.nova-fill') as HTMLElement;
-      this.toastOnce('nova', 'NOVA unlocked! Kills charge the meter — fire it for a station-wide shockwave when things get desperate.');
+      this.toastOnce('nova', 'NOVA unlocked! Kills charge the meter — fire it to tear 30% of the health from everything on screen (8% from bosses) and stun the survivors.');
     }
 
     // abilities — bottom-left stack
@@ -1692,6 +1694,13 @@ export class UI {
       const ip = this.hudRefs.interestPreview as HTMLElement;
       if (ip && ip.textContent !== txt) ip.textContent = txt;
     }
+    // sell/undo button: flips from full-refund to 72% the instant the undo window lapses,
+    // even while the panel stays open — piggybacks the same per-frame path as the interest
+    // preview above, since both are "recompute a live label from game.now" jobs.
+    if (this.hudRefs.sellBtn && this.sellPanelTower) {
+      const txt = this.sellLabel(this.sellPanelTower);
+      if (this.hudRefs.sellBtn.textContent !== txt) this.hudRefs.sellBtn.textContent = txt;
+    }
     // combo counter: appears at ×3, pulses on increment
     {
       const c = this.hudRefs.combo as HTMLElement;
@@ -1735,8 +1744,10 @@ export class UI {
     (this.hudRefs.callWrap as HTMLElement).style.display = canCall ? 'flex' : 'none';
     if (canCall) {
       const secs = Math.ceil(g.interT);
-      const bonus = Math.round(g.interT * 3);
-      this.hudRefs.callBonus.textContent = bonus > 1 ? `+${bonus} ◆ if launched now` : '';
+      const E = TUNING.economy;
+      const frac = Math.min(E.earlyCallCap, g.interT * E.earlyCallPerSec);
+      const bonus = Math.round(g.pendingWaveBounty() * frac);
+      this.hudRefs.callBonus.textContent = bonus > 0 ? `+${bonus} ◆ (+${Math.round(frac * 100)}%) if launched now` : '';
       this.hudRefs.callBtn.textContent = `Launch wave (${secs}s)`;
     }
     this.updateWavePreview();
@@ -1943,7 +1954,19 @@ export class UI {
   }
 
   // ---------- side panel (adjacent to tower) ----------
-  closeSidePanel() { document.getElementById('side-panel')?.remove(); this.syncBuildPause(); }
+  closeSidePanel() {
+    document.getElementById('side-panel')?.remove();
+    delete this.hudRefs.sellBtn;
+    this.sellPanelTower = null;
+    this.syncBuildPause();
+  }
+
+  // Live two-state sell label: full refund inside the undo window, 72% after it lapses.
+  sellLabel(t: Tower): string {
+    const g = this.game!;
+    const undo = g.now - t.builtAt <= TUNING.economy.sellUndoWindow;
+    return undo ? `Undo — full refund ◆ ${t.spent}` : `Sell (72%) ◆ ${Math.round(t.spent * TUNING.economy.sellRefund)}`;
+  }
 
   renderSidePanel() {
     this.closeSidePanel();
@@ -2031,10 +2054,12 @@ export class UI {
       g.armMove(t);
       this.closeSidePanel();
     };
-    const sell = el('button', 'sell-btn', `Sell — full refund ◆ ${t.spent}`);
+    const sell = el('button', 'sell-btn', this.sellLabel(t));
     sell.onclick = () => { g.sell(t); this.closeSidePanel(); };
     actionRow.append(move, sell);
     panel.append(actionRow);
+    this.hudRefs.sellBtn = sell;
+    this.sellPanelTower = t;
 
     // position adjacent to the tower, clamped
     this.root.append(panel);
@@ -2274,7 +2299,7 @@ export class UI {
         starsRow.append(s);
       }
       card.append(starsRow);
-      card.append(el('div', 'r-sub', stars === 3 ? 'Flawless. Not a scratch on the hull.' : stars === 2 ? 'Held with minor damage.' : 'That was close. The station survived.'));
+      card.append(el('div', 'r-sub', stars === 3 ? 'Held the line. Minimal damage to the hull.' : stars === 2 ? 'Held with real damage.' : 'That was close. The station survived.'));
 
       // challenge badges — start face-down, flip to earned/failed during the sequence
       let chRow: HTMLElement | null = null;

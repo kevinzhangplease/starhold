@@ -407,6 +407,7 @@ export class Tower {
   target: Enemy | null = null;
   mode: 'first' | 'last' | 'strong' | 'weak' | 'close' = 'first';
   spent = 0;
+  builtAt = -999;   // game-time of placement — drives the sell-undo window (Phase 1)
   disabledUntil = 0;
   vein = false;   // built on a Rich Vein cell (+credits per kill landed)
   dmgDealt = 0;
@@ -637,7 +638,7 @@ export class Game {
   destroyed = false;
 
   constructor(cv: HTMLCanvasElement, level: LevelSpec, endless: boolean,
-              meta: { credits: number; hp: number; costMul: number; dmgMul: number; orbital: boolean; stasis: boolean },
+              meta: { creditMul: number; hp: number; costMul: number; dmgMul: number; orbital: boolean; stasis: boolean },
               cellSize = 48,
               opts: { hpMul?: number; rewardMul?: number; waveFactor?: number; meander?: number; diffTier?: number; ascTier?: number; mirror?: boolean; forceMods?: string[]; mutatorBonus?: number; perfMode?: boolean } = {}) {
     this.cv = cv;
@@ -647,7 +648,7 @@ export class Game {
     this.cell = cellSize;
     this.k = cellSize / 48;
     this.zone = ZONES[level.zone];
-    this.credits = Math.round((level.startCredits + meta.credits) * ((opts.ascTier ?? 0) >= 4 ? TUNING.ascension.startCreditMul : 1));
+    this.credits = Math.round(level.startCredits * meta.creditMul * ((opts.ascTier ?? 0) >= 4 ? TUNING.ascension.startCreditMul : 1));
     this.maxLives = this.lives = level.baseHp + meta.hp;
     this.metaCostMul = meta.costMul;
     this.metaDmgMul = meta.dmgMul;
@@ -669,17 +670,20 @@ export class Game {
     this.perfMode = opts.perfMode ?? false;
     const AS = TUNING.ascension;
     this.diffHp = (opts.hpMul ?? 1) * progressionMul * (this.ascTier >= 1 ? AS.hpMul : 1);
-    // Interest cap scales gently with level progress so it stays meaningful against
-    // late-campaign tower costs, not just early-game ones (endless has no level.id beyond
-    // its own fixed id, so it keeps the flat base — scaling it per endless-wave belongs to
-    // a different tuning knob, not this one).
-    this.interestCap = this.endless ? TUNING.interest.cap : TUNING.interest.cap + this.level.id * 3;
-    if (this.ascTier >= 4) this.interestCap = AS.interestCapTier4;
     // Onslaught (tier 5+): meteors rage on every level, on top of whatever the level already has
     if (this.ascTier >= 5) this.mods.add('meteors');
     // Daily Op: 1-2 forced modifiers, added on top of whatever the level already has
     for (const m of opts.forceMods || []) if (MODIFIER_INFO[m] && isUnlocked(MODIFIER_INFO[m].gate)) this.mods.add(m);
     this.diffReward = opts.rewardMul ?? 1;
+    // Interest cap scales gently with level progress so it stays meaningful against
+    // late-campaign tower costs, not just early-game ones (endless has no level.id beyond
+    // its own fixed id, so it keeps the flat base — scaling it per endless-wave belongs to
+    // a different tuning knob, not this one). Phase 1: also rides econScale() so the cap
+    // holds its relative value from L1 to L15, same as every other flat credit source.
+    this.interestCap = Math.round((this.endless ? TUNING.interest.cap : TUNING.interest.cap + this.level.id * 3) * this.waveRewardMul());
+    // Ascension IV halves the cap — apply that reduction AFTER scaling, as a ratio of the
+    // two tuned constants (not a flat override), so it stays "half" at every campaign point.
+    if (this.ascTier >= 4) this.interestCap = Math.round(this.interestCap * (AS.interestCapTier4 / TUNING.interest.cap));
     this.meander = opts.meander ?? 0;
     this.diffTier = opts.diffTier ?? 2;
     // Active modifiers: the level's list (endless: a seeded per-run pick), each behind its unlock gate.
@@ -911,11 +915,17 @@ export class Game {
         t.branchStage = 0;
       }
     }
-    this.credits += refund;
+    // In-wave refunds are cut to 72% (closes the refund-everything-at-wave-clear interest
+    // exploit — interest pays on the still-active wave's balance, so the round trip is now
+    // strictly unprofitable). Between waves, refunds stay full — deliberate: free
+    // experimentation with your build is a design value worth keeping. `t.spent` always
+    // drops by the FULL node value regardless — it tracks investment, not payout.
+    const payout = this.waveActive ? Math.round(refund * TUNING.economy.refundInWaveMul) : refund;
+    this.credits += payout;
     t.spent = Math.max(0, t.spent - refund);
     t.rampT = 0; t.cool = Math.min(t.cool, 1);
     audio.ui('sell');
-    this.floater(t.x, t.y - 30, `+${refund} refunded`, '#fff3b0');
+    this.floater(t.x, t.y - 30, `+${payout} refunded`, '#fff3b0');
     this.parts.push({ x: t.x, y: t.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 40, color: '#ffb3c6', kind: 'ring' });
     this.onSelect(); this.onHud();
   }
@@ -961,14 +971,31 @@ export class Game {
     }
   }
 
-  callWave(early: boolean) {
+  // Bounty of the currently pending wave, at the reward scale it would spawn under right
+  // now — ignores mutator adjustments (bounty/horde) as a deliberate simplification, so the
+  // early-call preview stays cheap to compute every frame.
+  pendingWaveBounty(): number {
+    if (!this.pendingWave) return 0;
+    const mul = this.waveRewardMul();
+    return this.pendingWave.reduce((a, g) => a + ENEMIES[g.e].reward * g.n * mul, 0);
+  }
+
+  callWave(early: boolean, auto = false) {
     if (this.state !== 'playing' || this.waveActive || !this.pendingWave) return;
     if (!early) this.lateCallHappened = true;
-    if (early && this.interT > 0.5) {
-      const bonus = Math.round(this.interT * 3);
-      this.credits += bonus;
-      this.floater(W / 2, 120, `+${bonus} early bonus`, '#fff3b0');
-      audio.ui('coin');
+    // Early-call bonus is a % of the pending wave's bounty, scaled by how much time was
+    // left on the clock — a deliberate risk/reward read on the forecast, not a flat tip.
+    // Auto-called waves never earn it: if auto-call paid out, auto mode would be strictly
+    // optimal and the "call it early yourself" decision would vanish.
+    if (early && !auto && this.interT > 0.5) {
+      const E = TUNING.economy;
+      const frac = Math.min(E.earlyCallCap, this.interT * E.earlyCallPerSec);
+      const bonus = Math.round(this.pendingWaveBounty() * frac);
+      if (bonus > 0) {
+        this.credits += bonus;
+        this.floater(W / 2, 120, `Early call +${bonus} ◆ (+${Math.round(frac * 100)}%)`, '#fff3b0');
+        audio.ui('coin');
+      }
     }
     this.waveIdx++;
     this.waveActive = true;
@@ -1028,6 +1055,26 @@ export class Game {
   }
   endlessHpMul(i: number) { return 1 + i * 0.22 + i * i * 0.012; }
 
+  // The reward multiplier every enemy bounty already uses — extracted so secondary
+  // credit sources (combo, drops, fragments, veins, wave-clear bonus, interest cap)
+  // can scale identically. Includes difficulty reward multiplier.
+  waveRewardMul(): number {
+    // waveIdx starts at -1 before the first wave launches (e.g. when the interest cap is
+    // set at construction) — clamp so that reads as "wave 0", not a negative endless bonus.
+    const waveIdx = Math.max(0, this.waveIdx);
+    return (1 + (this.level.hpMul - 1) * TUNING.economy.bountyCoef
+      + (this.endless ? waveIdx * 0.05 : 0)) * this.diffReward;
+  }
+  // Convenience for scaling flat credit values. Always Math.round at the call site.
+  econScale(): number { return this.waveRewardMul(); }
+
+  // Mirrors the enemy HP spawn formula — used to scale flat ability damage (Orbital Strike)
+  // so a fixed hit still means something at L15 Ascension V, not just L1.
+  currentHpScale(): number {
+    const base = this.endless ? this.endlessHpMul(this.waveIdx) : this.level.hpMul;
+    return base * (1 + this.waveIdx * 0.03) * this.diffHp;
+  }
+
   mkEnemy(id: string, pathIdx: number, hpMul: number, rewardMul: number) {
     const spec = ENEMIES[id];
     const pi = Math.min(pathIdx, this.paths.length - 1);
@@ -1068,7 +1115,9 @@ export class Game {
         this.spawnQueue.splice(i, 1);
         const spec = ENEMIES[s.e];
         const hpMul = (this.endless ? this.endlessHpMul(this.waveIdx) : this.level.hpMul) * (1 + this.waveIdx * 0.03);
-        const rewardMul = 1 + (this.level.hpMul - 1) * 0.22 + (this.endless ? this.waveIdx * 0.05 : 0);
+        // mkEnemy() multiplies rewardMul by this.diffReward internally — waveRewardMul()
+        // already includes diffReward, so divide it back out here to apply it exactly once.
+        const rewardMul = this.waveRewardMul() / this.diffReward;
         const e = this.mkEnemy(s.e, s.p, hpMul, rewardMul);
         if (this.waveMutator) this.applyMutator(e);
         // --- elite promotion ---
@@ -1112,7 +1161,7 @@ export class Game {
       this.runStats.wavesCleared++;
       this.slowMo(0.4, 0.3);
       this.screenFlash(0.3);
-      const bonus = 30 + this.waveIdx * 4;
+      const bonus = Math.round((30 + this.waveIdx * 4) * this.econScale());
       this.credits += bonus;
       this.floater(W / 2, 120, `Wave clear  +${bonus}`, '#a8e6cf');
       audio.ui('coin');
@@ -1130,7 +1179,7 @@ export class Game {
       this.interMax = (this.endless ? 14 : 13) * (this.ascTier >= 5 ? TUNING.ascension.intermissionMul : 1);
       this.interT = this.interMax;
       this.preparePending();
-      if (this.autoWave) this.callWave(true);
+      if (this.autoWave) this.callWave(true, true);
     }
     // ---------- boss phase 2 (50% HP) ----------
     if (isUnlocked('boss_phase2')) {
@@ -1166,7 +1215,9 @@ export class Game {
       this.parts.push({ x: W / 2, y: H / 2, vx: 0, vy: 0, life: 0.7, max: 0.7, size: W * 0.75, color: '#fff3b0', kind: 'ring' });
       for (const e of [...this.enemies]) {
         if (e.dead) continue;
-        e.hurt(TUNING.nova.damage * (e.spec.boss ? TUNING.nova.bossFrac : 1), this, true);
+        const N = TUNING.nova;
+        e.hurt(Math.max(1, Math.round(e.hp * (e.spec.boss ? N.fracBoss : N.fracNormal))), this, true);
+        if (!e.spec.boss) e.frozenUntil = Math.max(e.frozenUntil, this.now + N.stunDur);
       }
       this.onHud();
     }
@@ -1219,7 +1270,7 @@ export class Game {
           this.floater(c.x, c.y - 24, 'DISABLED', '#ff9d76');
         }
         if (Math.random() < TUNING.meteors.fragmentChance) {
-          this.drops.push({ x: c.x, y: c.y, vx: 0, born: now, kind: 'fragment', amount: TUNING.meteors.fragmentCredits });
+          this.drops.push({ x: c.x, y: c.y, vx: 0, born: now, kind: 'fragment', amount: Math.round(TUNING.meteors.fragmentCredits * this.econScale()) });
         }
       }
     }
@@ -1310,7 +1361,7 @@ export class Game {
       inc.t -= dt;
       if (inc.t <= 0) {
         this.incomings.splice(i, 1);
-        this.bigExplosion(inc.x, inc.y, ABILITIES.orbital.radius, ABILITIES.orbital.dmg, true);
+        this.bigExplosion(inc.x, inc.y, ABILITIES.orbital.radius, Math.round(ABILITIES.orbital.dmg * this.currentHpScale()), true);
       }
     }
 
@@ -1844,7 +1895,7 @@ export class Game {
       const r = Math.random() * 100;
       const kind = r < w.credits ? 'credits' : r < w.credits + w.recharge ? 'recharge'
         : r < w.credits + w.recharge + w.overclock ? 'overclock' : 'hull';
-      const amount = kind === 'credits' ? Math.round(rand(D.creditsMin, D.creditsMax)) : 0;
+      const amount = kind === 'credits' ? Math.round(rand(D.creditsMin, D.creditsMax) * this.econScale()) : 0;
       this.drops.push({ x, y, vx: rand(-11, 11), born: this.now, kind, amount });
       this.parts.push({ x, y, vx: 0, vy: 0, life: 0.4, max: 0.4, size: 44, color: '#c5b3f6', kind: 'ring' });
       audio.ui('wave');
@@ -1910,7 +1961,7 @@ export class Game {
       this.runStats.bestCombo = Math.max(this.runStats.bestCombo, this.comboCount);
       const mi = (C.milestones as readonly number[]).indexOf(this.comboCount);
       if (mi >= 0) {
-        const bonus = C.bonuses[mi];
+        const bonus = Math.round(C.bonuses[mi] * this.econScale());
         this.credits += bonus;
         this.floater(e.x, e.y - e.spec.size - 30, `COMBO ×${this.comboCount}!  +${bonus}◆`, '#ffd97a');
         audio.comboBlip(mi + 2);
@@ -1929,7 +1980,7 @@ export class Game {
     }
     // --- rich vein bonus: killing blow landed by a tower on a vein cell ---
     if (e.lastHitBy && e.lastHitBy.vein && this.towers.includes(e.lastHitBy)) {
-      const v = TUNING.richVeins.creditPerKill;
+      const v = Math.max(1, Math.round(TUNING.richVeins.creditPerKill * this.econScale()));
       this.credits += v;
       e.lastHitBy.creditsEarned += v;
       this.floater(e.lastHitBy.x, e.lastHitBy.y - 26, `+${v}◆`, '#d6f7ff');
@@ -1992,8 +2043,10 @@ export class Game {
       this.onBanner(`${ZONES[this.level.zone].name.toUpperCase()} SECURED`, ZONES[this.level.zone].accent, 'medium');
     }
     audio.jingle(true);
-    const frac = this.livesLostTotal / this.maxLives;
-    const stars = frac === 0 ? 3 : frac <= 0.25 ? 2 : 1;
+    // Absolute hull damage, not a fraction — deliberate: with Hull Plating meta owned, this
+    // challenge stays exactly as hard rather than getting easier as maxLives grows.
+    const lost = this.livesLostTotal;
+    const stars = lost <= 2 ? 3 : lost <= 8 ? 2 : 1;
     for (let i = 0; i < 90; i++) {
       this.parts.push({
         x: rand(0, W), y: -20, vx: rand(-40, 40), vy: rand(60, 190),
@@ -2100,6 +2153,7 @@ export class Game {
     const c = this.cells[cellIdx];
     const t = new Tower(spec, c.x, c.y);
     t.spent = cost;
+    t.builtAt = this.now;
     t.mode = this.defaultMode;
     t.vein = c.vein;
     t.cell = cellIdx; t.col = c.col; t.row = c.row;
@@ -2187,13 +2241,15 @@ export class Game {
   }
 
   sell(t: Tower) {
-    this.soldAny = true;
-    this.credits += t.spent;
+    const undo = this.now - t.builtAt <= TUNING.economy.sellUndoWindow;
+    const refund = undo ? t.spent : Math.round(t.spent * TUNING.economy.sellRefund);
+    if (!undo) this.soldAny = true;   // undo is an "unplace", not a sale — Committed challenge unaffected
+    this.credits += refund;
     if (t.cell >= 0) this.occupied[t.cell] = null;
     this.towers = this.towers.filter(o => o !== t);
     this.selected = null;
     audio.ui('sell');
-    this.floater(t.x, t.y - 20, `+${t.spent}`, '#fff3b0');
+    this.floater(t.x, t.y - 20, undo ? `Undone +${refund}` : `+${refund}`, '#fff3b0');
     for (let i = 0; i < 8; i++) this.smoke(t.x + rand(-12, 12), t.y + rand(-8, 8));
     this.onSelect(); this.onHud();
   }
