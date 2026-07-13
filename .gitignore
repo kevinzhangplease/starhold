@@ -3,3 +3,4 @@ dist/
 dist-single/
 .vercel/
 *.log
+.claude/settings.local.json
