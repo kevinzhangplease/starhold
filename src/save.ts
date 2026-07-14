@@ -45,7 +45,7 @@ const KEY = 'starhold-save-v1';
 // Map: seen-key -> level at which that system unlocks (from UNLOCKS in data.ts, duplicated
 // here to avoid an import cycle; validate.ts asserts the two stay in sync).
 export const SEEN_UNLOCK_LEVELS: Record<string, number> = {
-  combo: 2, challenges: 2, interest: 3, drops: 4, mod_asteroids: 4,
+  combo: 2, challenges: 2, interest: 3, cells: 3, drops: 4, mod_asteroids: 4,
   elites: 5, boss_theater: 5, mutators: 6, mod_veins: 6, nova: 7,
   mod_meteors: 8, boss_phase2: 10, mod_ionstorms: 12,
   guide_build: 1, guide_confirm: 1, guide_launch: 1,

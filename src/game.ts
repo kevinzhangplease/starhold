@@ -350,7 +350,17 @@ export class Enemy {
       this.angle = Math.atan2(this.fy1 - this.fy0, this.fx1 - this.fx0);
       if (t >= 1) this.leak(game);
     } else {
-      this.d += sp * dt;
+      // Null Zone: ground enemies passing within 1.5 tiles of a null cell center are
+      // slowed — multiplicative with tower slows. Checked against last frame's position
+      // (continuous input, one-frame lag is imperceptible — same pattern as conduit).
+      let nullSlowMul = 1;
+      if (game.nullCellPx.length) {
+        const rad = 1.5 * game.cell;
+        for (const p of game.nullCellPx) {
+          if (dist(this.x, this.y, p.x, p.y) < rad) { nullSlowMul = 1 - TUNING.cells.nullcell.slowPct; game.nullSlowTint(this); break; }
+        }
+      }
+      this.d += sp * nullSlowMul * dt;
       const p = this.path.at(this.d);
       this.x = p.x; this.y = p.y; this.angle = p.a;
       if (this.d >= this.path.total) this.leak(game);
@@ -410,6 +420,8 @@ export class Tower {
   builtAt = -999;   // game-time of placement — drives the sell-undo window (Phase 1)
   disabledUntil = 0;
   vein = false;   // built on a Rich Vein cell (+credits per kill landed)
+  cellType: string | null = null;   // special terrain this tower sits on (Phase 2), or null
+  cellRangeAdd = 0; cellRateMul = 1; cellDmgMul = 1;   // cached numeric modifiers from cellType
   dmgDealt = 0;
   kills = 0;
   creditsEarned = 0;
@@ -429,18 +441,31 @@ export class Tower {
     if (this.branch >= 0) return `${this.spec.name} (${4 + this.branchStage} ${this.raw.name})`;
     return `${this.spec.name} (${this.stage + 1})`;
   }
-  rangeT() { return Math.max(1, Math.round(this.raw.range * (1 + this.bRange))); }
+  // Range floor of 1 is load-bearing: a sinkhole under a range-1 tower stays 1 — pure
+  // win, and intended — that IS the short-tower home the cell type is built to reward.
+  rangeT() { return Math.max(1, Math.round(this.raw.range * (1 + this.bRange)) + this.cellRangeAdd); }
   stats(game: Game) {
     const r = this.raw;
     return {
       ...r,
-      dmg: r.dmg * (1 + this.bDmg) * game.metaDmgMul,
-      burnDps: r.burnDps ? r.burnDps * (1 + this.bDmg) * game.metaDmgMul : r.burnDps,
+      dmg: r.dmg * (1 + this.bDmg) * game.metaDmgMul * this.cellDmgMul,
+      burnDps: r.burnDps ? r.burnDps * (1 + this.bDmg) * game.metaDmgMul * this.cellDmgMul : r.burnDps,
       rate: r.rate * (1 + this.bRate) * (game.now < game.overclockUntil ? 1 + TUNING.drops.overclockRate : 1)
-        * (game.stormRow0 >= 0 && game.now > game.stormWarnUntil && this.row >= game.stormRow0 && this.row < game.stormRow0 + TUNING.ionStorms.bandRows ? 1 - TUNING.ionStorms.ratePenalty : 1),
+        * (game.stormRow0 >= 0 && game.now > game.stormWarnUntil && this.row >= game.stormRow0 && this.row < game.stormRow0 + TUNING.ionStorms.bandRows ? 1 - TUNING.ionStorms.ratePenalty : 1)
+        * this.cellRateMul,
       range: this.rangeT(),
       crit: (r.crit || 0) + this.bCrit,
     };
+  }
+  // Set/clear the cached numeric cell modifiers from CELL_TYPES + TUNING.cells whenever
+  // cellType changes (buildAt / confirmMove). Cached rather than looked up live so rangeT()
+  // (called every frame, no Game ref) and stats() stay cheap.
+  applyCellType(type: string | null) {
+    this.cellType = type;
+    const CT = TUNING.cells;
+    this.cellRangeAdd = type === 'ridge' ? CT.ridge.rangeAdd : type === 'sinkhole' ? CT.sinkhole.rangeAdd : 0;
+    this.cellRateMul = type === 'ridge' ? CT.ridge.rateMul : 1;
+    this.cellDmgMul = type === 'sinkhole' ? CT.sinkhole.dmgMul : 1;
   }
   baseStats(game: Game) {
     const r = this.raw;
@@ -473,7 +498,7 @@ type Proj = Bullet | Missile | Shell;
 interface Bolt { pts: number[][]; life: number; color: string }
 interface RayFx { x0: number; y0: number; x1: number; y1: number; life: number; max: number; color: string; w: number }
 interface Incoming { x: number; y: number; t: number }
-interface CellInfo { x: number; y: number; col: number; row: number; valid: boolean; path: boolean; rock: boolean; vein: boolean }
+interface CellInfo { x: number; y: number; col: number; row: number; valid: boolean; path: boolean; rock: boolean; vein: boolean; special: string | null; conduitPartner?: number }
 
 export type BannerFn = (text: string, color?: string, tier?: 'critical' | 'medium' | 'low', sub?: string) => void;
 
@@ -597,11 +622,14 @@ export class Game {
   cells: CellInfo[] = [];
   cols = 0; rows = 0; gx0 = 0; gy0 = 0;
   occupied: (Tower | null)[] = [];
+  nullCells: number[] = [];                              // cell indices of Null Zone specials
+  nullCellPx: { x: number; y: number }[] = [];            // precomputed centers, for the ground-slow check
   portalPx: { x: number; y: number }[] = [];
   basePx: { x: number; y: number }[] = [];
 
   selected: Tower | null = null;
   focus: Enemy | null = null;
+  conduitTarget: Enemy | null = null;   // shared acquisition target for conduit-cell towers
   armed: 'orbital' | 'stasis' | null = null;
   cds: Record<string, number> = { orbital: 0, stasis: 0 };
   mx = -100; my = -100;
@@ -757,6 +785,9 @@ export class Game {
     const pathTiles = new Set<number>();
     const rockTiles = new Set<number>();
     const endTiles = new Set<number>();
+    // Ordered path-cell sequence per path (portal -> base), one array per path index.
+    // Used by the Null Zone placement algorithm to find each path's "final third".
+    const pathCellsOrderedAll: { c: number; r: number }[][] = [];
 
     // snap each level path to the grid → rectilinear tile path
     this.paths = [];
@@ -788,6 +819,7 @@ export class Game {
       // carve path tiles
       let firstIn: { c: number; r: number } | null = null;
       let lastIn: { c: number; r: number } | null = null;
+      const orderedThisPath: { c: number; r: number }[] = [];
       for (let i = 0; i < meandered.length - 1; i++) {
         const a = meandered[i], b = meandered[i + 1];
         const dc = Math.sign(b.c - a.c), dr = Math.sign(b.r - a.r);
@@ -795,6 +827,7 @@ export class Game {
         while (true) {
           if (c >= 0 && c < this.cols && r >= 0 && r < this.rows) {
             pathTiles.add(this.idx(c, r));
+            orderedThisPath.push({ c, r });
             if (!firstIn) firstIn = { c, r };
             lastIn = { c, r };
           }
@@ -802,6 +835,7 @@ export class Game {
           c += dc; r += dr;
         }
       }
+      pathCellsOrderedAll.push(orderedThisPath);
       const fi = firstIn || { c: 0, r: meandered[0].r };
       const li = lastIn || { c: this.cols - 1, r: meandered[meandered.length - 1].r };
       this.portalPx.push({ x: this.cx(fi.c), y: this.cy(fi.r) });
@@ -849,22 +883,252 @@ export class Game {
       }
     }
 
+    // ---------- Special terrain cells (Phase 2: Cell Diversity) ----------
+    // Seeded placement, run after asteroid/vein seeding so cell candidates already know
+    // about every other terrain feature. Order is fixed (sinkhole -> ridge -> conduit pair
+    // -> anchor -> null zone) and later types respect minSeparation from all earlier ones.
+    // Locked (below UNLOCKS.cells): specialMap stays empty and the board is unchanged.
+    const specialMap = new Map<number, { type: string; partner?: number }>();
+    if (isUnlocked('cells')) {
+      const CT = TUNING.cells;
+      const cellsRng = mulberry32(hashString(`${this.level.id}-cells`) ^ (this.endless ? (Math.random() * 1e9) | 0 : 0));
+      const placedIdx: number[] = [];
+      const allIdx: number[] = [];
+      for (let r = 0; r < this.rows; r++) for (let c = 0; c < this.cols; c++) allIdx.push(this.idx(c, r));
+      const cOfIdx = (i: number) => i % this.cols;
+      const rOfIdx = (i: number) => Math.floor(i / this.cols);
+      const isFreeForSpecial = (i: number) => !pathTiles.has(i) && !rockTiles.has(i) && !endTiles.has(i) && !veinTiles.has(i) && !specialMap.has(i);
+      const pathAdjCount = (c: number, r: number): number => {
+        let n = 0;
+        for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+          if (dc === 0 && dr === 0) continue;
+          const cc = c + dc, rr = r + dr;
+          if (cc < 0 || cc >= this.cols || rr < 0 || rr >= this.rows) continue;
+          if (pathTiles.has(this.idx(cc, rr))) n++;
+        }
+        return n;
+      };
+      const pathNear = (c: number, r: number, k: number): boolean => {
+        for (let dr = -k; dr <= k; dr++) for (let dc = -k; dc <= k; dc++) {
+          if (dc === 0 && dr === 0) continue;
+          const cc = c + dc, rr = r + dr;
+          if (cc < 0 || cc >= this.cols || rr < 0 || rr >= this.rows) continue;
+          if (pathTiles.has(this.idx(cc, rr))) return true;
+        }
+        return false;
+      };
+      const chebyshevD = (i: number, j: number) => Math.max(Math.abs(cOfIdx(i) - cOfIdx(j)), Math.abs(rOfIdx(i) - rOfIdx(j)));
+      const farEnough = (i: number, sep: number) => placedIdx.every(j => chebyshevD(i, j) >= sep);
+
+      // path corners (ridge's "prefer nearest a bend" rule): a path cell whose two
+      // path-neighbors are non-collinear.
+      const corners: { c: number; r: number }[] = [];
+      for (let r = 0; r < this.rows; r++) for (let c = 0; c < this.cols; c++) {
+        if (!pathTiles.has(this.idx(c, r))) continue;
+        const dirs: [number, number][] = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+        const nbrs: [number, number][] = [];
+        for (const [dc, dr] of dirs) {
+          const cc = c + dc, rr = r + dr;
+          if (cc < 0 || cc >= this.cols || rr < 0 || rr >= this.rows) continue;
+          if (pathTiles.has(this.idx(cc, rr))) nbrs.push([dc, dr]);
+        }
+        if (nbrs.length === 2 && !(nbrs[0][0] === -nbrs[1][0] && nbrs[0][1] === -nbrs[1][1])) corners.push({ c, r });
+      }
+      const distToNearestCorner = (c: number, r: number): number => {
+        if (!corners.length) return 0;
+        let best = Infinity;
+        for (const cor of corners) best = Math.min(best, Math.max(Math.abs(c - cor.c), Math.abs(r - cor.r)));
+        return best;
+      };
+
+      // anchor "cluster heart" score: how many of the 8 neighbors are themselves valid
+      // AND touch the path (this cell sits at the middle of a natural tower cluster).
+      const anchorScore = (c: number, r: number): number => {
+        let score = 0;
+        for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+          if (dc === 0 && dr === 0) continue;
+          const cc = c + dc, rr = r + dr;
+          if (cc < 0 || cc >= this.cols || rr < 0 || rr >= this.rows) continue;
+          const ni = this.idx(cc, rr);
+          if (pathTiles.has(ni) || rockTiles.has(ni) || endTiles.has(ni)) continue;
+          if (pathAdjCount(cc, rr) >= 1) score++;
+        }
+        return score;
+      };
+
+      // final third of each path (by travel order, portal -> base) — where Null Zones live.
+      const finalThirdIdx = new Set<number>();
+      for (const ordered of pathCellsOrderedAll) {
+        const from = Math.floor(ordered.length * 2 / 3);
+        for (let i = from; i < ordered.length; i++) finalThirdIdx.add(this.idx(ordered[i].c, ordered[i].r));
+      }
+      const nearFinalThird = (c: number, r: number): boolean => {
+        for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+          if (dc === 0 && dr === 0) continue;
+          const cc = c + dc, rr = r + dr;
+          if (cc < 0 || cc >= this.cols || rr < 0 || rr >= this.rows) continue;
+          const ni = this.idx(cc, rr);
+          if (pathTiles.has(ni) && finalThirdIdx.has(ni)) return true;
+        }
+        return false;
+      };
+
+      // longest straight run of consecutive path cells (row-wise or col-wise) — the
+      // "firing line" conduit pairs cluster around.
+      type Run = { axis: 'row' | 'col'; fixed: number; lo: number; hi: number };
+      let bestRun: Run | null = null, bestLen = 0;
+      for (let r = 0; r < this.rows; r++) {
+        let start = -1;
+        for (let c = 0; c <= this.cols; c++) {
+          const has = c < this.cols && pathTiles.has(this.idx(c, r));
+          if (has) { if (start < 0) start = c; }
+          else if (start >= 0) { const len = c - start; if (len > bestLen) { bestLen = len; bestRun = { axis: 'row', fixed: r, lo: start, hi: c - 1 }; } start = -1; }
+        }
+      }
+      for (let c = 0; c < this.cols; c++) {
+        let start = -1;
+        for (let r = 0; r <= this.rows; r++) {
+          const has = r < this.rows && pathTiles.has(this.idx(c, r));
+          if (has) { if (start < 0) start = r; }
+          else if (start >= 0) { const len = r - start; if (len > bestLen) { bestLen = len; bestRun = { axis: 'col', fixed: c, lo: start, hi: r - 1 }; } start = -1; }
+        }
+      }
+
+      // generic single-cell placer: builds candidates at the given separation, picks the
+      // best-scoring (min or max), seeded tie-break — used by sinkhole/ridge/anchor/nullcell.
+      const placeCells = (want: number, type: string, buildCandidates: (sep: number) => number[], score: (i: number) => number, higherIsBetter: boolean) => {
+        for (let n = 0; n < want; n++) {
+          let candidates = buildCandidates(CT.minSeparation);
+          if (!candidates.length) candidates = buildCandidates(1);
+          if (!candidates.length) { console.warn(`buildGrid: could not place ${type} #${n + 1} on level ${this.level.id}`); continue; }
+          let best = higherIsBetter ? -Infinity : Infinity;
+          for (const i of candidates) { const s = score(i); if (higherIsBetter ? s > best : s < best) best = s; }
+          const tied = candidates.filter(i => score(i) === best);
+          const pick = tied[seededInt(cellsRng, 0, tied.length - 1)];
+          specialMap.set(pick, { type });
+          placedIdx.push(pick);
+        }
+      };
+
+      const conduitPairCandidatesFromRun = (sep: number): [number, number][] => {
+        if (!bestRun) return [];
+        const pairs: { pair: [number, number]; dist: number }[] = [];
+        const mid = (bestRun.lo + bestRun.hi) / 2;
+        for (const off of [-1, 1]) {
+          if (bestRun.axis === 'row') {
+            const rr = bestRun.fixed + off;
+            if (rr < 0 || rr >= this.rows) continue;
+            for (let c = bestRun.lo; c < bestRun.hi; c++) {
+              const i1 = this.idx(c, rr), i2 = this.idx(c + 1, rr);
+              if (!isFreeForSpecial(i1) || !isFreeForSpecial(i2)) continue;
+              if (pathAdjCount(c, rr) < 1 || pathAdjCount(c + 1, rr) < 1) continue;
+              if (!farEnough(i1, sep) || !farEnough(i2, sep)) continue;
+              pairs.push({ pair: [i1, i2], dist: Math.abs((c + 0.5) - mid) });
+            }
+          } else {
+            const cc = bestRun.fixed + off;
+            if (cc < 0 || cc >= this.cols) continue;
+            for (let r = bestRun.lo; r < bestRun.hi; r++) {
+              const i1 = this.idx(cc, r), i2 = this.idx(cc, r + 1);
+              if (!isFreeForSpecial(i1) || !isFreeForSpecial(i2)) continue;
+              if (pathAdjCount(cc, r) < 1 || pathAdjCount(cc, r + 1) < 1) continue;
+              if (!farEnough(i1, sep) || !farEnough(i2, sep)) continue;
+              pairs.push({ pair: [i1, i2], dist: Math.abs((r + 0.5) - mid) });
+            }
+          }
+        }
+        if (!pairs.length) return [];
+        pairs.sort((a, b) => a.dist - b.dist);
+        const bestDist = pairs[0].dist;
+        const tied = pairs.filter(p => p.dist === bestDist).map(p => p.pair);
+        return [tied[seededInt(cellsRng, 0, tied.length - 1)]];
+      };
+      const anyAdjacentPairCandidates = (sep: number): [number, number][] => {
+        const found: [number, number][] = [];
+        for (let r = 0; r < this.rows; r++) for (let c = 0; c < this.cols; c++) {
+          const i1 = this.idx(c, r);
+          if (!isFreeForSpecial(i1) || pathAdjCount(c, r) < 1) continue;
+          if (c + 1 < this.cols) {
+            const i2 = this.idx(c + 1, r);
+            if (isFreeForSpecial(i2) && pathAdjCount(c + 1, r) >= 1 && farEnough(i1, sep) && farEnough(i2, sep)) found.push([i1, i2]);
+          }
+          if (r + 1 < this.rows) {
+            const i2 = this.idx(c, r + 1);
+            if (isFreeForSpecial(i2) && pathAdjCount(c, r + 1) >= 1 && farEnough(i1, sep) && farEnough(i2, sep)) found.push([i1, i2]);
+          }
+        }
+        return found;
+      };
+      const placeConduitPairs = (want: number) => {
+        for (let n = 0; n < want; n++) {
+          let pairs = conduitPairCandidatesFromRun(CT.minSeparation);
+          if (!pairs.length) pairs = conduitPairCandidatesFromRun(1);
+          if (!pairs.length) pairs = anyAdjacentPairCandidates(CT.minSeparation);
+          if (!pairs.length) pairs = anyAdjacentPairCandidates(1);
+          if (!pairs.length) { console.warn(`buildGrid: could not place conduit pair #${n + 1} on level ${this.level.id}`); continue; }
+          const [i1, i2] = pairs[seededInt(cellsRng, 0, pairs.length - 1)];
+          specialMap.set(i1, { type: 'conduit', partner: i2 });
+          specialMap.set(i2, { type: 'conduit', partner: i1 });
+          placedIdx.push(i1, i2);
+        }
+      };
+
+      // resolve this level's cell inventory: authored per-level, or (endless) a seeded
+      // weighted roll of 2-4 specials — per-run variety, like the endless modifier pick.
+      let plan: { ridge: number; sinkhole: number; conduitPairs: number; anchor: number; nullcell: number };
+      if (this.endless) {
+        plan = { ridge: 0, sinkhole: 0, conduitPairs: 0, anchor: 0, nullcell: 0 };
+        const pool: [keyof typeof plan, number][] = [['ridge', 30], ['sinkhole', 30], ['conduitPairs', 15], ['anchor', 15], ['nullcell', 10]];
+        const totalWeight = pool.reduce((a, [, w]) => a + w, 0);
+        const totalSpecials = seededInt(cellsRng, 2, 4);
+        for (let i = 0; i < totalSpecials; i++) {
+          let roll = cellsRng() * totalWeight;
+          for (const [type, w] of pool) { if (roll < w) { plan[type]++; break; } roll -= w; }
+        }
+      } else {
+        const cp = this.level.cellPlan || {};
+        plan = { ridge: cp.ridge || 0, sinkhole: cp.sinkhole || 0, conduitPairs: cp.conduitPairs || 0, anchor: cp.anchor || 0, nullcell: cp.nullcell || 0 };
+      }
+
+      // fixed placement order: sinkhole -> ridge -> conduit pair -> anchor -> null zone.
+      placeCells(plan.sinkhole, 'sinkhole',
+        sep => allIdx.filter(i => isFreeForSpecial(i) && pathAdjCount(cOfIdx(i), rOfIdx(i)) >= 2 && farEnough(i, sep)),
+        i => pathAdjCount(cOfIdx(i), rOfIdx(i)), true);
+      placeCells(plan.ridge, 'ridge',
+        sep => allIdx.filter(i => { const c = cOfIdx(i), r = rOfIdx(i); return isFreeForSpecial(i) && pathAdjCount(c, r) === 0 && pathNear(c, r, 3) && farEnough(i, sep); }),
+        i => distToNearestCorner(cOfIdx(i), rOfIdx(i)), false);
+      placeConduitPairs(plan.conduitPairs);
+      placeCells(plan.anchor, 'anchor',
+        sep => allIdx.filter(i => isFreeForSpecial(i) && farEnough(i, sep)),
+        i => anchorScore(cOfIdx(i), rOfIdx(i)), true);
+      placeCells(plan.nullcell, 'nullcell',
+        sep => allIdx.filter(i => { const c = cOfIdx(i), r = rOfIdx(i); return isFreeForSpecial(i) && nearFinalThird(c, r) && farEnough(i, sep); }),
+        () => 0, true);
+    }
+
     this.cells = [];
     this.occupied = [];
+    this.nullCells = [];
     for (let r = 0; r < this.rows; r++) {
       for (let c = 0; c < this.cols; c++) {
         const i = this.idx(c, r);
         const isPath = pathTiles.has(i);
         const isRock = rockTiles.has(i);
         const isEnd = endTiles.has(i);
+        const sp = specialMap.get(i);
+        const isNull = sp?.type === 'nullcell';
+        if (isNull) this.nullCells.push(i);
         this.cells.push({
           x: this.cx(c), y: this.cy(r), col: c, row: r,
           path: isPath, rock: isRock, vein: veinTiles.has(i),
-          valid: !isPath && !isRock && !isEnd,
+          valid: !isPath && !isRock && !isEnd && !isNull,
+          special: sp ? sp.type : null,
+          conduitPartner: sp?.partner,
         });
         this.occupied.push(null);
       }
     }
+    this.nullCellPx = this.nullCells.map(i => ({ x: this.cells[i].x, y: this.cells[i].y }));
   }
   cellAt(x: number, y: number): number {
     const c = this.colOf(x), r = this.rowOf(y);
@@ -1328,16 +1592,28 @@ export class Game {
     for (const a of this.towers) {
       if (a.spec.kind !== 'amp' || now < a.disabledUntil) continue;
       const s = a.raw;
+      const anchorMul = a.cellType === 'anchor' ? TUNING.cells.anchor.ampMul : 1;
       for (const t of this.towers) {
         if (t === a || t.spec.kind === 'amp') continue;
         if (this.circCell(a.x, a.y, s.range, t.col, t.row)) {
-          t.bDmg = Math.max(t.bDmg, s.buffDmg || 0);
-          t.bRate = Math.max(t.bRate, s.buffRate || 0);
-          t.bRange = Math.max(t.bRange, s.buffRange || 0);
-          t.bCrit = Math.max(t.bCrit, s.crit || 0);
+          t.bDmg = Math.max(t.bDmg, (s.buffDmg || 0) * anchorMul);
+          t.bRate = Math.max(t.bRate, (s.buffRate || 0) * anchorMul);
+          t.bRange = Math.max(t.bRange, (s.buffRange || 0) * anchorMul);
+          t.bCrit = Math.max(t.bCrit, (s.crit || 0) * anchorMul);
         }
       }
     }
+
+    // Conduit cells: linked towers focus whichever conduit tower has committed the most
+    // (highest spent) to a live target, so a deliberately-built firing line reads as one
+    // coordinated gun rather than N independent ones. One frame of lag (reads last frame's
+    // targets) is invisible and matches the amp-buff loop's own read-then-recompute pattern.
+    let conduitLeader: Tower | null = null;
+    for (const t of this.towers) {
+      if (t.cellType !== 'conduit' || !t.target || t.target.dead || !t.target.targetable) continue;
+      if (!conduitLeader || t.spent > conduitLeader.spent) conduitLeader = t;
+    }
+    this.conduitTarget = conduitLeader ? conduitLeader.target : null;
 
     for (const t of this.towers) this.updateTower(t, dt, now);
     this.updateProjs(dt, now);
@@ -1408,6 +1684,12 @@ export class Game {
       const beams = s.beams || 1;
       const inRange = this.enemies.filter(e => e.targetable && this.inRangeT(t, e, R) && this.canHit(t, e));
       this.sortTargets(inRange, t);
+      // Conduit: pull the shared target to the front of the beam queue (same prepend
+      // pattern as focus-fire below), so a Prism on a conduit cell still joins the line.
+      if (t.cellType === 'conduit' && this.conduitTarget && inRange.includes(this.conduitTarget)) {
+        inRange.splice(inRange.indexOf(this.conduitTarget), 1);
+        inRange.unshift(this.conduitTarget);
+      }
       if (this.focus && inRange.includes(this.focus)) {
         inRange.splice(inRange.indexOf(this.focus), 1);
         inRange.unshift(this.focus);
@@ -1435,6 +1717,9 @@ export class Game {
     t.cool -= dt * s.rate;
     if (this.focusValidFor(t, R)) {
       t.target = this.focus;
+    } else if (t.cellType === 'conduit' && this.conduitTarget && this.conduitTarget.targetable
+      && this.inRangeT(t, this.conduitTarget, R) && this.canHit(t, this.conduitTarget)) {
+      t.target = this.conduitTarget;
     } else {
       if (t.target && (t.target.dead || !t.target.targetable || !this.inRangeT(t, t.target, R) || !this.canHit(t, t.target))) t.target = null;
       if (!t.target || t.mode !== 'first') {
@@ -2157,6 +2442,7 @@ export class Game {
     t.mode = this.defaultMode;
     t.vein = c.vein;
     t.cell = cellIdx; t.col = c.col; t.row = c.row;
+    t.applyCellType(c.special);
     this.towers.push(t);
     this.occupied[cellIdx] = t;
     this.runStats.towersBuilt[spec.id] = (this.runStats.towersBuilt[spec.id] || 0) + 1;
@@ -2192,6 +2478,7 @@ export class Game {
     const c = this.cells[cellIdx];
     t.x = c.x; t.y = c.y; t.col = c.col; t.row = c.row;
     t.vein = c.vein;
+    t.applyCellType(c.special);   // move ONTO a special cell picks up its modifier; off drops it
     t.target = null; t.rampT = 0;
     this.occupied[cellIdx] = t;
     audio.ui('place');
@@ -2253,6 +2540,11 @@ export class Game {
     for (let i = 0; i < 8; i++) this.smoke(t.x + rand(-12, 12), t.y + rand(-8, 8));
     this.onSelect(); this.onHud();
   }
+
+  // Null Zone: reuses the existing slow-ring visual (drawn whenever now < slowUntil)
+  // without touching slowPct — the actual speed reduction is applied separately in
+  // Enemy.update, so this purely keeps the tint alive while the enemy is in the field.
+  nullSlowTint(e: Enemy) { e.slowUntil = Math.max(e.slowUntil, this.now + 0.15); }
 
   // ---------- fx helpers ----------
   shake(m: number) { if (!this.shakeOn || this.reduceMotion) return; this.shakeMag = Math.max(this.shakeMag, m); this.shakeT = 0.3; }
@@ -2460,6 +2752,80 @@ export class Game {
           g.restore();
         }
         g.globalAlpha = 1;
+      }
+      // ---- Special terrain (Phase 2). Value/elevation-based, palette-neutral — never a new
+      // hue. Drawn before the buildable-cell outline below so occupied special cells keep
+      // their treatment visible around the tower pad. ----
+      if (c.special === 'ridge') {
+        // lifted face: 2px up-shift, lighter top edge, dark drop shadow along the bottom.
+        g.fillStyle = 'rgba(4,5,14,0.28)';
+        (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2 - 2 + 3, s, s, rad); g.fill();
+        g.fillStyle = 'rgba(238,240,255,0.14)';
+        (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2 - 2, s, s, rad); g.fill();
+        g.strokeStyle = 'rgba(255,255,255,0.22)';
+        g.lineWidth = 1.5;
+        g.beginPath(); g.moveTo(c.x - s / 2 + rad, c.y - s / 2 - 2); g.lineTo(c.x + s / 2 - rad, c.y - s / 2 - 2); g.stroke();
+      } else if (c.special === 'sinkhole') {
+        // inset face: darker fill, inner shadow on the top edge, faint downward-triangle glyph.
+        g.fillStyle = 'rgba(4,5,14,0.22)';
+        (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2, s, s, rad); g.fill();
+        g.strokeStyle = 'rgba(0,0,0,0.35)';
+        g.lineWidth = 2;
+        g.beginPath(); g.moveTo(c.x - s / 2 + rad, c.y - s / 2 + 1); g.lineTo(c.x + s / 2 - rad, c.y - s / 2 + 1); g.stroke();
+        g.globalAlpha = 0.18;
+        g.fillStyle = '#dfe3ff';
+        g.beginPath();
+        g.moveTo(c.x - s * 0.14, c.y - s * 0.08); g.lineTo(c.x + s * 0.14, c.y - s * 0.08); g.lineTo(c.x, c.y + s * 0.14);
+        g.closePath(); g.fill();
+        g.globalAlpha = 1;
+      } else if (c.special === 'conduit') {
+        // emissive border on every conduit cell, plus a marching dashed link line drawn
+        // once from the lower-index cell of each pair (avoids drawing it twice).
+        const pulse = this.reduceMotion ? 0.45 : 0.3 + 0.3 * (0.5 + 0.5 * Math.sin(this.now * (Math.PI * 2 / 1.2)));
+        g.globalAlpha = pulse;
+        g.strokeStyle = '#bfe3ff';
+        g.lineWidth = 2;
+        (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2, s, s, rad); g.stroke();
+        g.globalAlpha = 1;
+        if (c.conduitPartner !== undefined && i < c.conduitPartner) {
+          const partner = this.cells[c.conduitPartner];
+          const bothOccupied = !!this.occupied[i] && !!this.occupied[c.conduitPartner];
+          g.globalAlpha = bothOccupied ? pulse : pulse * 0.5;
+          g.strokeStyle = '#bfe3ff';
+          g.lineWidth = 1.5;
+          if (!this.perfMode && !this.reduceMotion) { g.setLineDash([5, 6]); g.lineDashOffset = -(this.now * 22) % 22; }
+          g.beginPath(); g.moveTo(c.x, c.y); g.lineTo(partner.x, partner.y); g.stroke();
+          g.setLineDash([]);
+          g.globalAlpha = 1;
+        }
+      } else if (c.special === 'anchor') {
+        const spin = this.reduceMotion ? 0 : this.now * 0.6;
+        g.strokeStyle = 'rgba(197,179,246,0.5)';
+        g.lineWidth = 1.5;
+        for (const rr of [s * 0.32, s * 0.22]) { g.beginPath(); g.arc(c.x, c.y, rr, spin, spin + Math.PI * 1.5); g.stroke(); }
+      } else if (c.special === 'nullcell') {
+        // diagonal hatch always visible; the dashed slow-radius ring only while an enemy
+        // is actually inside it — keeps the board quiet when nothing's happening.
+        g.save();
+        g.beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2, s, s, rad); g.clip();
+        g.strokeStyle = 'rgba(160,216,239,0.18)';
+        g.lineWidth = 2;
+        for (let off = -s; off <= s; off += 7) {
+          g.beginPath(); g.moveTo(c.x - s / 2 + off, c.y - s / 2); g.lineTo(c.x - s / 2 + off + s, c.y + s / 2); g.stroke();
+        }
+        g.restore();
+        const slowRad = 1.5 * this.cell;
+        const enemyInside = this.enemies.some(e => !e.dead && !e.spec.flying && dist(e.x, e.y, c.x, c.y) < slowRad);
+        if (enemyInside) {
+          g.globalAlpha = 0.35;
+          g.strokeStyle = '#a0d8ef';
+          g.lineWidth = 1.5;
+          g.setLineDash([4, 5]);
+          g.beginPath(); g.arc(c.x, c.y, slowRad, 0, 7); g.stroke();
+          g.setLineDash([]);
+          g.globalAlpha = 1;
+        }
+        continue;
       }
       if (!c.valid || this.occupied[i]) continue;
       const hovered = i === hoverIdx && this.state === 'playing';

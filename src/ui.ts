@@ -1,5 +1,5 @@
 // ================= UI layer =================
-import { TOWERS, META, ABILITIES, ZONES, ENEMIES, TowerSpec, EnemySpec, airClass, setUnlockedLevel, fmt, isUnlocked, MUTATORS, MODIFIER_INFO, CHALLENGE_POOL, TUNING } from './data';
+import { TOWERS, META, ABILITIES, ZONES, ENEMIES, TowerSpec, EnemySpec, airClass, setUnlockedLevel, fmt, isUnlocked, MUTATORS, MODIFIER_INFO, CHALLENGE_POOL, CELL_TYPES, TUNING } from './data';
 import { LEVELS, ENDLESS_LEVEL, LevelSpec } from './levels';
 import { Game, Tower, Enemy, W, H } from './game';
 import { audio } from './audio';
@@ -146,6 +146,7 @@ export class UI {
   private longPressTimer: number | null = null;
   private longPressFired = false;
   private pinnedEnemyTip: Enemy | null = null;   // long-press-shown tooltip target, persists till lift
+  private pinnedCellIdx: number | null = null;   // long-press-shown special-cell tooltip, persists till lift
 
   constructor() {
     this.root = document.getElementById('ui-root')!;
@@ -304,6 +305,10 @@ export class UI {
     if (t) { g.peekTower = t; g.buzz([12]); return; }
     const e = g.enemyAt(p.x, p.y);
     if (e) { this.pinnedEnemyTip = e; g.buzz([12]); return; }
+    // long-press on a special cell (empty or occupied) pins its tooltip — a tap still
+    // builds normally on an empty one, since tap is a wholly separate gesture from long-press.
+    const idx = g.cellAt(p.x, p.y);
+    if (idx >= 0 && g.cells[idx].special) { this.pinnedCellIdx = idx; g.buzz([12]); return; }
   }
 
   private clearLongPressTimer() {
@@ -311,6 +316,7 @@ export class UI {
   }
   private clearTouchPeeks() {
     this.pinnedEnemyTip = null;
+    this.pinnedCellIdx = null;
     if (this.game) this.game.peekTower = null;
   }
 
@@ -498,6 +504,12 @@ export class UI {
           .filter(Boolean)
           .map(info => `<span class="lv-mod" title="${info.name} — ${info.blurb}">${info.icon}</span>`)
           .join('');
+        const cellLine = isUnlocked('cells') && lv.cellPlan
+          ? ([['ridge', lv.cellPlan.ridge], ['sinkhole', lv.cellPlan.sinkhole], ['conduit', lv.cellPlan.conduitPairs], ['anchor', lv.cellPlan.anchor], ['nullcell', lv.cellPlan.nullcell]] as [string, number | undefined][])
+              .filter(([, n]) => (n || 0) > 0)
+              .map(([id, n]) => `<span class="lv-cell" title="${CELL_TYPES[id].name} — ${CELL_TYPES[id].blurb}">${CELL_TYPES[id].icon}${n}</span>`)
+              .join('')
+          : '';
         const chDone = this.save.challenges[lv.id] || [];
         const chBadges = isUnlocked('challenges') ? (lv.challenges || []).map((c, i) => {
           const def = CHALLENGE_POOL[c.id];
@@ -511,6 +523,7 @@ export class UI {
           el('div', 'lv-stars', [1, 2, 3].map(i => `<span class="${i <= stars ? 'star-on' : 'star-off'}">★</span>`).join('')),
         );
         if (chBadges) card.append(el('div', 'lv-challenges', chBadges));
+        if (cellLine) card.append(el('div', 'lv-cells', cellLine));
         if (bothEarned) card.classList.add('all-challenges');
         const bestAsc = this.save.ascension.bestPerLevel[lv.id] || 0;
         if (bestAsc > 0) {
@@ -922,6 +935,20 @@ export class UI {
       row.append(swatch, info);
       list.append(row);
     }
+    if (isUnlocked('cells')) {
+      list.append(el('div', 'guide-section-h', 'Terrain'));
+      for (const id of ['ridge', 'sinkhole', 'conduit', 'anchor', 'nullcell'] as const) {
+        const t = CELL_TYPES[id];
+        const bestFor = t.bestFor.map(tid => TOWERS.find(tw => tw.id === tid)?.name).filter(Boolean).join(', ');
+        const row = el('div', 'codex-row');
+        const swatch = el('div', `gm-swatch gm-swatch-${id}`);
+        const info = el('div', 'codex-info');
+        info.append(el('div', 'codex-name', `${t.icon} ${t.name}`),
+          el('div', 'codex-desc', bestFor ? `${t.blurb} Best for: ${bestFor}.` : t.blurb));
+        row.append(swatch, info);
+        list.append(row);
+      }
+    }
     card.append(list);
     const close = el('button', 'btn primary', 'Back');
     close.onclick = () => { audio.ui('click'); dim.remove(); };
@@ -1169,6 +1196,9 @@ export class UI {
         }
         this.banner(parts.join('  ·  '), '#c5b3f6', 'medium');
       }
+      if (isUnlocked('cells') && game.cells.some(c => c.special)) {
+        this.toastOnce('cells', 'Special terrain! Long-press (or hover) a marked cell to see what it does — the right tower in the right place hits harder.');
+      }
       // pre-level challenge briefing (not endless, not daily, not L1 — challenges gate at L2)
       if (!endless && !daily && isUnlocked('challenges') && level.challenges?.length) {
         const names = level.challenges.map(c => `${CHALLENGE_POOL[c.id].icon} ${CHALLENGE_POOL[c.id].name}`).join('  ·  ');
@@ -1207,6 +1237,7 @@ export class UI {
         t.stage = rt.stage; t.branch = rt.branch; t.branchStage = rt.branchStage;
         t.mode = rt.mode as any; t.spent = rt.spent;
         t.dmgDealt = rt.dmgDealt; t.kills = rt.kills; t.creditsEarned = rt.creditsEarned; t.vein = rt.vein;
+        t.applyCellType(cellInfo.special);   // grid is deterministic given the snapshot's tileSize/meander
         game.towers.push(t);
         game.occupied[rt.cell] = t;
       }
@@ -1456,11 +1487,14 @@ export class UI {
     const menu = el('div', 'panel build-menu');
     menu.id = 'build-menu';
     menu.append(el('div', 'bm-title', 'Build'));
+    const cellInfo = c.special ? CELL_TYPES[c.special] : null;
+    if (cellInfo) menu.append(el('div', 'bm-cell-chip', `${cellInfo.icon} ${cellInfo.name}`));
     const grid = el('div', 'bm-grid');
     for (const spec of TOWERS) {
       const cost = g.costOf(spec);
       const poor = g.credits < cost;
-      const item = el('button', `bm-item${poor ? ' poor' : ''}`) as HTMLButtonElement;
+      const favored = cellInfo?.bestFor.includes(spec.id);
+      const item = el('button', `bm-item${poor ? ' poor' : ''}${favored ? ' cell-favored' : ''}`) as HTMLButtonElement;
       const mini = document.createElement('canvas');
       mini.width = 68; mini.height = 68;
       this.drawMiniTower(mini, spec);
@@ -1759,6 +1793,7 @@ export class UI {
       (btn.querySelector('.cd-num') as HTMLElement).textContent = cd > 0 ? `${Math.ceil(cd)}` : '';
     }
     this.updateEnemyTip();
+    this.updateCellTip();
     const boss = g.enemies.find(e => e.spec.boss && !e.dead) || null;
     this.notify.bossAlive = !!boss;
     if (!boss) this.notify.pumpLow();
@@ -1895,6 +1930,37 @@ export class UI {
     this.repositionPopups();
   }
 
+  // Desktop hover (mousemove tracked via g.mx/g.my each frame) or touch long-press
+  // (this.pinnedCellIdx) — same dual-path pattern as updateEnemyTip. Enemy tooltips take
+  // spatial priority: if an enemy is under the cursor, its tip wins over the cell's.
+  updateCellTip() {
+    const g = this.game;
+    let tip = document.getElementById('cell-tip');
+    if (this.pinnedCellIdx !== null && (!g || !g.cells[this.pinnedCellIdx]?.special)) this.pinnedCellIdx = null;
+    const idx = this.pinnedCellIdx !== null ? this.pinnedCellIdx
+      : (g && g.state === 'playing' && !g.moveArmed && !g.pendingMove && !g.pendingBuild && !g.enemyAt(g.mx, g.my) ? g.cellAt(g.mx, g.my) : -1);
+    const cell = g && idx >= 0 ? g.cells[idx] : null;
+    if (!cell || !cell.special) { tip?.remove(); return; }
+    const info = CELL_TYPES[cell.special];
+    if (!tip) {
+      tip = el('div', 'panel');
+      tip.id = 'cell-tip';
+      this.root.append(tip);
+    }
+    const rows: string[] = [`<div class="et-name">${info.icon} ${info.name}</div>`, `<div class="et-row"><span>${info.blurb}</span></div>`];
+    if (info.bestFor.length) {
+      const names = info.bestFor.map(id => { const t = TOWERS.find(tw => tw.id === id); return t ? `<span style="color:${t.color}">${t.name}</span>` : ''; }).filter(Boolean).join(' · ');
+      rows.push(`<div class="et-row"><span>Best for</span><b>${names}</b></div>`);
+    }
+    tip.innerHTML = rows.join('');
+    let x = cell.x + 20, y = cell.y - 40;
+    if (x > W - 170) x = cell.x - 20 - 156;
+    y = Math.max(64, Math.min(H - 170, y));
+    tip.style.left = `${x}px`;
+    tip.style.top = `${y}px`;
+    this.repositionPopups();
+  }
+
   // ---------- popup overlap avoidance ----------
   // Converts a screen-space DOMRect into the game's own coordinate space
   // (the whole #ui-root is scaled via CSS transform to fit the window).
@@ -1937,6 +2003,8 @@ export class UI {
   repositionPopups() {
     const tip = document.getElementById('enemy-tip');
     if (tip) this.avoidOverlap(tip, ['side-panel', 'build-menu', 'place-confirm']);
+    const cellTip = document.getElementById('cell-tip');
+    if (cellTip) this.avoidOverlap(cellTip, ['side-panel', 'build-menu', 'place-confirm', 'enemy-tip']);
   }
 
   banner(text: string, color = '#eef0ff', tier: 'critical' | 'medium' | 'low' = 'medium', sub?: string) {
@@ -1981,6 +2049,15 @@ export class UI {
     const base = t.baseStats(g);
     panel.append(el('h3', '', `<span style="color:${t.spec.color}">●</span> ${t.displayName}`));
     panel.append(el('div', 'sp-desc', s.desc));
+    if (t.cellType) {
+      const info = CELL_TYPES[t.cellType];
+      const detail = t.cellType === 'ridge' ? '+1 range, −15% rate'
+        : t.cellType === 'sinkhole' ? '−1 range, +30% dmg'
+        : t.cellType === 'conduit' ? 'linked targeting'
+        : t.cellType === 'anchor' && t.spec.kind === 'amp' ? `×${TUNING.cells.anchor.ampMul} buffs`
+        : '';
+      panel.append(el('div', 'sp-cell-chip', `On ${info.name} ${info.icon}${detail ? ` (${detail})` : ''}`));
+    }
     if (t.kills > 0 || t.dmgDealt > 0) {
       const eff = t.spent > 0 ? t.creditsEarned / t.spent : 0;
       panel.append(el('div', 'sp-perf', `${fmt(Math.round(t.dmgDealt))} dmg · ${t.kills} kill${t.kills === 1 ? '' : 's'} · ${eff.toFixed(1)}× value`));

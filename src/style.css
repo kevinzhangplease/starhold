@@ -351,6 +351,11 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
   animation: panel-in 0.16s ease both;
 }
 .bm-title { font-family: 'Fredoka'; font-size: 15px; font-weight: 600; margin-bottom: 8px; letter-spacing: 0.5px; }
+.bm-cell-chip {
+  display: inline-block; font-family: 'Fredoka'; font-size: 11px; font-weight: 600;
+  color: var(--sky); background: rgba(160,216,239,0.12); border: 1px solid rgba(160,216,239,0.3);
+  border-radius: 999px; padding: 3px 10px; margin: -4px 0 8px;
+}
 .bm-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 7px; }
 .bm-item {
   display: flex; flex-direction: column; align-items: center; gap: 2px;
@@ -364,6 +369,11 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 .bm-item .bm-name { font-size: 10px; font-weight: 800; }
 .bm-item .bm-cost { font-family: 'Fredoka'; font-size: 11px; color: var(--butter); }
 .bm-item.poor, .bm-item:disabled { opacity: 0.38; cursor: default; }
+.bm-item.cell-favored { animation: cell-favored-pulse 1.6s ease-in-out infinite; }
+@keyframes cell-favored-pulse {
+  0%, 100% { border-color: rgba(160,216,239,0.35); box-shadow: 0 0 0 rgba(160,216,239,0); }
+  50% { border-color: rgba(160,216,239,0.9); box-shadow: 0 0 8px rgba(160,216,239,0.5); }
+}
 
 /* abilities — bottom-left stack */
 #ability-stack {
@@ -463,6 +473,24 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 .gm-swatch-crate {
   background: linear-gradient(180deg, #fff3b0, #ffb3c6); border-radius: 6px;
 }
+.gm-swatch-ridge { background: linear-gradient(180deg, rgba(238,240,255,0.18), rgba(4,5,14,0.28)); border: 1px solid rgba(255,255,255,0.25); }
+.gm-swatch-ridge::after { content: ''; position: absolute; top: 0; left: 6px; right: 6px; height: 2px; background: rgba(255,255,255,0.5); }
+.gm-swatch-sinkhole { background: rgba(4,5,14,0.3); border: 1px solid rgba(0,0,0,0.4); }
+.gm-swatch-sinkhole::after {
+  content: ''; position: absolute; bottom: 13px; left: 17px;
+  border-left: 7px solid transparent; border-right: 7px solid transparent; border-top: 9px solid rgba(223,227,255,0.35);
+}
+.gm-swatch-conduit { background: rgba(191,227,255,0.08); border: 1.5px dashed #bfe3ff; }
+.gm-swatch-conduit::after {
+  content: ''; position: absolute; top: 22px; left: 6px; right: 6px; height: 2px;
+  background: repeating-linear-gradient(90deg, #bfe3ff 0 4px, transparent 4px 8px);
+}
+.gm-swatch-anchor { background: rgba(197,179,246,0.08); border: 1px solid rgba(197,179,246,0.3); }
+.gm-swatch-anchor::after {
+  content: ''; position: absolute; inset: 12px; border: 1.5px solid rgba(197,179,246,0.6); border-radius: 50%;
+  box-shadow: 0 0 0 6px rgba(197,179,246,0.25) inset;
+}
+.gm-swatch-nullcell { background: repeating-linear-gradient(45deg, rgba(160,216,239,0.12) 0 4px, transparent 4px 9px); border: 1.5px dashed rgba(160,216,239,0.4); }
 
 /* ---- Game guide ---- */
 .guide-card { width: 620px; }
@@ -573,6 +601,20 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 #enemy-tip .et-row b { color: var(--ink); font-weight: 800; }
 #enemy-tip .et-row i { color: var(--ink-dim); font-style: normal; font-weight: 700; }
 
+/* special-terrain cell hover/long-press tooltip (Phase 2) */
+#cell-tip {
+  position: absolute; width: 152px; padding: 8px 10px;
+  background: rgba(27, 29, 56, 0.72);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  pointer-events: none;
+  display: flex; flex-direction: column; gap: 2px;
+}
+#cell-tip .et-name { font-family: 'Fredoka'; font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+#cell-tip .et-row { display: flex; flex-direction: column; gap: 1px; font-size: 11.5px; color: var(--ink-dim); }
+#cell-tip .et-row b { color: var(--ink); font-weight: 700; }
+body.perf-mode #cell-tip { backdrop-filter: none; -webkit-backdrop-filter: none; background: rgba(27, 29, 56, 0.94); }
+
 /* developer mode modal */
 .dev-modal { width: 420px; border-color: var(--coral); }
 .dev-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 7px; }
@@ -605,6 +647,11 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 #side-panel h3 { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
 #side-panel .sp-lvl { font-size: 12px; color: var(--ink-dim); font-weight: 700; }
 #side-panel .sp-desc { font-size: 13px; color: var(--ink-dim); line-height: 1.4; }
+#side-panel .sp-cell-chip {
+  display: inline-block; align-self: flex-start; font-family: 'Fredoka'; font-size: 11px; font-weight: 600;
+  color: var(--sky); background: rgba(160,216,239,0.12); border: 1px solid rgba(160,216,239,0.3);
+  border-radius: 999px; padding: 3px 10px; margin-top: 2px;
+}
 .sp-stats2 { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
 .ss-row { display: flex; gap: 14px; }
 .ss-item { flex: 1; min-width: 0; display: flex; justify-content: space-between; gap: 6px; }
@@ -762,6 +809,10 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 .level-card.all-challenges { border-color: #ffd97a; box-shadow: 0 0 0 1px rgba(255,217,122,0.4) inset; }
 .level-card .lv-crown { position: absolute; top: 4px; right: 6px; font-size: 11px; font-weight: 800; color: #ffd97a; }
 .level-card { position: relative; }
+
+/* level-card special-cell inventory (Phase 2) — "think about the map on the bus" */
+.level-card .lv-cells { display: flex; gap: 5px; justify-content: center; margin-top: 1px; font-size: 10px; color: var(--sky); cursor: help; }
+.level-card .lv-cell { font-size: 11px; }
 
 /* ascension selector row on level select */
 .asc-row { display: flex; align-items: center; gap: 8px; padding: 0 22px 4px; }

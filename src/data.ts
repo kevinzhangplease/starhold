@@ -9,7 +9,7 @@
 // replaying L1 gets the full sandbox while a first-timer's L1 stays clean.
 // Must stay in sync with SEEN_UNLOCK_LEVELS in save.ts (validate.ts asserts this).
 export const UNLOCKS: Record<string, number> = {
-  combo: 2, challenges: 2, interest: 3, drops: 4, mod_asteroids: 4,
+  combo: 2, challenges: 2, interest: 3, cells: 3, drops: 4, mod_asteroids: 4,
   elites: 5, boss_theater: 5, mutators: 6, mod_veins: 6, nova: 7,
   mod_meteors: 8, mutators_hard: 9, boss_phase2: 10, mod_combo: 10, mod_ionstorms: 12,
 };
@@ -49,6 +49,19 @@ export const MODIFIER_INFO: Record<string, ModifierSpec> = {
   'rich-veins': { id: 'rich-veins', name: 'Rich Veins', icon: '💎', gate: 'mod_veins', blurb: 'Glittering cells: towers built there earn +2◆ per kill.' },
   meteors:    { id: 'meteors', name: 'Meteor Shower', icon: '☄️', gate: 'mod_meteors', blurb: 'Periodic strikes disable a tower for 6s. Watch the warning rings.' },
   'ion-storms': { id: 'ion-storms', name: 'Ion Storms', icon: '🌩', gate: 'mod_ionstorms', blurb: 'Storm bands sweep through, slowing fire rate 30% inside.' },
+};
+
+// ---------- Special terrain cells (Starhold 3.0 Phase 2) ----------
+// Each type favors a different tower archetype and carries a real tradeoff — never
+// "put your best tower here." Placement is algorithmic (levels.ts only states counts);
+// see game.ts buildGrid() for the seeded placement algorithms themselves.
+export interface CellTypeSpec { id: 'ridge' | 'sinkhole' | 'conduit' | 'anchor' | 'nullcell'; name: string; icon: string; blurb: string; bestFor: string[] }
+export const CELL_TYPES: Record<string, CellTypeSpec> = {
+  ridge:    { id: 'ridge',    name: 'Ridge',    icon: '⛰', blurb: '+1 range, −15% fire rate for the tower built here.', bestFor: ['sentinel', 'ray', 'missile'] },
+  sinkhole: { id: 'sinkhole', name: 'Sinkhole', icon: '▽', blurb: '−1 range, +30% damage for the tower built here.', bestFor: ['flame', 'cryo', 'tesla'] },
+  conduit:  { id: 'conduit',  name: 'Conduit',  icon: '↭', blurb: 'Linked cells: towers built on them focus the same target.', bestFor: ['pulse', 'prism', 'sentinel'] },
+  anchor:   { id: 'anchor',   name: 'Anchor',   icon: '◎', blurb: 'An Amp built here projects double-strength buffs.', bestFor: ['amp'] },
+  nullcell: { id: 'nullcell', name: 'Null Zone', icon: '∅', blurb: 'Unbuildable. Ground enemies passing beside it are slowed 20%.', bestFor: [] },
 };
 
 // ---------- Level challenges ----------
@@ -114,6 +127,14 @@ export const TUNING = {
   smoothing: {
     earlyLevels: 0.9,                     // L1–L2 pressure multiplier
     compensationFrom: 5, compensationFull: 10, compensationMax: 1.15,
+  },
+  // ---- Starhold 3.0 Phase 2: cell diversity ----
+  cells: {
+    ridge: { rangeAdd: 1, rateMul: 0.85 },
+    sinkhole: { rangeAdd: -1, dmgMul: 1.3 },
+    anchor: { ampMul: 2 },
+    nullcell: { slowPct: 0.2 },           // applies within Chebyshev 1.5 tiles, ground only
+    minSeparation: 2,                     // min Chebyshev distance between special cells
   },
   // ---- Starhold 3.0 Phase 1: economy & scaling foundations ----
   economy: {

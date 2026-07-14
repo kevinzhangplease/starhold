@@ -18,6 +18,7 @@ export interface LevelSpec {
   newEnemy?: { id: string; hint: string };
   modifiers?: string[];      // level-identity modifiers (see MODIFIER_INFO in data.ts)
   challenges?: { id: string; param?: number }[]; // exactly 2 per level, L2+ (see CHALLENGE_POOL in data.ts)
+  cellPlan?: { ridge?: number; sinkhole?: number; conduitPairs?: number; anchor?: number; nullcell?: number }; // special terrain (see CELL_TYPES in data.ts)
 }
 
 const g = (e: string, n: number, iv = 0.9, d = 0, p = 0): WaveGroup => ({ e, n, iv, d, p });
@@ -52,6 +53,8 @@ export const LEVELS: LevelSpec[] = [
   },
   {
     id: 3, name: 'Long Meander', zone: 0, challenges: [{ id: 'minimalist', param: 6 }, { id: 'never_sell' }], startCredits: 300, baseHp: 20, hpMul: 1.3,
+    // First contact with cells: one of each of the two simplest, opposite types.
+    cellPlan: { ridge: 1, sinkhole: 1 },
     newEnemy: { id: 'brute', hint: 'Brutes soak damage and cost 2 integrity if they leak. Focus fire.' },
     paths: [[[-40, 120], [250, 120], [250, 360], [520, 360], [520, 140], [800, 140], [800, 430], [480, 430], [480, 610], [1000, 610], [1000, 330], [1320, 330]]],
     waves: [
@@ -66,6 +69,8 @@ export const LEVELS: LevelSpec[] = [
   },
   {
     id: 4, name: 'High Wind', zone: 0, challenges: [{ id: 'specialist', param: 2 }, { id: 'never_sell' }], modifiers: ['asteroids'], startCredits: 320, baseHp: 20, hpMul: 1.5,
+    // Wisps debut — ridges reward reaching anti-air; null eases the new pressure.
+    cellPlan: { ridge: 2, nullcell: 1 },
     newEnemy: { id: 'wisp', hint: 'Wisps fly straight to your base, ignoring the road. Missiles hit hard against air.' },
     paths: [[[-40, 400], [340, 400], [340, 160], [700, 160], [700, 480], [1040, 480], [1040, 240], [1320, 240]]],
     waves: [
@@ -81,6 +86,8 @@ export const LEVELS: LevelSpec[] = [
   },
   {
     id: 5, name: 'The Mothership', zone: 0, challenges: [{ id: 'perfect_hull' }, { id: 'no_abilities' }], startCredits: 360, baseHp: 20, hpMul: 1.7,
+    // Boss level: reward a committed chokepoint + a buff hub.
+    cellPlan: { sinkhole: 1, anchor: 1 },
     paths: [[[-40, 240], [380, 240], [380, 520], [760, 520], [760, 210], [1100, 210], [1100, 430], [1320, 430]]],
     waves: [
       [g('drone', 12, 0.7)],
@@ -97,6 +104,8 @@ export const LEVELS: LevelSpec[] = [
   // ---------------- ZONE 2 · Ember Drift ----------------
   {
     id: 6, name: 'Ember Gate', zone: 1, challenges: [{ id: 'speedrunner' }, { id: 'specialist', param: 2 }], modifiers: ['rich-veins'], startCredits: 340, baseHp: 20, hpMul: 1.5,
+    // Conduit debuts where veins already teach "cells matter".
+    cellPlan: { conduitPairs: 1, sinkhole: 1 },
     newEnemy: { id: 'aegis', hint: 'Aegis shields regenerate if left alone. Keep hitting them.' },
     asteroids: [{ x: 520, y: 300, r: 46 }, { x: 860, y: 480, r: 54 }, { x: 300, y: 560, r: 40 }],
     paths: [[[-40, 160], [640, 160], [640, 400], [320, 400], [320, 620], [1000, 620], [1000, 320], [1320, 320]]],
@@ -113,6 +122,8 @@ export const LEVELS: LevelSpec[] = [
   },
   {
     id: 7, name: 'Twin Lanes', zone: 1, challenges: [{ id: 'minimalist', param: 7 }, { id: 'no_abilities' }], startCredits: 380, baseHp: 20, hpMul: 2.3,
+    // Ridges can cover both lanes from between them.
+    cellPlan: { ridge: 2, anchor: 1 },
     newEnemy: { id: 'raptor', hint: 'Raptors are fast fliers. Do not let your anti-air lapse.' },
     paths: [
       [[-40, 170], [430, 170], [430, 330], [900, 330], [900, 200], [1320, 200]],
@@ -132,6 +143,8 @@ export const LEVELS: LevelSpec[] = [
   },
   {
     id: 8, name: 'The Coil', zone: 1, challenges: [{ id: 'perfect_hull' }, { id: 'never_sell' }], modifiers: ['meteors'], startCredits: 400, baseHp: 20, hpMul: 2.7,
+    // Serpentine bends are sinkhole heaven; meteors threaten the conduit line.
+    cellPlan: { sinkhole: 2, conduitPairs: 1 },
     newEnemy: { id: 'mender', hint: 'Menders heal everything around them. Kill them first — set towers to target Strong.' },
     paths: [[[-40, 360], [150, 360], [150, 140], [450, 140], [450, 600], [750, 600], [750, 140], [1050, 140], [1050, 600], [1320, 600]]],
     waves: [
@@ -148,6 +161,9 @@ export const LEVELS: LevelSpec[] = [
   },
   {
     id: 9, name: 'Shatterfield', zone: 1, challenges: [{ id: 'speedrunner' }, { id: 'specialist', param: 3 }], startCredits: 420, baseHp: 20, hpMul: 3.1,
+    // Splitter swarms — cluster play around the anchor. (Path gets a Phase 3 rework —
+    // this placement is path-relative and survives it untouched; do not special-case it.)
+    cellPlan: { anchor: 1, nullcell: 1, ridge: 1 },
     newEnemy: { id: 'splitter', hint: 'Splitters burst into swarmlings on death. Pop them where your splash can mop up.' },
     asteroids: [{ x: 380, y: 250, r: 42 }, { x: 700, y: 500, r: 58 }, { x: 950, y: 250, r: 44 }, { x: 200, y: 540, r: 38 }, { x: 1120, y: 520, r: 36 }],
     paths: [[[-40, 380], [300, 380], [300, 150], [820, 150], [820, 380], [560, 380], [560, 620], [1180, 620], [1180, 380], [1320, 380]]],
@@ -166,6 +182,8 @@ export const LEVELS: LevelSpec[] = [
   },
   {
     id: 10, name: 'The Colossus', zone: 1, challenges: [{ id: 'perfect_hull' }, { id: 'hard_plus' }], modifiers: ['asteroids', 'rich-veins'], startCredits: 460, baseHp: 20, hpMul: 3.6,
+    // Full toolkit before Zone 3.
+    cellPlan: { conduitPairs: 1, sinkhole: 1, ridge: 1 },
     paths: [[[-40, 520], [360, 520], [360, 200], [720, 200], [720, 520], [1040, 520], [1040, 260], [1320, 260]]],
     waves: [
       [g('drone', 16, 0.5), g('aegis', 4, 1.4, 4)],
@@ -183,6 +201,9 @@ export const LEVELS: LevelSpec[] = [
   // ---------------- ZONE 3 · The Void Reach ----------------
   {
     id: 11, name: 'Void Door', zone: 2, challenges: [{ id: 'minimalist', param: 8 }, { id: 'no_abilities' }], startCredits: 440, baseHp: 20, hpMul: 4.2,
+    // Phasers slip past — null slow near the base is the safety net you build around.
+    // (Path gets a Phase 3 rework — this placement is path-relative and survives it untouched.)
+    cellPlan: { ridge: 2, nullcell: 1 },
     newEnemy: { id: 'phase', hint: 'Phasers blink out of reality — untargetable while shimmering. Slows still stick.' },
     paths: [[[-40, 200], [500, 200], [500, 460], [180, 460], [180, 640], [820, 640], [820, 360], [1120, 360], [1120, 180], [1320, 180]]],
     waves: [
@@ -200,6 +221,8 @@ export const LEVELS: LevelSpec[] = [
   },
   {
     id: 12, name: 'Crossfire', zone: 2, challenges: [{ id: 'speedrunner' }, { id: 'never_sell' }], modifiers: ['ion-storms'], startCredits: 480, baseHp: 20, hpMul: 4.9,
+    // Crossing lanes -> the shared center is anchor country.
+    cellPlan: { anchor: 1, sinkhole: 2 },
     paths: [
       [[-40, 150], [640, 150], [640, 620], [1320, 620]],
       [[-40, 620], [640, 620], [640, 150], [1320, 150]],
@@ -219,6 +242,8 @@ export const LEVELS: LevelSpec[] = [
   },
   {
     id: 13, name: 'Long Night', zone: 2, challenges: [{ id: 'specialist', param: 2 }, { id: 'perfect_hull' }], modifiers: ['meteors', 'rich-veins'], startCredits: 520, baseHp: 20, hpMul: 5.7,
+    // Long straights -> the conduit line level.
+    cellPlan: { conduitPairs: 1, ridge: 2, sinkhole: 1 },
     paths: [[[-40, 640], [180, 640], [180, 140], [420, 140], [420, 540], [660, 540], [660, 140], [900, 140], [900, 540], [1140, 540], [1140, 140], [1320, 140]]],
     waves: [
       [g('drone', 20, 0.4), g('dart', 12, 0.35, 4)],
@@ -236,6 +261,8 @@ export const LEVELS: LevelSpec[] = [
   },
   {
     id: 14, name: 'The Gauntlet', zone: 2, challenges: [{ id: 'hard_plus' }, { id: 'speedrunner' }], modifiers: ['meteors', 'ion-storms'], startCredits: 560, baseHp: 20, hpMul: 6.6,
+    // One straight corridor: pure chokepoint identity.
+    cellPlan: { sinkhole: 2, conduitPairs: 1 },
     asteroids: [{ x: 640, y: 180, r: 50 }, { x: 400, y: 560, r: 46 }, { x: 900, y: 560, r: 46 }],
     paths: [[[-40, 370], [400, 370], [640, 370], [900, 370], [1320, 370]]],
     waves: [
@@ -254,6 +281,8 @@ export const LEVELS: LevelSpec[] = [
   },
   {
     id: 15, name: 'The Leviathan', zone: 2, challenges: [{ id: 'perfect_hull' }, { id: 'hard_plus' }], modifiers: ['asteroids', 'meteors', 'ion-storms'], startCredits: 620, baseHp: 20, hpMul: 7.6,
+    // Finale uses the whole language.
+    cellPlan: { ridge: 1, sinkhole: 1, conduitPairs: 1, anchor: 1 },
     paths: [[[-40, 160], [460, 160], [460, 420], [200, 420], [200, 620], [760, 620], [760, 300], [1040, 300], [1040, 520], [1320, 520]]],
     waves: [
       [g('drone', 22, 0.32), g('dart', 14, 0.3, 4)],

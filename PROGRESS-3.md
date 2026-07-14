@@ -148,3 +148,137 @@ the 4s game-time boundary while the panel stays open.
 
 ### Next
 Phase 2 — Cell Diversity: The Board Speaks (ridge/sinkhole/conduit/anchor/null-zone terrain).
+
+---
+
+## Phase 2 — Cell Diversity: The Board Speaks [COMPLETE]
+Started: 2026-07-14 · Finished: 2026-07-14
+
+### Shipped
+1. **Data model** (data.ts): `CellTypeSpec`/`CELL_TYPES` (ridge/sinkhole/conduit/anchor/
+   nullcell, each with icon/blurb/`bestFor`), `TUNING.cells` (rangeAdd/rateMul/dmgMul/ampMul/
+   slowPct/minSeparation). `LevelSpec.cellPlan?` added to levels.ts.
+2. **Per-level inventories** (levels.ts): authored exactly the plan's table for L3-L15 (L1-L2
+   stay clean, per spec), each with a one-line design-reason comment. Endless gets a seeded
+   weighted roll (2-4 specials from the ridge30/sinkhole30/conduitPairs15/anchor15/nullcell10
+   pool) computed at `buildGrid()` time rather than authored in levels.ts, since it needs to
+   vary per run.
+3. **Placement algorithms** (`Game.buildGrid()`, after asteroid/vein seeding): seeded
+   (`mulberry32(hashString('<levelId>-cells'))`, endless XORs a per-run random like veins do)
+   placement in the fixed order sinkhole → ridge → conduit pair → anchor → null zone, each
+   respecting `minSeparation` (relax to 1, then skip with `console.warn` if still unplaceable —
+   never happened against any authored level at any tested tile size). Implemented exactly the
+   candidate rules from the plan: sinkhole picks highest-`pathAdj` bend-interior cells;
+   ridge picks `pathAdj===0 && pathNear(3)` cells nearest a genuine path corner (detected via
+   non-collinear path-neighbor directions); conduit pairs cluster around the longest straight
+   path run (row/col-wise scan), falling back to any qualifying adjacent pair; anchor scores
+   by how many of its 8 neighbors are themselves valid path-adjacent cells (the "cluster
+   heart"); null zone requires adjacency to a path cell in the final third of that path's
+   travel order (captured via a new `pathCellsOrderedAll` array built during the existing
+   path-carving loop). `CellInfo` gained `special`/`conduitPartner`; `Game` gained
+   `nullCells`/`nullCellPx`.
+4. **Effect wiring**: `Tower.cellType` + cached `cellRangeAdd`/`cellRateMul`/`cellDmgMul`
+   (via `applyCellType()`, called from `buildAt()`, `confirmMove()`, and the resume-restore
+   tower-rebuild loop in ui.ts) so `rangeT()`/`stats()` stay cheap — no `Game` lookup needed
+   per frame. Range floor of 1 confirmed load-bearing (a sinkhole under a range-1 Flame is a
+   pure, intended win). Anchor doubles a buffing Amp's `buffDmg/buffRate/buffRange/crit`
+   contribution at the point of application. Conduit: a new `Game.conduitTarget`, recomputed
+   once per `update()` from whichever conduit-cell tower has committed the most (`spent`) to a
+   live target, which linked towers pick up ahead of their own mode-based acquisition (falls
+   through cleanly to normal targeting when the shared target is out of range/dead — targeting
+   chips still apply then, per spec). Extended into Prism's separate multi-beam targeting path
+   too (prepend to the beam queue, same pattern as the existing focus-fire prepend) since
+   Prism is explicitly listed in conduit's `bestFor` but has its own targeting block that
+   bypasses the main one. Null Zone: ground enemies within 1.5 tiles of a null-cell center get
+   `speedMul *= 0.8` in `Enemy.update`'s ground-movement branch (multiplicative with tower
+   slows, fliers exempt), and a new `Game.nullSlowTint()` bumps `slowUntil` by 0.15s each frame
+   without touching `slowPct` — reuses the existing slow-ring visual purely for the tint,
+   completely decoupled from the actual speed math.
+5. **Rendering** (`drawTiles`): five palette-neutral, value/elevation-based treatments (no new
+   hues, per the binding design discipline) — ridge lifts 2px with a lighter top edge and drop
+   shadow; sinkhole insets with a darker fill, inner top shadow, and a faint downward-triangle
+   glyph; conduit gets a pulsing emissive border on both cells plus a marching dashed link line
+   (drawn once, from the lower-index cell of the pair; brighter when both cells are
+   tower-occupied, matching spec) — `perfMode`/`reduceMotion` freeze the pulse/dash-march;
+   anchor gets two slow-rotating concentric rings (static under `reduceMotion`); null zone gets
+   a diagonal hatch (always visible) plus a dashed slow-radius ring shown only while a ground
+   enemy is actually inside it, keeping the board quiet otherwise. All five draw before the
+   generic buildable-cell outline so occupied special cells keep their treatment visible around
+   the tower pad, exactly as specified.
+6. **Legibility** (ui.ts): a `#cell-tip` hover/long-press tooltip (new `updateCellTip()`,
+   mirroring the existing `updateEnemyTip()`'s dual hover/pinned-long-press pattern exactly,
+   including `repositionPopups()` overlap avoidance) showing icon, name, blurb, and a
+   `Best for:` line in each tower's own color. Long-press on an empty special cell pins the
+   tooltip instead of doing nothing — a plain tap is a wholly separate gesture path and still
+   builds normally, so this can't interfere with building. Build menu: a header chip
+   (icon+name) plus a `cell-favored` pulsing-outline class on every `bestFor` tile — verified
+   live (Flame/Cryo/Tesla visibly pulsed on a Sinkhole cell, and nothing else did). Tower
+   panel: a compact `On <Type> <icon> (<effect>)` chip under the description (doubles as the
+   Anchor+Amp "×2 buffs" callout the plan asked for). Level-select cards: a cell-inventory row
+   (`⛰1 ▽1` etc., hover-titled per icon) built from `cellPlan` — verified live, matches the
+   authored data on every card exactly. Codex: a new "Terrain" section in the Map Guide with a
+   custom CSS swatch per type (echoing each one's actual in-game visual language) plus its
+   `bestFor` list.
+7. **Gating**: `cells:3` added to both `UNLOCKS` and `SEEN_UNLOCK_LEVELS` (validate.ts's sync
+   check enforces this automatically). `buildGrid()`'s whole placement block is skipped when
+   locked — a fresh sub-L3 save's board is byte-for-byte identical to pre-Phase-2 behavior.
+   `toastOnce('cells', …)` fires the first time a level with any placed special loads (mirrors
+   the existing per-modifier toast pattern at the same call site). Veterans get `seen.cells`
+   pre-marked automatically via the existing generic `SEEN_UNLOCK_LEVELS` migration loop — no
+   new code needed, confirmed by inspection.
+
+### Real, pre-existing issue caught while implementing (not a regression)
+None this phase — Phase 1's `selftest.ts` fix already covered the one live-verification gap in
+the harness itself. This phase's own 500-tick selftest run and manual browser pass were both
+clean on the first try.
+
+### Decisions / deviations
+- **1.1's `TUNING.threat` scaffold**: not applicable to this phase — that's Phase 1's item, not
+  Phase 2's. (No deviation here; noting only because PLAN-3.md's phase numbering could be
+  misread.)
+- **"CELL_TYPES ids match TUNING.cells keys" (2.8)**: implemented as a one-directional-per-side
+  sync check rather than strict set equality, because the plan's own `TUNING.cells` sample
+  intentionally has no `conduit` entry (conduit's numbers are the pairing/adjacency logic
+  itself, not a per-type scalar) and intentionally has a cross-cutting `minSeparation` key that
+  isn't a cell type at all. A literal equality check would have permanently failed against the
+  plan's own spec. The implemented check instead catches real drift (a `TUNING.cells` key with
+  no matching type, or a type — besides conduit — with no `TUNING.cells` entry), which is the
+  useful property "keep them in sync" is actually asking for.
+- **Ridge's "nearest corner" and anchor's "cluster heart" scoring**: implemented exactly as
+  specified in the real `buildGrid()` algorithm (game.ts). The `validate.ts` headless check and
+  `tests/cell-seeding.ts`, however, simplify both to a plain seeded pick among qualifying
+  candidates — matching the precedent already set by `tests/asteroid-vein-seeding.ts` (which
+  explicitly skips meander re-application for the same reasoning: a test file that can't import
+  the stateful, canvas-owning `Game` class headlessly reimplements the algorithm faithfully for
+  the properties that matter to *that* test). The scoring preference is a placement-quality
+  refinement, not a correctness invariant (no overlap, right counts, adjacency, separation) —
+  which is what these particular tests check. The real algorithm's scoring logic itself was
+  hand-verified during implementation and exercised live in a real browser (see below).
+- **Meander skipped in validate.ts/tests/cell-seeding.ts**, identically to the precedent in
+  `tests/asteroid-vein-seeding.ts` and for the same reason: the placement algorithm only reads
+  the resulting `pathTiles`/`endTiles` sets, not which meander tier produced them, and meander
+  itself already has dedicated, exhaustive fuzz coverage elsewhere.
+- **Resume**: confirmed no `RESUME_VERSION` bump was needed. `cellType` is deliberately never
+  serialized (`ResumeTower` has no such field) — it's always recomputed from the cell index
+  against the deterministic grid on restore (`t.applyCellType(cellInfo.special)`), exactly as
+  the plan specifies. The "resume round-trip" test requirement from 2.8 is therefore satisfied
+  by `tests/cell-seeding.ts`'s stats test (which verifies the exact modifier math that
+  recomputation produces) rather than a `resume.ts` round-trip test, since there is no
+  serialized field to round-trip — documented inline in that test file's header comment.
+- Endless's weighted cell-type roll lives in `buildGrid()` (computed at construction, per run)
+  rather than as authored data in levels.ts, since — unlike the other 14 levels — it must vary
+  every run rather than being fixed.
+
+### Known issues
+None. All gates green: `tsc --noEmit`, `validate.ts` (including the new special-cell placement
+invariant check — 39 level×tile-size combinations, zero shortfalls or warnings), full 12-file
+test suite (11 pre-existing + new `cell-seeding.ts`), both builds, and a live 500-tick
+`?selftest=1` run with 0 errors. Manually verified in a real browser on a fresh L3 board: the
+level-select cell-inventory rows matched the authored data exactly on every card; hovering the
+placed Sinkhole cell showed the correct tooltip (name, effect text, and `Best for: Flame · Cryo
+· Tesla` in each tower's own color); opening the build menu on that same cell showed the
+"▽ Sinkhole" header chip and pulsed exactly Flame/Cryo/Tesla's tiles and no others.
+
+### Next
+Phase 3 — Map, Path & Portal Identity (seeded backgrounds + landmarks, path channel +
+chevrons, portal charge telegraphs, L9/L11 structural reworks).

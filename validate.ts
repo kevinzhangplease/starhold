@@ -1,6 +1,6 @@
 // Run with: node --experimental-strip-types validate.ts
 import { LEVELS } from './src/levels.ts';
-import { ENEMIES, TOWERS, META, UNLOCKS, TUNING, fmt, MUTATORS, MODIFIER_INFO, ZONES, CHALLENGE_POOL } from './src/data.ts';
+import { ENEMIES, TOWERS, META, UNLOCKS, TUNING, fmt, MUTATORS, MODIFIER_INFO, CELL_TYPES, ZONES, CHALLENGE_POOL } from './src/data.ts';
 import { RESUME_VERSION } from './src/resume.ts';
 import { mulberry32, hashString, seededInt, seededPick } from './src/rng.ts';
 // computeDailyOp itself lives in daily.ts, but daily.ts internally imports from './rng' and
@@ -393,6 +393,148 @@ if (!(RESUME_VERSION >= 1 && Number.isInteger(RESUME_VERSION))) err('RESUME_VERS
   if (migrated.ascension.current !== 3) err('migrateSave should preserve ascension.current');
   const twice = migrateSave(JSON.parse(JSON.stringify(migrated)));
   if (JSON.stringify(twice.ascension) !== JSON.stringify(migrated.ascension)) err('migrateSave not idempotent on ascension after backfill');
+}
+
+// ---- Phase 2 (3.0): special-cell placement — headless across every level x tile size ----
+// (Meander is intentionally NOT re-applied here — same reasoning as
+// tests/asteroid-vein-seeding.ts: the placement algorithm only cares about the resulting
+// pathTiles/rockTiles/endTiles sets, not which meander tier produced them, and meander
+// itself is already exhaustively fuzz-tested elsewhere. This reimplementation also
+// simplifies the ridge "nearest corner" and anchor "cluster heart" tie-break SCORING to a
+// plain seeded pick among qualifying candidates — those preferences are polish, not
+// correctness, so they're out of scope for an invariant check like this one.)
+{
+  // CELL_TYPES <-> TUNING.cells sync: every TUNING.cells key (besides the cross-cutting
+  // minSeparation) needs a real cell type, and every type besides conduit (which has no
+  // per-type scalar — its numbers are the pairing/adjacency logic itself) needs a TUNING entry.
+  for (const key of Object.keys(TUNING.cells)) {
+    if (key === 'minSeparation') continue;
+    if (!(key in CELL_TYPES)) err(`TUNING.cells.${key} has no matching CELL_TYPES entry`);
+  }
+  for (const id of Object.keys(CELL_TYPES)) {
+    if (id === 'conduit') continue;
+    if (!((id in TUNING.cells))) err(`CELL_TYPES.${id} has no matching TUNING.cells entry`);
+  }
+
+  function snapToGrid(rawPts: number[][], cell: number) {
+    const top = 70, bottom = 720 - 22;
+    const cols = Math.floor((1280 - 12) / cell);
+    const rows = Math.floor((bottom - top) / cell);
+    const gx0 = (1280 - cols * cell) / 2;
+    const gy0 = top + ((bottom - top) - rows * cell) / 2;
+    const pts: { c: number; r: number }[] = [];
+    for (let i = 0; i < rawPts.length; i++) {
+      let c = Math.round((rawPts[i][0] - gx0 - cell / 2) / cell);
+      let r = Math.round((rawPts[i][1] - gy0 - cell / 2) / cell);
+      r = Math.max(0, Math.min(rows - 1, r));
+      if (i === 0) c = -2; else if (i === rawPts.length - 1) c = cols + 1; else c = Math.max(1, Math.min(cols - 2, c));
+      if (i > 0) { const prev = pts[pts.length - 1]; if (prev.r !== r && prev.c !== c) pts.push({ c: prev.c, r }); }
+      pts.push({ c, r });
+    }
+    return { pts, cols, rows };
+  }
+  function carve(pts: { c: number; r: number }[], cols: number, rows: number) {
+    const idx = (c: number, r: number) => r * cols + c;
+    const pathTiles = new Set<number>(), endTiles = new Set<number>();
+    const ordered: { c: number; r: number }[] = [];
+    let firstIn: { c: number; r: number } | null = null, lastIn: { c: number; r: number } | null = null;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const a = pts[i], b = pts[i + 1];
+      const dc = Math.sign(b.c - a.c), dr = Math.sign(b.r - a.r);
+      let c = a.c, r = a.r;
+      while (true) {
+        if (c >= 0 && c < cols && r >= 0 && r < rows) { pathTiles.add(idx(c, r)); ordered.push({ c, r }); if (!firstIn) firstIn = { c, r }; lastIn = { c, r }; }
+        if (c === b.c && r === b.r) break;
+        c += dc; r += dr;
+      }
+    }
+    const fi = firstIn || { c: 0, r: pts[0].r }, li = lastIn || { c: cols - 1, r: pts[pts.length - 1].r };
+    endTiles.add(idx(fi.c, fi.r)); endTiles.add(idx(li.c, li.r));
+    return { idx, pathTiles, endTiles, ordered };
+  }
+
+  // Simplified mirror of Game.buildGrid()'s cell-placement block: same candidate rules,
+  // same fixed order, same separation/fallback strategy — seeded pick instead of scored
+  // tie-break for ridge/anchor (see note above).
+  function placeSpecials(levelId: number, cellPlan: Record<string, number | undefined>, pathTiles: Set<number>, endTiles: Set<number>, cols: number, rows: number, ordered: { c: number; r: number }[]) {
+    const idx = (c: number, r: number) => r * cols + c;
+    const cOf = (i: number) => i % cols, rOf = (i: number) => Math.floor(i / cols);
+    const rng = mulberry32(hashString(`${levelId}-cells`));
+    const specialMap = new Map<number, { type: string; partner?: number }>();
+    const placedIdx: number[] = [];
+    const allIdx: number[] = []; for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) allIdx.push(idx(c, r));
+    const isFree = (i: number) => !pathTiles.has(i) && !endTiles.has(i) && !specialMap.has(i);
+    const pathAdj = (c: number, r: number) => { let n = 0; for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) { if (!dc && !dr) continue; const cc = c + dc, rr = r + dr; if (cc < 0 || cc >= cols || rr < 0 || rr >= rows) continue; if (pathTiles.has(idx(cc, rr))) n++; } return n; };
+    const pathNear = (c: number, r: number, k: number) => { for (let dr = -k; dr <= k; dr++) for (let dc = -k; dc <= k; dc++) { if (!dc && !dr) continue; const cc = c + dc, rr = r + dr; if (cc < 0 || cc >= cols || rr < 0 || rr >= rows) continue; if (pathTiles.has(idx(cc, rr))) return true; } return false; };
+    const cheby = (i: number, j: number) => Math.max(Math.abs(cOf(i) - cOf(j)), Math.abs(rOf(i) - rOf(j)));
+    const farEnough = (i: number, sep: number) => placedIdx.every(j => cheby(i, j) >= sep);
+    const from = Math.floor(ordered.length * 2 / 3);
+    const finalThird = new Set(ordered.slice(from).map(p => idx(p.c, p.r)));
+    const nearFinalThird = (c: number, r: number) => { for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) { if (!dc && !dr) continue; const cc = c + dc, rr = r + dr; if (cc < 0 || cc >= cols || rr < 0 || rr >= rows) continue; const ni = idx(cc, rr); if (pathTiles.has(ni) && finalThird.has(ni)) return true; } return false; };
+
+    const place = (want: number, type: string, cands: (sep: number) => number[]) => {
+      for (let n = 0; n < want; n++) {
+        let c = cands(TUNING.cells.minSeparation);
+        if (!c.length) c = cands(1);
+        if (!c.length) { console.warn(`validate: could not place ${type} #${n + 1} on level ${levelId}`); continue; }
+        const pick = c[seededInt(rng, 0, c.length - 1)];
+        specialMap.set(pick, { type }); placedIdx.push(pick);
+      }
+    };
+    place(cellPlan.sinkhole || 0, 'sinkhole', sep => allIdx.filter(i => isFree(i) && pathAdj(cOf(i), rOf(i)) >= 2 && farEnough(i, sep)));
+    place(cellPlan.ridge || 0, 'ridge', sep => allIdx.filter(i => { const c = cOf(i), r = rOf(i); return isFree(i) && pathAdj(c, r) === 0 && pathNear(c, r, 3) && farEnough(i, sep); }));
+    for (let n = 0; n < (cellPlan.conduitPairs || 0); n++) {
+      let pairs: [number, number][] = [];
+      for (let r = 0; r < rows && !pairs.length; r++) for (let c = 0; c < cols - 1 && !pairs.length; c++) {
+        const i1 = idx(c, r), i2 = idx(c + 1, r);
+        if (isFree(i1) && isFree(i2) && pathAdj(c, r) >= 1 && pathAdj(c + 1, r) >= 1 && farEnough(i1, TUNING.cells.minSeparation) && farEnough(i2, TUNING.cells.minSeparation)) pairs.push([i1, i2]);
+      }
+      if (!pairs.length) { console.warn(`validate: could not place conduit pair #${n + 1} on level ${levelId}`); continue; }
+      const [i1, i2] = pairs[seededInt(rng, 0, pairs.length - 1)];
+      specialMap.set(i1, { type: 'conduit', partner: i2 }); specialMap.set(i2, { type: 'conduit', partner: i1 }); placedIdx.push(i1, i2);
+    }
+    place(cellPlan.anchor || 0, 'anchor', sep => allIdx.filter(i => isFree(i) && farEnough(i, sep)));
+    place(cellPlan.nullcell || 0, 'nullcell', sep => allIdx.filter(i => { const c = cOf(i), r = rOf(i); return isFree(i) && nearFinalThird(c, r) && farEnough(i, sep); }));
+    return specialMap;
+  }
+
+  let trials = 0;
+  for (const lv of LEVELS) {
+    if (!lv.cellPlan) continue;
+    for (const tileSize of [40, 48, 58]) {
+      const { pts, cols, rows } = snapToGrid(lv.paths[0], tileSize);
+      const { idx, pathTiles, endTiles, ordered } = carve(pts, cols, rows);
+      const specialMap = placeSpecials(lv.id, lv.cellPlan as any, pathTiles, endTiles, cols, rows, ordered);
+      trials++;
+
+      const wantTotal = (lv.cellPlan.ridge || 0) + (lv.cellPlan.sinkhole || 0) + (lv.cellPlan.conduitPairs || 0) * 2 + (lv.cellPlan.anchor || 0) + (lv.cellPlan.nullcell || 0);
+      const gotTotal = specialMap.size;
+      if (gotTotal < wantTotal - 1) err(`Level ${lv.id} tile=${tileSize}: special-cell placement shortfall (wanted ${wantTotal}, got ${gotTotal})`);
+      for (const [i, sp] of specialMap) {
+        if (pathTiles.has(i)) err(`Level ${lv.id} tile=${tileSize}: ${sp.type} placed on the path`);
+        if (endTiles.has(i)) err(`Level ${lv.id} tile=${tileSize}: ${sp.type} placed on a portal/base tile`);
+        if (sp.type === 'conduit') {
+          if (sp.partner === undefined || !specialMap.has(sp.partner)) err(`Level ${lv.id} tile=${tileSize}: conduit cell ${i} has no valid partner`);
+          else {
+            const dc = Math.abs((i % cols) - (sp.partner % cols)), dr = Math.abs(Math.floor(i / cols) - Math.floor(sp.partner / cols));
+            if (dc + dr !== 1) err(`Level ${lv.id} tile=${tileSize}: conduit partners ${i}/${sp.partner} aren't orthogonally adjacent`);
+          }
+        }
+        if (sp.type === 'nullcell') {
+          const from3 = Math.floor(ordered.length * 2 / 3);
+          const finalThird = new Set(ordered.slice(from3).map(p => idx(p.c, p.r)));
+          const c = i % cols, r = Math.floor(i / cols);
+          let touches = false;
+          for (let dr = -1; dr <= 1 && !touches; dr++) for (let dc = -1; dc <= 1 && !touches; dc++) {
+            const cc = c + dc, rr = r + dr; if (cc < 0 || cc >= cols || rr < 0 || rr >= rows) continue;
+            const ni = idx(cc, rr); if (pathTiles.has(ni) && finalThird.has(ni)) touches = true;
+          }
+          if (!touches) err(`Level ${lv.id} tile=${tileSize}: null cell ${i} isn't adjacent to the path's final third`);
+        }
+      }
+    }
+  }
+  console.log(`  (special-cell placement: ${trials} level x tile-size combinations checked)`);
 }
 
 console.log(errors ? `\n${errors} error(s)` : '\nAll checks passed ✓');
