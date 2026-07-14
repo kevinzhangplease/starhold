@@ -1,3 +1,43 @@
+# STARHOLD 3.0 — Device Checklist additions (Samsung S23+)
+
+The 3.0 overhaul added a lot of new touch surface on top of everything in the 2.0 checklist
+below. These were verified in a headless desktop + emulated-390px browser (no console errors,
+layout renders at both sizes), but never on real S23+ glass — same gap the 2.0 list closes.
+Test these first, then run the 2.0 list underneath.
+
+- [ ] **Cell tooltips via long-press.** On a level with special terrain (L3+), press and hold a
+  marked cell (Ridge/Sinkhole/Conduit/Anchor/Null) for ~half a second. Does its info card appear
+  (name, effect, "Best for: …") and stay while you hold? Long-pressing an *empty* special cell
+  must show the tooltip, NOT open the build menu (a plain tap still builds).
+- [ ] **Briefing screen touch targets + scroll.** Tap a level to open its Briefing. Are the draft
+  tower tiles, the "Use full arsenal" toggle, the Suggested/Last used/Clear buttons, the doctrine
+  chips, and the big LAUNCH button all comfortably tappable? On a level with a full roster + draft
+  + doctrines, does the screen scroll cleanly if it overflows (one scroll region, no double
+  scrollbars, LAUNCH always reachable)?
+- [ ] **Hull pips readable at 390px.** During a wave, is the segmented hull bar (top-left) legible
+  — can you tell filled from empty pips, and see the teal→amber→red color shift as it drops? When
+  a boss leaks several hull at once, do the pips crack in sequence rather than all vanishing?
+- [ ] **Overcharge double-tap vs. pan/zoom.** With Overcharge unlocked (L4+), double-tap a built
+  tower during a wave. Does it activate Overcharge (crackle + depleting ring + a spent pip
+  bottom-left) reliably, WITHOUT the browser zooming or the board panning? Try it near the screen
+  edge too.
+- [ ] **Draft picker tap targets.** In a Briefing draft grid, tap tower tiles to select/deselect —
+  does the count update and the chosen state (highlight) toggle on the first tap each time? Does
+  the picker refuse a selection past the draft size (deny feedback, not a silent no-op)?
+- [ ] **Muted-run twin check (audio → visual).** Mute the phone (or turn off Alert cues in
+  Settings) and play a wave. Confirm each audio cue still has its on-screen twin: mender pulse
+  ring, portal charge coloring per enemy, hull pip cracks + `-N HULL` on a leak, `LAST ONE`
+  floater on the final enemy, credit floaters on income. Nothing important should be audio-only.
+- [ ] **Resume across the update boundary.** If you had a level in progress from a *previous*
+  (pre-3.0) version and open the updated app, the old resume snapshot should be discarded
+  gracefully exactly once (RESUME_VERSION advanced 1→5 across 3.0) — you'll simply not get a
+  Resume prompt for that stale run, with no error or crash. A resume snapshot saved *within* 3.0
+  should restore normally (towers, credits, hull, draft, and active doctrine all intact).
+- [ ] **Threat readout legibility.** Is the Comfortable / Tight / Likely-leak chip on the forecast
+  readable at 390px, and does it visibly change as you build coverage during an intermission?
+
+---
+
 # STARHOLD 2.0 — Device Checklist (Samsung S23+)
 
 Context: all of Phase 7's mobile/touch work was built and reasoned through carefully, but

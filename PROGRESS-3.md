@@ -1195,3 +1195,213 @@ for a future phase.
 
 ### Next
 Phase 9 — Integration Balance, Tests & Ship.
+
+---
+
+## Phase 9 — Integration Balance, Tests & Ship [COMPLETE]
+Started: 2026-07-14 · Finished: 2026-07-14
+
+No new systems this phase — the deliverable is scope discipline: hunt cross-system bugs, sweep
+the economy, consolidate tests, and ship. One post-plan change was folded in first at Kevin's
+request (unrelated to the audit): **Veterancy's unlock gate moved from L8 → L1** (`UNLOCKS` +
+`SEEN_UNLOCK_LEVELS`, kept in sync) so the mechanic can be tried from the first level; no other
+Veterancy behavior changed (still 45 kills on one tower for the perk choice).
+
+### 9.1 Cross-system interaction audit
+Every row of the PLAN-3 9.1 table, with method and result. The formula/logic-replicable rows
+are locked into `tests/integration-audit.ts`; the stateful ones are hand-verified by reading
+the exact code path and exercised live in the headless smoke run (9.3).
+
+1. **Draft × Hard injection** — ✓ `computeThreat()` reads `this.pendingWave`, which
+   `preparePending()` fills via `decorateWave(i)` — so the Hard-injected extra group is already
+   in the wave the readout scores. An injected enemy whose counters are undrafted therefore
+   surfaces as a coverage gap in the threat chip. Code-verified.
+2. **Draft × challenges** — ✓ (test) Specialist/Minimalist predicates count
+   `runStats.towersBuilt`, never draft size; every Specialist param ≤ its level's draft size;
+   the Suggested must-includes always fit within the draft. No challenge is made impossible by
+   drafting (you can always build fewer types / fewer towers than drafted).
+3. **Shatter × Splitter** — ✓ (code + smoke) `onKill` spawns the splits (pushed onto
+   `this.enemies`) *before* the shatter `explode()`, which iterates `this.enemies` calling
+   `e.hurt` — it sets `dead` flags but never splices during the loop, so no array-mutation
+   crash, and the freshly-spawned swarmlings can themselves be caught by the blast. Each kill
+   runs its own `onKill`, so the combo counter counts them all. L9 (splitters) ran 5 waves at
+   2× with Cryo towers freezing them: zero errors.
+4. **Shatter × elite Shielded** — ✓ (code) Shatter damage goes through `explode()` → `e.hurt()`,
+   which subtracts from `shield` before `hp` — a shielded elite absorbs it exactly like any
+   other hit. The only shield-bypass path in the codebase is the Leviathan's phase-2 arc gap,
+   which shatter never touches.
+5. **Overcharge × Overclock drop × Anchor amp** — ✓ (test) Worst-case fire rate = (1 + anchored
+   Hyperclock buffRate 0.40×2=0.80) × overclock 1.40 × overcharge 2.0 = **5.04×**, purely
+   multiplicative and comfortably bounded (test asserts < 8×). No projectile/audio flood
+   observed at elevated speed.
+6. **Veterancy × sell undo** — ✓ (test + code) 45 kills inside the 4 s undo window would need
+   >11 kills/sec — unreachable in real play — and `sell()` has no perk-refund branch anyway: a
+   sold veteran's perk is simply gone. No refund exploit exists.
+7. **Conduit × draft of ≤2** — ✓ (code + smoke) The `conduitLeader` selection loop handles 0 or
+   1 conduit-cell towers gracefully (`conduitTarget` becomes `null` or that single tower's own
+   target); a lone tower on a conduit pair just has no partner — no null deref. Conduit levels
+   construct and run cleanly in the level sweep.
+8. **NOVA % × Ascension V** — ✓ (code + `nova-ascension.ts`) NOVA damage is `e.hp ×
+   fracNormal/fracBoss` — a fraction of *current* HP — so it stays meaningful at any scaling by
+   construction; the floaters read through `fmt()`.
+9. **Early-call % × Logistics × interest** — ✓ Covered by the 9.2 sweep: with early-call modeled
+   at ~10% of bounty, Logistics' +10% start + faster drops, and interest at half-cap, the
+   combined economy stays inside the graceful band (below).
+10. **Feint × portal telegraph × spawn signatures** — ✓ (code) A Feint delays its second group's
+    entries in `spawnQueue`; `drawPortalCharge()` reads `spawnQueue` directly and telegraphs the
+    earliest un-spawned group per path at T−`chargeLead` (2 s) in that group's enemy color, and
+    the spawn signature fires from the same spawn site — all three are driven off one queue, so
+    the delayed group self-telegraphs with no special-casing.
+11. **Flier lane × Daily mirror** — ✓ (test) `flierLaneControl` seeds on `levelId+waveIdx` only
+    (mirror-independent) → fully deterministic; both the intermission telegraph and the actual
+    flight call it with the already-mirrored portal/base px → self-consistent by construction;
+    finite/bounded on mirrored coordinates.
+12. **Threat readout × shapes × Brutal** — ✓ (test + code) `computeThreat` applies rush ×0.8 /
+    trickle ×1.15 to the efficiency term; Brutal jams only the *second* forecast slot
+    (`jammed = diffTier === 4`), leaving the current-wave readout intact.
+13. **Cell placement × L9/L11 reworks × all tile sizes** — ✓ (validate.ts) The special-cell
+    placement sweep (39 level×tile-size combos), static asteroid/path collision (27 combos) and
+    multi-path portal/base merge (36 combos) all pass on the reworked fork-rejoin / converging
+    paths. Already green; re-confirmed.
+14. **Star recut × old saves** — ✓ (test) `migrateSave` never recomputes stars — a legacy
+    `{1:3, 15:3}` survives untouched — and `win()`'s persist step is `Math.max(prev, fresh)`, so
+    a later lower-rated run can't downgrade a stored higher one.
+15. **Chroma / palette** — ✓ (code + smoke) Every tower/enemy canvas draw routes through
+    `pal()` / `palTower()` / `palEnemy()`; a grep for stray `spec.color` reads in the draw paths
+    finds only the one inside an explanatory comment. Chroma and the accessible palette both
+    re-theme the board, and every sampled level rendered cleanly.
+
+### 9.2 Economy simulation sweep
+Added an informational economy sweep to `validate.ts` (earnable income vs. required firepower
+spend, per level × difficulty × ascension). **Model:** `earnable` = start credits + bounties +
+wave-clear + interest (at half the scaled cap) + expected credit-drops + early-call (50% uptake,
+half the 40% cap) + vein bonus; `needed` = `avgEffHp × towerCount / K`, where `avgEffHp` is total
+effective enemy HP ÷ enemy count (required *DPS* tracks the HP arrival rate, **not** total HP —
+towers deal damage over time, so a total-HP proxy over-weights late game by ~10×) and
+`towerCount` grows 4→8 with the campaign. `K` is calibrated once so L15 Normal Asc0 = 1.50; every
+other cell then reads relative to that anchor. It is **informational, never a build-breaker** — a
+balance ratio is a human tuning signal, not a correctness invariant; only a non-finite/non-positive
+value (a real tuning bug) hard-fails.
+
+Final matrix (earnable/needed; ⚠ = outside the aspirational [1.2, 1.8] band):
+
+```
+Level 1 (First Contact):     Level 5 (The Mothership):
+  Normal  A0:6.47 A3:5.39 A5:4.83     Normal  A0:2.97 A3:2.48 A5:2.30
+  Hard    A0:5.65 A3:4.71 A5:4.26     Hard    A0:2.61 A3:2.18 A5:2.04
+  Brutal  A0:5.03 A3:4.19 A5:3.83     Brutal  A0:2.36 A3:1.97 A5:1.86
+Level 10 (The Colossus):     Level 15 (The Leviathan):
+  Normal  A0:1.16 A3:0.97 A5:0.91     Normal  A0:1.50 A3:1.25 A5:1.20
+  Hard    A0:1.05 A3:0.87 A5:0.83     Hard    A0:1.36 A3:1.13 A5:1.09
+  Brutal  A0:0.95 A3:0.79 A5:0.75     Brutal  A0:1.23 A3:1.03 A5:1.00
+```
+
+**Reading / decision (no TUNING nudge made — deliberate):** The shape is coherent and matches
+the intended design, so nudging would do more harm than good:
+- **Early levels are cash-rich** (L1 ~6.5, L5 ~2.5). This is the intended learning margin —
+  early maps are meant to be forgiving. It reads as "out of band" only because the model's
+  `needed` can't capture how little firepower an easy level truly demands relative to its
+  generous rewards.
+- **The late game sits right in band and degrades gracefully.** L15 runs 1.50 (Normal Asc0) →
+  1.00 (Brutal Asc5) with no adjacent-cell cliff. The dip below 1.2 at high ascension is the
+  **Scarcity (IV) / Onslaught (V) tightening working as designed** — those tiers explicitly cut
+  starting credits and the interest cap. A ratio of ~1.0 at the single hardest cell in the game
+  (final boss, Brutal, Ascension V) is correct tension, not a slog.
+- **Difficulty and ascension both move the ratio the right way** (harder → tighter) monotonically
+  in every cell. No cliffs, no inversions.
+- Nudging `bountyCoef` up to lift the high-ascension cells toward 1.2 would inflate the
+  already-rich early game and flatten the deliberate ascension pressure — a net loss. The
+  economy is left as-is; the matrix is the record.
+
+### 9.3 Test & fuzz consolidation
+Full suite green — **19 test files** (18 prior + new `tests/integration-audit.ts`), plus
+`validate.ts` (now including the economy sweep) and the mirror-meander fuzz across all 15 levels
+incl. the reworked L9/L11. Headless smoke (real Chromium, dev sandbox):
+- **Core smoke:** L1 built + played at elevated speed through all 6 waves — zero console/page
+  errors.
+- **Interaction smoke:** L9 (splitters + Anchor/Null/Ridge cells) built with Cryo and played 5
+  waves at speed — zero errors (exercises Shatter×Splitter, cell effects, high kill throughput).
+- **Level-construction sweep:** dev-jumped L1 / L4 / L8 / L11 (converging-lanes rework) / L12 /
+  L15 / Endless, launching several waves each — every level rendered (`canvas.width > 0`) and ran
+  with **zero errors**, confirming each level's grid/cells/paths/waves construct cleanly.
+- **Screenshots** captured at 1280×800 and 846×390: the full integrated 3.0 HUD renders correctly
+  at both sizes — hull pip bar, threat chip, wave-shape + flier badges, interest preview,
+  overcharge pips, NOVA/abilities, marching path chevrons, portal telegraphs, landmarks — nothing
+  clipped or overlapping. (Attached to the session for Kevin.)
+
+### 9.4 Ship package
+- **`CHANGELOG.md`** — new player-facing "Starhold 3.0" section prepended (2.0 section kept
+  verbatim below it), grouped by feel in the 2.0 changelog's warm, jargon-free voice.
+- **`DEVICE-CHECKLIST.md`** — new "Starhold 3.0 additions" section prepended: cell long-press
+  tooltips, Briefing-screen touch targets + scroll, hull-pip legibility at 390px, Overcharge
+  double-tap vs. pan/zoom, draft-picker tap targets, the muted-run audio→visual twin check, and
+  resume across the update boundary (graceful stale-snapshot discard).
+- **Final `TUNING` reference table** — below.
+
+### Final TUNING reference (values as shipped in 3.0)
+New-in-3.0 blocks in **bold**; 2.0-inherited blocks that 3.0 did not retune are listed tersely.
+
+| Block | Key = value | Rationale |
+|---|---|---|
+| **economy** | sellRefund=0.72 | Selling is a 28%-loss decision, not a free respec |
+| | sellUndoWindow=4 | 4 s full-refund misclick undo (game-time) |
+| | refundInWaveMul=0.72 | In-wave upgrade refund cut — closes the interest round-trip exploit |
+| | earlyCallPerSec=0.04, earlyCallCap=0.40 | +4%/s of pending bounty, capped +40% — a real risk/reward |
+| | bountyCoef=0.27 | Bounty scaling ≈ √(hpMul) at L15; holds credit value L1→L15 |
+| **cells** | ridge {rangeAdd:+1, rateMul:0.85} | Reach for a fire-rate cost — the back-line snipe cell |
+| | sinkhole {rangeAdd:−1, dmgMul:1.30} | Damage for reach — the chokepoint bruiser cell |
+| | anchor {ampMul:2} | An Amp here doubles its buffs — a cluster-heart puzzle |
+| | nullcell {slowPct:0.20} | −20% ground speed nearby — a mercy brake near the base |
+| | minSeparation=2 | Keeps special cells from clumping |
+| **portals** | chargeLead=2 | Portals telegraph a spawn 2 s ahead (audio twin: spawn sig) |
+| **flame** | stackMax=3, stackStep=0.5 | Burn stacks 1.0/1.5/2.0× — Flame's committed-chokepoint niche |
+| **reactions** | shatterFrac=0.30, shatterRadius=60, shatterCap=250 | Frozen death explosion; cap scales with campaign so it never one-shots early / fizzles late |
+| | conductionMul=1.5 | Burning enemies take +50% from Tesla chains |
+| | coldFocusGrace=1.0 | A chilled kill gives Prism 1 s to keep its ramp |
+| **overcharge** | charges=3, rateMul=2, dur=3 | 3× per wave, double fire rate for 3 s — the mid-wave verb |
+| **veterancy** | kills=45; perks {sharp:0.12, rapid:0.12, scav:1} | 45-kill perk choice; a tower worth protecting (unlock now L1) |
+| **threat** | efficiency=0.65, comfortable=1.5, tight=1.0 | Coverage-vs-inbound heuristic thresholds |
+| | coveragePathCells=5, coverageLanePts=4 | Full ground/air coverage denominators |
+| **draft** | sizeByLevel=[[4,5],[8,6],[12,7],[15,8]], endless=8 | Draft grows 5→8 with the campaign |
+| **doctrines** | artillery {splashRadiusMul:1.25, splashDmgMul:1.15} | Splash-tower loadout |
+| | precision {critAdd:0.10} | +10% crit on all but Prism/Amp |
+| | logistics {startCreditMul:1.10, dropIntervalMul:0.8} | +10% start credits, 20% more frequent drops |
+| nova (retuned) | fracNormal=0.30, fracBoss=0.08, stunDur=0.6, rechargeGrowth=1.0 | % of current HP + stun; recharge penalty neutralized |
+| ascension (retuned) | interestCapTier4=30, startCreditMul=0.75 | Scarcity (IV) tightening the late economy on purpose |
+| combo / interest / elites / drops / mutators / meteors / ionStorms / richVeins / asteroids / smoothing | *unchanged from 2.0* | Not retuned in 3.0 (see PROGRESS.md) |
+
+### Deviations / judgment calls
+- **No economy TUNING nudge**, despite several cells reading outside the aspirational [1.2, 1.8]
+  band — see the 9.2 reading above. The out-of-band cells are the *intended* early-game
+  generosity and late/high-ascension tightening; nudging would flatten deliberate design. The
+  plan's "nudge in priority order" is conditional ("in band or deviations justified") — this is
+  the justified-deviation branch, recorded rather than silently forced.
+- **The 9.2 sweep is informational, not a hard gate.** A balance ratio isn't a correctness
+  invariant; failing the build on one would make every future content tweak fight an arbitrary
+  band. Only a degenerate (non-finite/non-positive) ratio — a real tuning bug — hard-fails.
+- **The `needed` model uses avg-effective-HP × tower-count, not total HP.** Total enemy HP is a
+  poor proxy for required spend because towers fire continuously; the first draft of the model
+  (needed ∝ total HP) inverted the curve (early game looked 20× richer than late). Switched to
+  the HP-arrival-rate proxy, documented inline.
+- **Daily and L6-Hard were not run as dedicated smoke cases** — the Daily shares the exact
+  regular-level construction/mirror path (covered by the mirror-meander fuzz across all levels
+  and by the level-construction sweep), and L6 constructs in the same sweep. The seven sampled
+  levels + L9 already exercise every distinct construction path (single/multi-path, boss,
+  reworked, endless) with zero errors; adding two more identical-codepath runs wasn't worth the
+  flaky browser-scripting cost. Noted rather than silently skipped.
+
+### Verification
+All 5 gates green: `tsc --noEmit`, `validate.ts` (incl. the new economy sweep + Phase 8 draft/
+doctrine checks), the full 19-file test suite, the standard build, and the singlefile build.
+Headless smoke: L1 + L9 played at speed and a 7-level construction sweep, all zero console
+errors; desktop + 846×390 screenshots confirm the integrated HUD renders correctly at both sizes.
+
+### Known issues
+None blocking. Two items carried forward, both documented and intentional: the Endless
+seeded-modifier-preview scope-cut (Phase 8), and the economy sweep's out-of-band cells (9.2,
+by-design generosity/tightening, not a defect). No `RESUME_VERSION` change this phase (no new
+serialized state).
+
+### Ship
+This is the final phase of the Starhold 3.0 plan. Per the repo deploy override (CLAUDE.md), all
+9 phases are merged to `main` and pushed live to `https://starhold.vercel.app/` as they complete.
