@@ -24,11 +24,10 @@
   font-family: 'Nunito', system-ui, sans-serif;
 }
 
-/* Chroma palette — unlocked by earning all 28 challenge stars. Pure re-theme via the same
-   custom properties everything else already uses, so every panel/button/HUD element picks
-   it up automatically. Scoped to the game-world canvas rendering NOT included (that stays
-   the original pastel palette — re-theming hundreds of hardcoded canvas draw calls wasn't
-   worth it for a cosmetic UI-chrome prestige reward). */
+/* Chroma palette — unlocked by earning all 28 challenge stars. Re-themes every panel/button/
+   HUD element via these custom properties. Phase 3B also routes the canvas board's tower/
+   enemy colors through their own PALETTE.chroma table (see data.ts/game.ts Game.pal()), so
+   toggling this now re-themes the whole game, not just the chrome around it. */
 body.chroma-theme {
   --space-0: #1a1030;
   --space-1: #241640;
@@ -647,6 +646,7 @@ body.perf-mode #cell-tip { backdrop-filter: none; -webkit-backdrop-filter: none;
 #side-panel h3 { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
 #side-panel .sp-lvl { font-size: 12px; color: var(--ink-dim); font-weight: 700; }
 #side-panel .sp-desc { font-size: 13px; color: var(--ink-dim); line-height: 1.4; }
+#side-panel .sp-warn { font-size: 12px; font-weight: 700; color: var(--danger); margin-top: 2px; }
 #side-panel .sp-cell-chip {
   display: inline-block; align-self: flex-start; font-family: 'Fredoka'; font-size: 11px; font-weight: 600;
   color: var(--sky); background: rgba(160,216,239,0.12); border: 1px solid rgba(160,216,239,0.3);

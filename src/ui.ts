@@ -1,5 +1,5 @@
 // ================= UI layer =================
-import { TOWERS, META, ABILITIES, ZONES, ENEMIES, TowerSpec, EnemySpec, airClass, setUnlockedLevel, fmt, isUnlocked, MUTATORS, MODIFIER_INFO, CHALLENGE_POOL, CELL_TYPES, TUNING } from './data';
+import { TOWERS, META, ABILITIES, ZONES, ENEMIES, PALETTE, TowerSpec, EnemySpec, airClass, setUnlockedLevel, fmt, isUnlocked, MUTATORS, MODIFIER_INFO, CHALLENGE_POOL, CELL_TYPES, TUNING } from './data';
 import { LEVELS, ENDLESS_LEVEL, LevelSpec } from './levels';
 import { Game, Tower, Enemy, W, H } from './game';
 import { audio } from './audio';
@@ -702,6 +702,11 @@ export class UI {
     mkToggle('Reduce motion', 'reduceMotion', () => {
       if (this.game) this.game.reduceMotion = s.reduceMotion;
     });
+    mkToggle('Accessible palette', 'accessiblePalette', () => {
+      // Wins over Chroma for the board (see Game.pal()) — pushes tower/enemy value
+      // separation harder and avoids red/green pairs. Applies live, no restart needed.
+      if (this.game) this.game.accessiblePalette = s.accessiblePalette;
+    });
     if (this.save.chromaUnlocked) {
       const chromaRow = el('div', 'set-row', `<span>✦ Chroma palette</span>`);
       const chromaTg = el('button', `toggle${this.save.chromaOn ? ' on' : ''}`);
@@ -709,6 +714,7 @@ export class UI {
         this.save.chromaOn = !this.save.chromaOn;
         chromaTg.classList.toggle('on');
         document.body.classList.toggle('chroma-theme', this.save.chromaOn);
+        if (this.game) this.game.chromaOn = this.save.chromaOn;
         this.persist();
         audio.ui('click');
       };
@@ -1176,6 +1182,8 @@ export class UI {
     game.damageNumbersOn = this.save.settings.damageNumbers !== false;
     game.reduceFlash = !!this.save.settings.reduceFlash;
     game.reduceMotion = !!this.save.settings.reduceMotion;
+    game.chromaOn = !!this.save.chromaOn;
+    game.accessiblePalette = !!this.save.settings.accessiblePalette;
     game.onToast = (key, text) => this.toastOnce(key, text);
     game.onWaveClear = () => this.saveResumeSnapshot();
     game.onPerfDrop = () => {
@@ -1239,6 +1247,7 @@ export class UI {
         t.mode = rt.mode as any; t.spent = rt.spent;
         t.dmgDealt = rt.dmgDealt; t.kills = rt.kills; t.creditsEarned = rt.creditsEarned; t.vein = rt.vein;
         t.applyCellType(cellInfo.special);   // grid is deterministic given the snapshot's tileSize/meander
+        game.recomputeCoverage(t);   // Phase 3B.4 — resume is one of the "grid rebuild" triggers
         game.towers.push(t);
         game.occupied[rt.cell] = t;
       }
@@ -1807,7 +1816,7 @@ export class UI {
         if (boss) {
           const name = this.hudRefs.bossName as HTMLElement;
           const label = `${boss.spec.name}${boss.bossPhase === 2 ? ' — PHASE 2' : ''}`;
-          if (name.textContent !== label) { name.textContent = label; name.style.color = boss.spec.color; }
+          if (name.textContent !== label) { name.textContent = label; name.style.color = g.palEnemy(boss.spec.id)[0]; }
           (this.hudRefs.bossFill as HTMLElement).style.width = `${Math.max(0, (boss.hp / boss.maxHp) * 100)}%`;
           (this.hudRefs.bossShield as HTMLElement).style.width = boss.maxShield > 0 ? `${(boss.shield / boss.maxShield) * 100}%` : '0%';
         }
@@ -1899,7 +1908,7 @@ export class UI {
       this.root.append(tip);
     }
     const rows: string[] = [];
-    rows.push(`<div class="et-name" style="color:${e.spec.color}">${e.spec.name}</div>`);
+    rows.push(`<div class="et-name" style="color:${(g ? g.palEnemy(e.spec.id) : PALETTE.default.enemies[e.spec.id])[0]}">${e.spec.name}</div>`);
     if (e.isElite) {
       const names: Record<string, string> = { shielded: 'Shielded (30% shield)', swift: 'Swift (+30% speed)', vampiric: 'Vampiric (heals nearby)' };
       const affixText = e.eliteAffixes.map(a => names[a]).join(' + ');
@@ -2048,8 +2057,11 @@ export class UI {
     panel.id = 'side-panel';
     const s = t.stats(g);
     const base = t.baseStats(g);
-    panel.append(el('h3', '', `<span style="color:${t.spec.color}">●</span> ${t.displayName}`));
+    panel.append(el('h3', '', `<span style="color:${g.palTower(t.spec.id)[0]}">●</span> ${t.displayName}`));
     panel.append(el('div', 'sp-desc', s.desc));
+    if (!!t.raw.groundOnly && t.pathCellsInRange === 0) {
+      panel.append(el('div', 'sp-warn', "⚠ Can't reach the road from here."));
+    }
     if (t.cellType) {
       const info = CELL_TYPES[t.cellType];
       const detail = t.cellType === 'ridge' ? '+1 range, −15% rate'

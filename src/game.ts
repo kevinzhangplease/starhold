@@ -1,5 +1,5 @@
 // ================= Starhold engine (unified grid, top-down) =================
-import { TOWERS, ENEMIES, ABILITIES, ZONES, LANDMARKS, LandmarkSpec, TowerSpec, StageStats, EnemySpec, TUNING, isUnlocked, MUTATORS, MODIFIER_INFO, fmt } from './data';
+import { TOWERS, ENEMIES, ABILITIES, ZONES, LANDMARKS, LandmarkSpec, PALETTE, TowerSpec, StageStats, EnemySpec, TUNING, isUnlocked, MUTATORS, MODIFIER_INFO, fmt } from './data';
 import { LevelSpec, WaveGroup } from './levels';
 import { mulberry32, hashString, seededInt } from './rng';
 import { audio } from './audio';
@@ -139,6 +139,17 @@ function applyMeander(cellsPts: CPt[], tier: number, cols: number, rows: number)
 }
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const rand = (a: number, b: number) => a + Math.random() * (b - a);
+// Blends two '#rrggbb' hex colors — used for the on-hit white flash, so continuous/DoT ticks
+// (Phase 3B.5) can pop at reduced strength instead of a hard binary swap to white.
+function mixHex(a: string, b: string, t: number): string {
+  if (t <= 0) return a;
+  if (t >= 1) return b;
+  const pa = parseInt(a.slice(1), 16), pb = parseInt(b.slice(1), 16);
+  const ar = (pa >> 16) & 255, ag = (pa >> 8) & 255, ab = pa & 255;
+  const br = (pb >> 16) & 255, bg = (pb >> 8) & 255, bb = pb & 255;
+  const r = Math.round(ar + (br - ar) * t), g = Math.round(ag + (bg - ag) * t), bl = Math.round(ab + (bb - ab) * t);
+  return `#${((1 << 24) + (r << 16) + (g << 8) + bl).toString(16).slice(1)}`;
+}
 
 class Path {
   pts: number[][];
@@ -200,6 +211,11 @@ export class Enemy {
   phase2BaseSpeed = 0;              // colossus phase-2: speed growth cap reference
   dmgAccum = 0;                     // damage-number batching
   dmgFlushAt = 0;
+  // --- physical hit feedback (Phase 3B.5) --- purely visual, never touches actual position
+  flashStrength = 1;                // white-flash blend on this hit: 1 full, <1 for continuous/DoT ticks
+  hitNudgeX = 0; hitNudgeY = 0; hitNudgeUntil = 0;   // 2px positional nudge along the hit direction
+  hitSquashUntil = 0;                // brief extra squash impulse layered on the ambient wobble squash
+  hadShieldBreak = false;            // set once by Game.shieldBreak() — chains into deathFx's aegis case
 
   constructor(spec: EnemySpec, path: Path, pathIdx: number, hpMul: number, rewardMul: number, flyFrom?: { x: number; y: number }, flyTo?: { x: number; y: number }) {
     this.spec = spec;
@@ -322,7 +338,7 @@ export class Enemy {
       if (this.minionT > this.spec.spawnMinion.every) {
         this.minionT = 0;
         for (let i = 0; i < this.spec.spawnMinion.count; i++) game.spawnAt(this.spec.spawnMinion.id, this);
-        game.ringFx(this.x, this.y, 44, this.spec.color);
+        game.ringFx(this.x, this.y, 44, game.palEnemy(this.spec.id)[0]);
       }
     }
     if (this.spec.emp) {
@@ -397,6 +413,17 @@ export class Enemy {
     }
     this.dmgAccum += amount;
     this.flashT = 0.08;
+    // Continuous/DoT ticks (silent=true: burns, auras, beams, patches) flash at reduced
+    // strength — a full-white pop every single tick of a multi-second burn would be noise,
+    // not signal. Direct hits (bullets, splash, chain) keep the full pop.
+    this.flashStrength = silent ? 0.4 : 1;
+    if (src && !game.reduceMotion) {
+      const dx = this.x - src.x, dy = this.y - src.y;
+      const len = Math.hypot(dx, dy) || 1;
+      this.hitNudgeX = (dx / len) * 2; this.hitNudgeY = (dy / len) * 2;
+      this.hitNudgeUntil = game.now + 0.08;
+    }
+    this.hitSquashUntil = game.now + 0.12;
     if (!silent) audio.hit();
     if (this.hp <= 0) { this.dead = true; game.onKill(this); }
   }
@@ -429,6 +456,9 @@ export class Tower {
   beamTargets: Enemy[] = [];
   bDmg = 0; bRate = 0; bRange = 0; bCrit = 0;
   auraPulse = Math.random() * 6;
+  // --- idle & uncovered feedback (Phase 3B.4) ---
+  pathCellsInRange = 0;   // cached; recomputed on build/move/upgrade/grid-rebuild (Game.recomputeCoverage)
+  noTargetSince = -1;     // game-time the tower last had no target/beam/aura-hit; -1 while actively engaged
 
   constructor(spec: TowerSpec, x: number, y: number) {
     this.spec = spec; this.x = x; this.y = y;
@@ -534,6 +564,15 @@ export class Game {
   bossVignetteUntil = 0;           // red edge pulse during boss entrances
   reduceFlash = false;             // accessibility (set by UI)
   reduceMotion = false;            // accessibility (set by UI)
+  chromaOn = false;                // set by UI from settings — board palette variant (Phase 3B)
+  accessiblePalette = false;       // set by UI from settings — wins over chromaOn when both are on
+  // Active tower/enemy palette variant, resolved from settings: accessiblePalette > chromaOn >
+  // default. Every canvas draw of tower/enemy color routes through this (or palTower/palEnemy
+  // below) instead of reading spec.color/color2 directly, so re-theming touches the whole
+  // board, not just HUD chrome.
+  pal() { return this.accessiblePalette ? PALETTE.accessible : this.chromaOn ? PALETTE.chroma : PALETTE.default; }
+  palTower(id: string): [string, string] { return this.pal().towers[id] || PALETTE.default.towers[id]; }
+  palEnemy(id: string): [string, string] { return this.pal().enemies[id] || PALETTE.default.enemies[id]; }
   // --- NOVA --- // SERIALIZE: novaCharge, novaNeed, novaFireAt
   novaCharge = 0;
   novaNeed: number = TUNING.nova.killsToCharge;
@@ -1166,6 +1205,16 @@ export class Game {
     return this.circCell(t.x, t.y, R, this.colOf(e.x), this.rowOf(e.y));
   }
 
+  // Count of path cells within a tower's current range (Phase 3B.4) — recomputed on
+  // build/move/upgrade/grid-rebuild, never per-frame. Phase 6's threat-readout coverage
+  // math is meant to reuse this exact helper, so it stays a plain, self-contained scan.
+  recomputeCoverage(t: Tower) {
+    const R = t.rangeT();
+    let n = 0;
+    for (const c of this.cells) if (c.path && this.circCell(t.x, t.y, R, c.col, c.row)) n++;
+    t.pathCellsInRange = n;
+  }
+
   // ---------- economy ----------
   costOf(spec: TowerSpec) { return this.devFree ? 0 : Math.round(spec.stages[0].cost * this.metaCostMul); }
   upgradeCost(stat: StageStats) { return this.devFree ? 0 : Math.round(stat.cost * this.metaCostMul); }
@@ -1204,6 +1253,7 @@ export class Game {
     this.credits += payout;
     t.spent = Math.max(0, t.spent - refund);
     t.rampT = 0; t.cool = Math.min(t.cool, 1);
+    this.recomputeCoverage(t);   // a refunded node can shrink range back down (Phase 3B.4)
     audio.ui('sell');
     this.floater(t.x, t.y - 30, `+${payout} refunded`, '#fff3b0');
     this.parts.push({ x: t.x, y: t.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 40, color: '#ffb3c6', kind: 'ring' });
@@ -1372,7 +1422,7 @@ export class Game {
       e.d = near.spec.flying ? this.nearestPathD(near) : near.d;
     }
     this.enemies.push(e);
-    this.spark(near.x, near.y, spec.color, 8);
+    this.spark(near.x, near.y, this.palEnemy(spec.id)[0], 8);
   }
   nearestPathD(near: Enemy) {
     let best = 0, bd = Infinity;
@@ -1423,12 +1473,12 @@ export class Game {
         this.portalFx(e);
         if (this.level.newEnemy && s.e === this.level.newEnemy.id && !this.seenNewEnemy) {
           this.seenNewEnemy = true;
-          this.onBanner(`New foe: ${spec.name}`, spec.color, 'medium', spec.desc);
+          this.onBanner(`New foe: ${spec.name}`, this.palEnemy(spec.id)[0], 'medium', spec.desc);
         }
         if (spec.boss) {
           this.shake(isUnlocked('boss_theater') ? 10 : 6);
           if (isUnlocked('boss_theater')) {
-            this.parts.push({ x: e.x, y: e.y, vx: 0, vy: 0, life: 0.6, max: 0.6, size: spec.size * 4, color: spec.color, kind: 'ring' });
+            this.parts.push({ x: e.x, y: e.y, vx: 0, vy: 0, life: 0.6, max: 0.6, size: spec.size * 4, color: this.palEnemy(spec.id)[0], kind: 'ring' });
             for (let k = 0; k < 14; k++) this.smoke(e.x + rand(-spec.size, spec.size), e.y + rand(-spec.size * 0.6, spec.size * 0.6));
             audio.explosion('big');
           }
@@ -1631,7 +1681,14 @@ export class Game {
     }
     this.conduitTarget = conduitLeader ? conduitLeader.target : null;
 
-    for (const t of this.towers) this.updateTower(t, dt, now);
+    for (const t of this.towers) {
+      this.updateTower(t, dt, now);
+      // Idle feedback (Phase 3B.4): amp towers have no "target" concept and EMP-disabled
+      // towers already show their own "⚡ EMP" indicator, so both are exempt.
+      if (t.spec.kind === 'amp' || now < t.disabledUntil) { t.noTargetSince = -1; continue; }
+      if (t.target) t.noTargetSince = -1;
+      else if (t.noTargetSince < 0) t.noTargetSince = now;
+    }
     this.updateProjs(dt, now);
 
     for (const p of this.patches) {
@@ -1687,12 +1744,18 @@ export class Game {
     if (t.spec.kind === 'amp' || disabled) { t.beamTargets = []; return; }
 
     if (s.aura) {
+      // Auras don't target in the normal sense, but t.target still doubles as the idle-dim
+      // signal (Phase 3B.4) — set to whatever's in range so an aura with nothing nearby
+      // reads as idle just like any other tower, without touching its actual (target-less) damage loop.
+      let anyInRange: Enemy | null = null;
       for (const e of this.enemies) {
         if (!e.dead && this.inRangeT(t, e, R)) {
+          anyInRange = e;
           e.applySlow(s.slow!, 0.3, now);
           if (s.dmg > 0 && dt > 0) e.hurt(s.dmg * dt, this, true, t);
         }
       }
+      t.target = anyInRange;
       return;
     }
 
@@ -1724,7 +1787,7 @@ export class Game {
         if (dt > 0 && Math.random() < dt * 2.2) audio.shoot('prism');
         if (dt > 0 && Math.random() < dt * 10) {
           const e = targets[0];
-          this.spark(e.x + rand(-5, 5), e.y + rand(-5, 5), t.spec.color, 1);
+          this.spark(e.x + rand(-5, 5), e.y + rand(-5, 5), this.palTower(t.spec.id)[0], 1);
         }
       }
       return;
@@ -1772,7 +1835,7 @@ export class Game {
     const e = t.target!;
     const bx = t.x + Math.cos(t.angle) * 14 * this.k, by = t.y + Math.sin(t.angle) * 14 * this.k;
     t.recoil = 1;
-    this.flash(bx, by, t.spec.color);
+    this.flash(bx, by, this.pal().muzzle);
     switch (t.spec.kind) {
       case 'bullet': {
         audio.shoot(s.rate > 2.4 ? 'gatling' : (s.pierce ? 'lance' : 'pulse'));
@@ -1783,7 +1846,7 @@ export class Game {
         const a = Math.atan2(py - by, px - bx);
         this.projs.push({
           kind: 'bullet', owner: t, x: bx, y: by, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed,
-          dmg: s.dmg, color: t.spec.color, pierce: s.pierce || 0, hit: new Set(), life: 1.6,
+          dmg: s.dmg, color: this.palTower(t.spec.id)[0], pierce: s.pierce || 0, hit: new Set(), life: 1.6,
           w: s.pierce ? 5 : 3.4, crit: s.crit, trail: [], target: e,
         });
         break;
@@ -1793,7 +1856,7 @@ export class Game {
         const a = Math.atan2(e.y - by, e.x - bx);
         this.projs.push({
           kind: 'bullet', owner: t, x: bx, y: by, vx: Math.cos(a) * 400, vy: Math.sin(a) * 400,
-          dmg: s.dmg, color: t.spec.color, pierce: 0, hit: new Set(), life: 1.4,
+          dmg: s.dmg, color: this.palTower(t.spec.id)[0], pierce: 0, hit: new Set(), life: 1.4,
           w: 4, slow: s.slow, slowDur: s.slowDur, freeze: s.freeze, trail: [], target: e,
         });
         break;
@@ -1807,7 +1870,7 @@ export class Game {
           this.projs.push({
             kind: 'missile', owner: t, x: bx, y: by, vx: Math.cos(a) * 120, vy: Math.sin(a) * 120,
             speed: 150, target: e, dmg: s.dmg, splash: s.splash || 24, airMul: s.airMul || 1,
-            color: t.spec.color, life: 5, wig: Math.random() * 9, trail: [],
+            color: this.palTower(t.spec.id)[0], life: 5, wig: Math.random() * 9, trail: [],
           });
         }
         break;
@@ -1820,7 +1883,7 @@ export class Game {
         const py = e.y + Math.sin(e.angle) * e.effSpeed(this.now) * T;
         this.projs.push({
           kind: 'shell', owner: t, x0: t.x, y0: t.y, x1: px, y1: py, t: 0, T,
-          dmg: s.dmg, splash: s.splash, color: t.spec.color, arc: 90 + T * 60,
+          dmg: s.dmg, splash: s.splash, color: this.palTower(t.spec.id)[0], arc: 90 + T * 60,
           burnDps: s.burnDps, burnDur: s.burnDur, cluster: s.cluster, stun: s.stun,
         });
         break;
@@ -1843,7 +1906,7 @@ export class Game {
         let px = bx, py = by;
         const falloff = (s.chains || 0) >= 7 ? 0.92 : 0.8;
         hitList.forEach((en, i) => {
-          this.bolts.push({ pts: this.mkBolt(px, py, en.x, en.y), life: 0.14, color: t.spec.color });
+          this.bolts.push({ pts: this.mkBolt(px, py, en.x, en.y), life: 0.14, color: this.palTower(t.spec.id)[0] });
           px = en.x; py = en.y;
           const crit = Math.random() < (s.crit || 0) ? 2.5 : 1;
           en.hurt(s.dmg * Math.pow(falloff, i) * crit, this, false, t);
@@ -1868,10 +1931,10 @@ export class Game {
           if (perp < w + en.spec.size * 0.6) {
             const crit = Math.random() < (s.crit || 0) ? 2.5 : 1;
             en.hurt(s.dmg * crit, this, false, t);
-            this.spark(en.x, en.y, t.spec.color, 2);
+            this.spark(en.x, en.y, this.palTower(t.spec.id)[0], 2);
           }
         }
-        this.rays.push({ x0: bx, y0: by, x1, y1, life: 0.14, max: 0.14, color: t.spec.color, w });
+        this.rays.push({ x0: bx, y0: by, x1, y1, life: 0.14, max: 0.14, color: this.palTower(t.spec.id)[0], w });
         break;
       }
       case 'flame': {
@@ -2051,6 +2114,7 @@ export class Game {
   // ---------- kills / leaks ----------
   deathFx(e: Enemy) {
     const spec = e.spec;
+    const [c1, c2] = this.palEnemy(spec.id);
     const push = (p: Partial<Particle> & { life: number; max: number; size: number; color: string; kind: Particle['kind'] }) =>
       this.parts.push({ x: e.x, y: e.y, vx: 0, vy: 0, ...p } as Particle);
     switch (spec.id) {
@@ -2059,46 +2123,64 @@ export class Game {
         for (let i = 0; i < 10; i++) {
           const a = e.angle + rand(-0.5, 0.5);
           const sp = rand(160, 340);
-          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.2, 0.45), max: 0.45, size: rand(1.6, 3.2), color: i % 2 ? spec.color : '#ffffff', kind: 'spark' });
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.2, 0.45), max: 0.45, size: rand(1.6, 3.2), color: i % 2 ? c1 : '#ffffff', kind: 'spark' });
         }
-        push({ life: 0.2, max: 0.2, size: spec.size * 1.8, color: spec.color, kind: 'ring' });
+        push({ life: 0.2, max: 0.2, size: spec.size * 1.8, color: c1, kind: 'ring' });
         break;
       }
       case 'brute': case 'colossus': {
-        // heavy, chunky, slow debris + thud
+        // heavy, chunky, slow thud + cracks into rotating shard PLATES in its two palette
+        // tones (Phase 3B.5) — bigger, slower, longer-lived than ordinary debris, so the
+        // body visibly breaks into pieces rather than just sparking.
         this.shake(spec.boss ? 8 : 3.5);
-        for (let i = 0; i < 14; i++) {
-          const a = Math.random() * Math.PI * 2, sp = rand(30, 120);
-          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.6, 1.1), max: 1.1, size: rand(4.5, 8.5), color: Math.random() < 0.6 ? spec.color : spec.color2, kind: 'shard', rot: Math.random() * 6, vr: rand(-4, 4) });
+        const plates = this.perfMode ? 3 : 5;
+        for (let i = 0; i < plates; i++) {
+          const a = (i / plates) * Math.PI * 2 + rand(-0.2, 0.2), sp = rand(40, 95);
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.7, 1.2), max: 1.2, size: rand(9, 15), color: i % 2 ? c1 : c2, kind: 'shard', rot: rand(0, 6), vr: rand(-2.2, 2.2) });
         }
-        push({ life: 0.4, max: 0.4, size: spec.size * 2.4, color: spec.color, kind: 'shock' });
-        for (let i = 0; i < 4; i++) this.smoke(e.x + rand(-10, 10), e.y + rand(-10, 10));
+        const debris = this.perfMode ? 6 : 12;
+        for (let i = 0; i < debris; i++) {
+          const a = Math.random() * Math.PI * 2, sp = rand(30, 120);
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.5, 0.9), max: 0.9, size: rand(3, 6), color: Math.random() < 0.6 ? c1 : c2, kind: 'shard', rot: Math.random() * 6, vr: rand(-4, 4) });
+        }
+        push({ life: 0.4, max: 0.4, size: spec.size * 2.4, color: c1, kind: 'shock' });
+        for (let i = 0; i < (this.perfMode ? 2 : 4); i++) this.smoke(e.x + rand(-10, 10), e.y + rand(-10, 10));
         break;
       }
       case 'swarmling': {
-        for (let i = 0; i < 5; i++) {
-          const a = Math.random() * Math.PI * 2, sp = rand(50, 140);
-          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0.3, max: 0.3, size: 2, color: spec.color, kind: 'spark' });
-        }
+        // a single quick pop ring — cheap, deliberately (Phase 3B.5): they die in dozens,
+        // and the old 5-spark burst added up fast on horde/splitter waves for no extra read.
+        push({ life: 0.18, max: 0.18, size: spec.size * 1.6, color: c1, kind: 'ring' });
         break;
       }
       case 'aegis': {
         // armor shatters like glass
         audio.freezeCrack();
-        for (let i = 0; i < 16; i++) {
+        const shards = this.perfMode ? 8 : 16;
+        for (let i = 0; i < shards; i++) {
           const a = Math.random() * Math.PI * 2, sp = rand(70, 220);
-          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.35, 0.7), max: 0.7, size: rand(2, 4.5), color: i % 3 ? '#bfe3ff' : spec.color, kind: 'shard', rot: Math.random() * 6, vr: rand(-12, 12) });
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.35, 0.7), max: 0.7, size: rand(2, 4.5), color: i % 3 ? '#bfe3ff' : c1, kind: 'shard', rot: Math.random() * 6, vr: rand(-12, 12) });
         }
         push({ life: 0.3, max: 0.3, size: spec.size * 2.4, color: '#bfe3ff', kind: 'ring' });
+        // If the shield broke earlier this life, chain in a second wave of hex-fragment
+        // shards (Phase 3B.5) — longer-lived than the body burst above, so they read as a
+        // beat behind it: the shield failing, then the body giving out.
+        if (e.hadShieldBreak) {
+          const hexN = this.perfMode ? 4 : 8;
+          for (let i = 0; i < hexN; i++) {
+            const a = Math.random() * Math.PI * 2, sp = rand(50, 150);
+            push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.55, 0.85), max: 0.85, size: rand(3, 6), color: '#bfe3ff', kind: 'shard', rot: Math.random() * 6, vr: rand(-8, 8) });
+          }
+        }
         break;
       }
       case 'wisp': case 'mothership': {
         // dissolves into rising sparkles
-        const n = spec.boss ? 34 : 12;
+        const n = spec.boss ? (this.perfMode ? 16 : 34) : (this.perfMode ? 6 : 12);
         for (let i = 0; i < n; i++) {
-          push({ x: e.x + rand(-spec.size, spec.size), y: e.y + rand(-spec.size, spec.size) * 0.6, vx: rand(-18, 18), vy: rand(-90, -30), life: rand(0.5, 1), max: 1, size: rand(1.8, 3.6), color: i % 2 ? spec.color : '#ffffff', kind: 'dot' });
+          push({ x: e.x + rand(-spec.size, spec.size), y: e.y + rand(-spec.size, spec.size) * 0.6, vx: rand(-18, 18), vy: rand(-90, -30), life: rand(0.5, 1), max: 1, size: rand(1.8, 3.6), color: i % 2 ? c1 : '#ffffff', kind: 'dot' });
         }
-        push({ life: 0.35, max: 0.35, size: spec.size * 2, color: spec.color, kind: 'ring' });
+        push({ life: 0.35, max: 0.35, size: spec.size * 2, color: c1, kind: 'ring' });
         break;
       }
       case 'mender': {
@@ -2109,37 +2191,37 @@ export class Game {
         push({ life: 0.45, max: 0.45, size: 95, color: '#c0f5b3', kind: 'ring' });
         for (let i = 0; i < 8; i++) {
           const a = Math.random() * Math.PI * 2, sp = rand(50, 150);
-          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0.5, max: 0.5, size: 3, color: spec.color, kind: 'dot' });
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0.5, max: 0.5, size: 3, color: c1, kind: 'dot' });
         }
         break;
       }
       case 'splitter': {
-        // wet gooey pop (the swarmlings do the rest)
+        // wet gooey pop (the swarmlings do the rest) — split-burst stands, per plan
         for (let i = 0; i < 9; i++) {
           const a = Math.random() * Math.PI * 2, sp = rand(30, 110);
-          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.4, 0.8), max: 0.8, size: rand(4, 8), color: spec.color, kind: 'smoke' });
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.4, 0.8), max: 0.8, size: rand(4, 8), color: c1, kind: 'smoke' });
         }
-        push({ life: 0.3, max: 0.3, size: spec.size * 2.2, color: spec.color, kind: 'ring' });
-        push({ life: 0.45, max: 0.45, size: spec.size * 3, color: spec.color2, kind: 'ring' });
+        push({ life: 0.3, max: 0.3, size: spec.size * 2.2, color: c1, kind: 'ring' });
+        push({ life: 0.45, max: 0.45, size: spec.size * 3, color: c2, kind: 'ring' });
         break;
       }
       case 'phase': {
         // winks out of reality — converging sparks
         for (let i = 0; i < 12; i++) {
           const a = Math.random() * Math.PI * 2, d = rand(18, 34);
-          push({ x: e.x + Math.cos(a) * d, y: e.y + Math.sin(a) * d, vx: -Math.cos(a) * d * 4, vy: -Math.sin(a) * d * 4, life: 0.25, max: 0.25, size: 2.4, color: spec.color, kind: 'spark' });
+          push({ x: e.x + Math.cos(a) * d, y: e.y + Math.sin(a) * d, vx: -Math.cos(a) * d * 4, vy: -Math.sin(a) * d * 4, life: 0.25, max: 0.25, size: 2.4, color: c1, kind: 'spark' });
         }
-        push({ life: 0.3, max: 0.3, size: spec.size * 2, color: spec.color, kind: 'ring' });
+        push({ life: 0.3, max: 0.3, size: spec.size * 2, color: c1, kind: 'ring' });
         push({ life: 0.14, max: 0.14, size: spec.size, color: '#ffffff', kind: 'flash' });
         break;
       }
       default: {
-        const n = clamp(Math.round(spec.size * 0.9), 6, 22);
+        const n = clamp(Math.round(spec.size * (this.perfMode ? 0.5 : 0.9)), 6, this.perfMode ? 12 : 22);
         for (let i = 0; i < n; i++) {
           const a = Math.random() * Math.PI * 2, sp = rand(50, 200) * (spec.boss ? 1.8 : 1);
-          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.35, 0.8), max: 0.8, size: rand(2.5, 5.5), color: Math.random() < 0.6 ? spec.color : spec.color2, kind: 'shard', rot: Math.random() * 6, vr: rand(-9, 9) });
+          push({ vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.35, 0.8), max: 0.8, size: rand(2.5, 5.5), color: Math.random() < 0.6 ? c1 : c2, kind: 'shard', rot: Math.random() * 6, vr: rand(-9, 9) });
         }
-        push({ life: 0.28, max: 0.28, size: spec.size * 2.2, color: spec.color, kind: 'ring' });
+        push({ life: 0.28, max: 0.28, size: spec.size * 2.2, color: c1, kind: 'ring' });
       }
     }
   }
@@ -2305,7 +2387,7 @@ export class Game {
       this.screenFlash(0.5);
       this.buzz([80, 60, 120]);
       audio.explosion('big');
-      this.onBanner(`${e.spec.name} DOWN`, e.spec.color, 'medium');
+      this.onBanner(`${e.spec.name} DOWN`, this.palEnemy(e.spec.id)[0], 'medium');
       for (let i = 0; i < 40; i++) {
         const a = Math.random() * Math.PI * 2, sp = rand(80, 380);
         this.parts.push({ x: e.x, y: e.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.5, 1.3), max: 1.3, size: rand(3, 8), color: ['#a8e6cf', '#ffb3c6', '#fff3b0', '#c5b3f6'][i % 4], kind: 'shard', rot: Math.random() * 6, vr: rand(-10, 10) });
@@ -2459,11 +2541,12 @@ export class Game {
     t.vein = c.vein;
     t.cell = cellIdx; t.col = c.col; t.row = c.row;
     t.applyCellType(c.special);
+    this.recomputeCoverage(t);
     this.towers.push(t);
     this.occupied[cellIdx] = t;
     this.runStats.towersBuilt[spec.id] = (this.runStats.towersBuilt[spec.id] || 0) + 1;
     audio.ui('place');
-    this.parts.push({ x: c.x, y: c.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 40, color: spec.color, kind: 'ring' });
+    this.parts.push({ x: c.x, y: c.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 40, color: this.palTower(spec.id)[0], kind: 'ring' });
     for (let i = 0; i < 8; i++) this.smoke(c.x + rand(-14, 14), c.y + rand(-10, 10));
     this.onHud();
     return true;
@@ -2496,9 +2579,10 @@ export class Game {
     t.vein = c.vein;
     t.applyCellType(c.special);   // move ONTO a special cell picks up its modifier; off drops it
     t.target = null; t.rampT = 0;
+    this.recomputeCoverage(t);
     this.occupied[cellIdx] = t;
     audio.ui('place');
-    this.parts.push({ x: c.x, y: c.y, vx: 0, vy: 0, life: 0.3, max: 0.3, size: 36, color: t.spec.color, kind: 'ring' });
+    this.parts.push({ x: c.x, y: c.y, vx: 0, vy: 0, life: 0.3, max: 0.3, size: 36, color: this.palTower(t.spec.id)[0], kind: 'ring' });
     for (let i = 0; i < 6; i++) this.smoke(c.x + rand(-12, 12), c.y + rand(-8, 8));
     this.moveArmed = null;
     this.pendingMove = null;
@@ -2535,10 +2619,11 @@ export class Game {
     else if (t.stage < 2) t.stage++;
     else { t.branch = branchPick; t.branchStage = 0; audio.ui('branch'); }
     if (t.branch < 0 || t.branchStage !== 0) audio.ui('upgrade');
-    this.parts.push({ x: t.x, y: t.y, vx: 0, vy: 0, life: 0.4, max: 0.4, size: 46, color: t.spec.color, kind: 'ring' });
+    this.recomputeCoverage(t);   // range may have changed with the new stage/branch (Phase 3B.4)
+    this.parts.push({ x: t.x, y: t.y, vx: 0, vy: 0, life: 0.4, max: 0.4, size: 46, color: this.palTower(t.spec.id)[0], kind: 'ring' });
     for (let i = 0; i < 10; i++) {
       const a = Math.random() * Math.PI * 2;
-      this.parts.push({ x: t.x, y: t.y, vx: Math.cos(a) * 90, vy: Math.sin(a) * 90, life: 0.5, max: 0.5, size: 3, color: t.spec.color, kind: 'dot' });
+      this.parts.push({ x: t.x, y: t.y, vx: Math.cos(a) * 90, vy: Math.sin(a) * 90, life: 0.5, max: 0.5, size: 3, color: this.palTower(t.spec.id)[0], kind: 'dot' });
     }
     this.onSelect(); this.onHud();
   }
@@ -2571,7 +2656,10 @@ export class Game {
     }
   }
   flash(x: number, y: number, color: string) {
-    this.parts.push({ x, y, vx: 0, vy: 0, life: 0.08, max: 0.08, size: 12, color, kind: 'flash' });
+    // The muzzle flash is a tower's single brightest moment (Phase 3B.2: towers read cool
+    // and desaturated everywhere else) — sized up from the plain body-color flash it used
+    // to be, and callers now pass the palette's dedicated muzzle token.
+    this.parts.push({ x, y, vx: 0, vy: 0, life: 0.09, max: 0.09, size: 15, color, kind: 'flash' });
   }
   smoke(x: number, y: number) {
     this.parts.push({ x, y, vx: rand(-16, 16), vy: rand(-16, 16), life: rand(0.4, 0.9), max: 0.9, size: rand(4, 9), color: 'rgba(200,205,235,0.25)', kind: 'smoke' });
@@ -2586,6 +2674,7 @@ export class Game {
     this.parts.push({ x, y, vx: 0, vy: 0, life: 0.4, max: 0.4, size: r, color, kind: 'ring' });
   }
   shieldBreak(e: Enemy) {
+    e.hadShieldBreak = true;   // chained into deathFx's aegis case (Phase 3B.5)
     audio.freezeCrack();
     for (let i = 0; i < 10; i++) {
       const a = Math.random() * Math.PI * 2;
@@ -2601,7 +2690,7 @@ export class Game {
   }
   portalFx(e: Enemy) {
     const p = this.portalPx[e.pathIdx] || { x: e.x, y: e.y };
-    this.parts.push({ x: p.x, y: p.y, vx: 0, vy: 0, life: 0.3, max: 0.3, size: 26, color: e.spec.color, kind: 'ring' });
+    this.parts.push({ x: p.x, y: p.y, vx: 0, vy: 0, life: 0.3, max: 0.3, size: 26, color: this.palEnemy(e.spec.id)[0], kind: 'ring' });
   }
 
   // ---------- background ----------
@@ -3139,7 +3228,7 @@ export class Game {
       const frac = 1 - clamp(until / lead, 0, 1); // 0 at lead-in, 1 right at spawn
       const portal = this.portalPx[pi];
       if (!portal) continue;
-      const color = ENEMIES[info.e].color;
+      const color = this.palEnemy(info.e)[0];
       g.save();
       g.translate(portal.x, portal.y);
       g.globalAlpha = (0.15 + frac * 0.55) * flashCap;
@@ -3177,7 +3266,7 @@ export class Game {
       g.globalAlpha = 1;
       if (this.menuHover) {
         const st = this.menuHover.stages[0];
-        this.drawRangeTiles(g, c.col, c.row, st.range, this.menuHover.color, 0.1);
+        this.drawRangeTiles(g, c.col, c.row, st.range, this.palTower(this.menuHover.id)[0], 0.1);
         if (this.menuHover.kind === 'amp') {
           for (const t of this.towers) {
             if (t.spec.kind !== 'amp' && Math.max(Math.abs(t.col - c.col), Math.abs(t.row - c.row)) <= st.range) {
@@ -3229,13 +3318,15 @@ export class Game {
   }
   drawEnemyBody(g: CanvasRenderingContext2D, e: Enemy, r: number, squash: number) {
     const spec = e.spec;
+    const [color, color2] = this.palEnemy(spec.id);
     const shape = spec.shape || 'circle';
     const flap = Math.sin(e.wobble * 3);
+    const flashed = e.flashT > 0 ? mixHex(color, '#ffffff', e.flashStrength) : color;
     g.save();
     g.rotate(e.angle);
     // wings for fliers — flapping, drawn under the body
     if (spec.flying) {
-      g.fillStyle = spec.color2;
+      g.fillStyle = color2;
       for (const side of [-1, 1]) {
         g.save();
         g.rotate(side * (0.35 + flap * 0.28));
@@ -3256,7 +3347,7 @@ export class Game {
       // gooey cluster of blobs
       const lobes = [[0, 0, 1], [-0.55, 0.4, 0.62], [0.5, 0.45, 0.55], [-0.1, -0.55, 0.58]];
       for (const pass of [0, 1]) {
-        g.fillStyle = pass ? (e.flashT > 0 ? '#ffffff' : spec.color) : spec.color2;
+        g.fillStyle = pass ? flashed : color2;
         const grow = pass ? 0 : 2;
         for (const [ox, oy, s] of lobes) {
           g.beginPath();
@@ -3265,14 +3356,23 @@ export class Game {
         }
       }
     } else {
-      g.fillStyle = spec.color2;
+      g.fillStyle = color2;
       this.shapePath(g, shape, (r + 2) * squash, (r + 2) / squash);
       g.fill();
-      g.fillStyle = e.flashT > 0 ? '#ffffff' : spec.color;
+      g.fillStyle = flashed;
       this.shapePath(g, shape, r * squash, r / squash);
       g.fill();
     }
     g.restore();
+    // warm rim-light (Phase 3B.2): a thin arc on the upper-left of the body — the
+    // brightest per-enemy accent, replacing the sheen's job of selling "warm and lit."
+    if (!this.perfMode) {
+      g.globalAlpha = 0.5;
+      g.strokeStyle = this.pal().rim;
+      g.lineWidth = 1.5;
+      g.beginPath(); g.arc(0, 0, r * 0.92, Math.PI * 1.05, Math.PI * 1.65); g.stroke();
+      g.globalAlpha = 1;
+    }
     // sheen
     g.fillStyle = 'rgba(255,255,255,0.3)';
     g.beginPath(); g.ellipse(-r * 0.25, -r * 0.28, r * 0.32, r * 0.22, -0.4, 0, 7); g.fill();
@@ -3398,9 +3498,14 @@ export class Game {
   drawEnemy(g: CanvasRenderingContext2D, e: Enemy) {
     const spec = e.spec;
     const x = e.x, y = e.y;
-    const squash = 1 + Math.sin(e.wobble * 2) * 0.06;
+    // Physical hit feedback (Phase 3B.5): the ambient wobble squash gets a brief extra
+    // impulse right after a hit, and the body nudges 2px along the hit direction — both
+    // pure render-space, never touching actual position/collision.
+    const hitT = this.now < e.hitSquashUntil ? clamp((e.hitSquashUntil - this.now) / 0.12, 0, 1) : 0;
+    const squash = (1 + Math.sin(e.wobble * 2) * 0.06) * (1 - 0.25 * hitT);
+    const nudgeT = this.now < e.hitNudgeUntil ? clamp((e.hitNudgeUntil - this.now) / 0.08, 0, 1) : 0;
     g.save();
-    g.translate(x, y);
+    g.translate(x + e.hitNudgeX * nudgeT, y + e.hitNudgeY * nudgeT);
     if (e.phased) g.globalAlpha = 0.3;
 
     const r = spec.size;
@@ -3440,7 +3545,7 @@ export class Game {
     this.drawEnemyBody(g, e, r, squash);
 
     if (spec.boss) {
-      g.fillStyle = spec.color2;
+      g.fillStyle = this.palEnemy(spec.id)[1];
       for (let i = 0; i < 7; i++) {
         const a = e.angle + Math.PI + (i - 3) * 0.42;
         g.beginPath();
@@ -3505,12 +3610,20 @@ export class Game {
   }
 
   drawTower(g: CanvasRenderingContext2D, t: Tower, ghost = false, part: 'all' | 'pad' | 'body' = 'all') {
-    const c = t.spec.color, c2 = t.spec.color2;
+    const [c, c2] = this.palTower(t.spec.id);
     const disabled = this.now < t.disabledUntil;
+    // Idle & uncovered feedback (Phase 3B.4). Uncovered is the hard warning (ground-only,
+    // zero path coverage — it can never do anything); idle is the soft one (has coverage,
+    // just nothing to shoot at right now). Mutually exclusive with disabled/ghost, and with
+    // each other — uncovered wins since it's the more actionable problem.
+    const uncovered = !ghost && !disabled && !!t.raw.groundOnly && t.pathCellsInRange === 0;
+    const idle = !ghost && !disabled && !uncovered && t.noTargetSince >= 0 && this.now - t.noTargetSince > 1.5;
     g.save();
     g.translate(t.x, t.y);
     g.scale(this.k, this.k);
     if (disabled || ghost) g.globalAlpha = ghost ? 0.6 : 0.55;
+    else if (uncovered) g.globalAlpha = 0.45;
+    else if (idle) g.globalAlpha = 0.75;
 
     if (part !== 'body') {
       // square pad matching the tile — lavender-tinted when amplified
@@ -3729,7 +3842,7 @@ export class Game {
         g.beginPath(); g.arc(0, 0, t.branch === 1 ? 10 : 8, 0, 7); g.fill(); // Overload: fat orb
         g.fillStyle = '#ffffff';
         g.beginPath(); g.arc(-2, -2.4, 2.6, 0, 7); g.fill();
-        if (Math.random() < 0.06 && !ghost) this.spark(t.x + rand(-8, 8) * this.k, t.y + rand(-8, 8) * this.k, c, 1);
+        if (Math.random() < 0.06 && !ghost && !idle) this.spark(t.x + rand(-8, 8) * this.k, t.y + rand(-8, 8) * this.k, c, 1);
         break;
       }
       case 'amp': {
@@ -3856,15 +3969,24 @@ export class Game {
       g.textAlign = 'center';
       g.fillText('⚡ EMP', 0, -28 + Math.sin(this.now * 8) * 2);
     }
+    if (uncovered) {
+      // hard-warning glyph — a groundOnly tower with zero road coverage can never fire.
+      g.globalAlpha = 0.9;
+      g.fillStyle = '#9aa0c8';
+      g.font = '700 11px Nunito';
+      g.textAlign = 'center';
+      g.fillText('zᶻ', 15, -13 + Math.sin(this.now * 2) * 1.5);
+    }
     g.restore();
 
-    // aura pulse squares (grid-consistent) — cryo fields only; amps stay still
-    if (!ghost && t.raw.aura) {
+    // aura pulse squares (grid-consistent) — cryo fields only; amps stay still. Idle towers
+    // (Phase 3B.4) skip the pulse: for an aura, "idle" means nothing's actually in range.
+    if (!ghost && t.raw.aura && !idle) {
       const R = t.rangeT();
       const prog = (t.auraPulse * 0.5) % 1;
       const rad = (R + 0.5) * this.cell * (0.3 + 0.7 * prog);
       g.globalAlpha = (disabled ? 0.4 : 1) * (0.28 * (1 - prog) + 0.05);
-      g.strokeStyle = t.spec.color;
+      g.strokeStyle = this.palTower(t.spec.id)[0];
       g.lineWidth = 2;
       g.beginPath(); g.arc(t.x, t.y, rad, 0, 7); g.stroke();
       g.globalAlpha = 1;
@@ -3891,7 +4013,7 @@ export class Game {
       const mult = 1 + ((s.rampMax || 3) - 1) * clamp(t.rampT / (s.rampTime || 3), 0, 1);
       const w = 1.5 + mult * 1.1;
       for (const e of t.beamTargets) {
-        g.strokeStyle = t.spec.color;
+        g.strokeStyle = this.palTower(t.spec.id)[0];
         g.globalAlpha = 0.35;
         g.lineWidth = w * 2.6;
         g.lineCap = 'round';
@@ -3901,7 +4023,7 @@ export class Game {
         g.lineWidth = w;
         g.beginPath(); g.moveTo(t.x, t.y); g.lineTo(e.x, e.y); g.stroke();
         g.globalAlpha = 1;
-        g.fillStyle = t.spec.color;
+        g.fillStyle = this.palTower(t.spec.id)[0];
         g.globalAlpha = 0.6;
         g.beginPath(); g.arc(e.x, e.y, w * 1.8 + Math.sin(this.now * 20) * 1.2, 0, 7); g.fill();
         g.globalAlpha = 1;
@@ -4098,8 +4220,8 @@ export class Game {
     // opening the tower panel. Skipped if this tower is already the real selection below.
     if (this.peekTower && this.peekTower !== this.selected && this.towers.includes(this.peekTower)) {
       const pt = this.peekTower;
-      this.drawRangeTiles(g, pt.col, pt.row, pt.rangeT(), pt.spec.color, 0.14);
-      g.strokeStyle = pt.spec.color;
+      this.drawRangeTiles(g, pt.col, pt.row, pt.rangeT(), this.palTower(pt.spec.id)[0], 0.14);
+      g.strokeStyle = this.palTower(pt.spec.id)[0];
       g.lineWidth = 1.6;
       g.globalAlpha = 0.7;
       const ps = this.cell - 6;
@@ -4108,9 +4230,9 @@ export class Game {
     }
     const t = this.selected;
     if (!t) return;
-    this.drawRangeTiles(g, t.col, t.row, t.rangeT(), t.spec.color, 0.1);
+    this.drawRangeTiles(g, t.col, t.row, t.rangeT(), this.palTower(t.spec.id)[0], 0.1);
     const pulse = 1 + Math.sin(performance.now() / 200) * 0.06;
-    g.strokeStyle = t.spec.color;
+    g.strokeStyle = this.palTower(t.spec.id)[0];
     g.lineWidth = 2;
     const s = (this.cell - 6) * pulse;
     (g as any).beginPath(); (g as any).roundRect(t.x - s / 2, t.y - s / 2, s, s, 9); g.stroke();
@@ -4130,7 +4252,7 @@ export class Game {
       const c = this.cells[pb.cellIdx];
       const ghost = new Tower(pb.spec, c.x, c.y);
       ghost.col = c.col; ghost.row = c.row;
-      this.drawRangeTiles(g, c.col, c.row, ghost.rangeT(), pb.spec.color, 0.14);
+      this.drawRangeTiles(g, c.col, c.row, ghost.rangeT(), this.palTower(pb.spec.id)[0], 0.14);
       this.shadow(g, c.x, c.y, (pb.spec.size + 6) * this.k);
       this.drawTower(g, ghost, true);
       return;
@@ -4140,7 +4262,7 @@ export class Game {
       const pm = this.pendingMove;
       const t = pm.tower;
       const c = this.cells[pm.cellIdx];
-      this.drawRangeTiles(g, c.col, c.row, t.rangeT(), t.spec.color, 0.14);
+      this.drawRangeTiles(g, c.col, c.row, t.rangeT(), this.palTower(t.spec.id)[0], 0.14);
       g.strokeStyle = 'rgba(255,255,255,0.35)';
       g.setLineDash([5, 7]);
       g.beginPath(); g.moveTo(t.x, t.y); g.lineTo(c.x, c.y); g.stroke();

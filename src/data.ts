@@ -201,7 +201,7 @@ const T = (s: Partial<StageStats> & { name: string; desc: string; cost: number }
 
 export const TOWERS: TowerSpec[] = [
   {
-    id: 'pulse', name: 'Pulse', color: '#a8e6cf', color2: '#5fae92', kind: 'bullet', hotkey: '1', size: 17,
+    id: 'pulse', name: 'Pulse', color: '#8fbfae', color2: '#5d8f7f', kind: 'bullet', hotkey: '1', size: 17,
     blurb: 'Fast, cheap, reliable single-target fire.',
     stages: [
       T({ name: 'Pulse Mk I', desc: 'Fires rapid single-target shots.', cost: 90, dmg: 9, rate: 2.2, range: 2 }),
@@ -224,7 +224,7 @@ export const TOWERS: TowerSpec[] = [
     ],
   },
   {
-    id: 'mortar', name: 'Mortar', color: '#ffd3b6', color2: '#d19a72', kind: 'mortar', hotkey: '2', size: 19,
+    id: 'mortar', name: 'Mortar', color: '#c4a894', color2: '#93755f', kind: 'mortar', hotkey: '2', size: 19,
     blurb: 'Lobbed shells with splash. Ground only.',
     stages: [
       T({ name: 'Mortar Mk I', desc: 'Fires shells that deal splash damage. Cannot target flying enemies.', cost: 140, dmg: 24, rate: 0.55, range: 3, splash: 46, groundOnly: true }),
@@ -247,7 +247,7 @@ export const TOWERS: TowerSpec[] = [
     ],
   },
   {
-    id: 'cryo', name: 'Cryo', color: '#a0d8ef', color2: '#6fa5c4', kind: 'cryo', hotkey: '3', size: 17,
+    id: 'cryo', name: 'Cryo', color: '#86b4cc', color2: '#5b84a1', kind: 'cryo', hotkey: '3', size: 17,
     blurb: 'Chills enemies to a crawl.',
     stages: [
       T({ name: 'Cryo Mk I', desc: 'Fires bolts that slow the target by 35% for a short time.', cost: 110, dmg: 5, rate: 1.4, range: 2, slow: 0.35, slowDur: 1.8 }),
@@ -270,7 +270,7 @@ export const TOWERS: TowerSpec[] = [
     ],
   },
   {
-    id: 'missile', name: 'Missile', color: '#ffb3c6', color2: '#c97c92', kind: 'missile', hotkey: '4', size: 18,
+    id: 'missile', name: 'Missile', color: '#c495a6', color2: '#92697c', kind: 'missile', hotkey: '4', size: 18,
     blurb: 'Homing missiles. Deadly to fliers.',
     stages: [
       T({ name: 'Missile Mk I', desc: 'Fires a homing missile that deals splash damage. Deals 2x damage to flying enemies.', cost: 130, dmg: 26, rate: 0.8, range: 3, splash: 26, airMul: 2 }),
@@ -293,7 +293,7 @@ export const TOWERS: TowerSpec[] = [
     ],
   },
   {
-    id: 'tesla', name: 'Tesla', color: '#fff3b0', color2: '#cbbd72', kind: 'tesla', hotkey: '5', size: 17,
+    id: 'tesla', name: 'Tesla', color: '#cfc491', color2: '#9c9260', kind: 'tesla', hotkey: '5', size: 17,
     blurb: 'Chain lightning between packed foes.',
     stages: [
       T({ name: 'Tesla Mk I', desc: 'Fires a bolt that chains to 2 additional nearby enemies.', cost: 150, dmg: 16, rate: 1.1, range: 2, chains: 2 }),
@@ -316,7 +316,7 @@ export const TOWERS: TowerSpec[] = [
     ],
   },
   {
-    id: 'amp', name: 'Amp', color: '#c5b3f6', color2: '#9583c9', kind: 'amp', hotkey: '6', size: 16,
+    id: 'amp', name: 'Amp', color: '#a394cc', color2: '#77699c', kind: 'amp', hotkey: '6', size: 16,
     blurb: 'Buffs every tower in its radius.',
     stages: [
       T({ name: 'Amp Mk I', desc: 'Increases the damage of all towers in range by 15%.', cost: 120, dmg: 0, rate: 0, range: 1, buffDmg: 0.15 }),
@@ -339,7 +339,7 @@ export const TOWERS: TowerSpec[] = [
     ],
   },
   {
-    id: 'prism', name: 'Prism', color: '#ff8fa3', color2: '#c46579', kind: 'prism', hotkey: '7', size: 17,
+    id: 'prism', name: 'Prism', color: '#c47a8d', color2: '#94566a', kind: 'prism', hotkey: '7', size: 17,
     blurb: 'A beam that ramps up the longer it holds.',
     stages: [
       T({ name: 'Prism Mk I', desc: 'Fires a continuous beam that ramps up to 3x damage over 3 seconds while held on one target.', cost: 160, dmg: 14, rate: 0, range: 2, rampMax: 3, rampTime: 3 }),
@@ -362,7 +362,7 @@ export const TOWERS: TowerSpec[] = [
     ],
   },
   {
-    id: 'ray', name: 'Ray', color: '#cdeb8b', color2: '#93b25c', kind: 'ray', hotkey: '8', size: 17,
+    id: 'ray', name: 'Ray', color: '#a8bf78', color2: '#79904c', kind: 'ray', hotkey: '8', size: 17,
     blurb: 'Fires a piercing beam — hits every alien along the line.',
     stages: [
       T({ name: 'Ray Mk I', desc: 'Fires an instant beam that damages every enemy along its line.', cost: 150, dmg: 18, rate: 0.8, range: 3, rayWidth: 9 }),
@@ -385,7 +385,7 @@ export const TOWERS: TowerSpec[] = [
     ],
   },
   {
-    id: 'flame', name: 'Flame', color: '#ffb37d', color2: '#c97f4a', kind: 'flame', hotkey: '9', size: 17,
+    id: 'flame', name: 'Flame', color: '#c4906a', color2: '#925f3d', kind: 'flame', hotkey: '9', size: 17,
     blurb: 'Short-range cone that sets aliens on fire.',
     stages: [
       T({ name: 'Flame Mk I', desc: 'Fires a short cone of fire that ignites enemies, dealing damage over time.', cost: 120, dmg: 4, rate: 1.4, range: 1, burnDps: 14, burnDur: 2.5 }),
@@ -408,7 +408,7 @@ export const TOWERS: TowerSpec[] = [
     ],
   },
   {
-    id: 'sentinel', name: 'Sentinel', color: '#e3b8f9', color2: '#a97fc9', kind: 'bullet', hotkey: '0', size: 16,
+    id: 'sentinel', name: 'Sentinel', color: '#b596cc', color2: '#85689c', kind: 'bullet', hotkey: '0', size: 16,
     blurb: 'Covers half the map. Light hits, huge reach.',
     stages: [
       T({ name: 'Sentinel Mk I', desc: 'Fires at very long range with modest damage.', cost: 110, dmg: 15, rate: 1.0, range: 4 }),
@@ -458,30 +458,92 @@ export interface EnemySpec {
 }
 
 export const ENEMIES: Record<string, EnemySpec> = {
-  drone:    { id: 'drone', shape: 'circle', name: 'Drone', desc: 'The standard invader. No tricks — just keeps coming.', hp: 42, speed: 52, reward: 8, size: 13, color: '#b7c4ff', color2: '#7f8cd6', leak: 1, eyes: 1, counters: ['pulse', 'tesla'] },
-  dart:     { id: 'dart', shape: 'slim', name: 'Dart', desc: 'Fast and fragile. Slips past slow-firing towers.', hp: 26, speed: 98, reward: 9, size: 10, color: '#9ff2e0', color2: '#5fbfa9', leak: 1, eyes: 2, counters: ['pulse', 'cryo'] },
-  brute:    { id: 'brute', shape: 'square', name: 'Brute', desc: 'Slow, heavily armored, and costs 2 integrity if it leaks. Focus fire.', hp: 300, speed: 30, reward: 24, size: 20, color: '#ffb9a3', color2: '#c97f68', leak: 2, eyes: 1, counters: ['prism', 'mortar'] },
-  swarmling:{ id: 'swarmling', shape: 'circle', name: 'Swarmling', desc: 'Tiny and weak, but arrives in floods. Splash and chain damage shine here.', hp: 12, speed: 74, reward: 3, size: 7.5, color: '#ffe08f', color2: '#c9a94f', leak: 1, eyes: 1, counters: ['mortar', 'tesla', 'ray'] },
-  aegis:    { id: 'aegis', shape: 'hex', name: 'Aegis', desc: 'Carries a shield that regenerates if left alone for a few seconds. Keep hitting it.', hp: 130, speed: 44, reward: 20, size: 15, color: '#9fd0ff', color2: '#6e97c9', leak: 1, shield: 0.9, eyes: 1, counters: ['prism', 'pulse'] },
-  wisp:     { id: 'wisp', shape: 'circle', name: 'Wisp', desc: 'Flies straight to your base, ignoring the road entirely. Needs anti-air coverage.', hp: 55, speed: 62, reward: 12, size: 12, color: '#e3c8ff', color2: '#a98cd6', leak: 1, flying: true, eyes: 1, counters: ['missile', 'sentinel'] },
-  raptor:   { id: 'raptor', shape: 'slim', name: 'Raptor', desc: 'A fast flier. If your anti-air lapses, these punish you first.', hp: 40, speed: 118, reward: 14, size: 11, color: '#ffc2e5', color2: '#c983ab', leak: 1, flying: true, eyes: 2, counters: ['missile', 'sentinel'] },
-  mender:   { id: 'mender', shape: 'circle', name: 'Mender', desc: 'Heals everything around it in pulses. Kill it first — set towers to target Strong.', hp: 150, speed: 38, reward: 26, size: 15, color: '#c0f5b3', color2: '#84bd77', leak: 1, healAura: 14, eyes: 1, counters: ['sentinel', 'prism'] },
-  splitter: { id: 'splitter', shape: 'lumpy', name: 'Splitter', desc: 'Bursts into four swarmlings on death. Pop them where your splash can mop up.', hp: 110, speed: 48, reward: 16, size: 16, color: '#ffd9f2', color2: '#c996b6', leak: 1, splits: { id: 'swarmling', count: 4 }, eyes: 3, counters: ['mortar', 'tesla'] },
-  phase:    { id: 'phase', shape: 'diamond', name: 'Phaser', desc: 'Periodically blinks out of reality — untargetable while shimmering. Slow fields still stick.', hp: 95, speed: 58, reward: 22, size: 13, color: '#b0fff4', color2: '#6fc4b8', leak: 1, phase: true, eyes: 1, counters: ['cryo', 'flame'] },
+  drone:    { id: 'drone', shape: 'circle', name: 'Drone', desc: 'The standard invader. No tricks — just keeps coming.', hp: 42, speed: 52, reward: 8, size: 13, color: '#ffb36e', color2: '#cc7f3f', leak: 1, eyes: 1, counters: ['pulse', 'tesla'] },
+  dart:     { id: 'dart', shape: 'slim', name: 'Dart', desc: 'Fast and fragile. Slips past slow-firing towers.', hp: 26, speed: 98, reward: 9, size: 9.5, color: '#ffd166', color2: '#c99b33', leak: 1, eyes: 2, counters: ['pulse', 'cryo'] },
+  brute:    { id: 'brute', shape: 'square', name: 'Brute', desc: 'Slow, heavily armored, and costs 2 integrity if it leaks. Focus fire.', hp: 300, speed: 30, reward: 24, size: 26, color: '#ff8f6e', color2: '#c95c3d', leak: 2, eyes: 1, counters: ['prism', 'mortar'] },
+  swarmling:{ id: 'swarmling', shape: 'circle', name: 'Swarmling', desc: 'Tiny and weak, but arrives in floods. Splash and chain damage shine here.', hp: 12, speed: 74, reward: 3, size: 6.5, color: '#ffe066', color2: '#c9a933', leak: 1, eyes: 1, counters: ['mortar', 'tesla', 'ray'] },
+  aegis:    { id: 'aegis', shape: 'hex', name: 'Aegis', desc: 'Carries a shield that regenerates if left alone for a few seconds. Keep hitting it.', hp: 130, speed: 44, reward: 20, size: 16, color: '#ff9e9e', color2: '#c96a6a', leak: 1, shield: 0.9, eyes: 1, counters: ['prism', 'pulse'] },
+  wisp:     { id: 'wisp', shape: 'circle', name: 'Wisp', desc: 'Flies straight to your base, ignoring the road entirely. Needs anti-air coverage.', hp: 55, speed: 62, reward: 12, size: 12, color: '#ffb3d9', color2: '#c980a8', leak: 1, flying: true, eyes: 1, counters: ['missile', 'sentinel'] },
+  raptor:   { id: 'raptor', shape: 'slim', name: 'Raptor', desc: 'A fast flier. If your anti-air lapses, these punish you first.', hp: 40, speed: 118, reward: 14, size: 10.5, color: '#ff8fb8', color2: '#c95f88', leak: 1, flying: true, eyes: 2, counters: ['missile', 'sentinel'] },
+  mender:   { id: 'mender', shape: 'circle', name: 'Mender', desc: 'Heals everything around it in pulses. Kill it first — set towers to target Strong.', hp: 150, speed: 38, reward: 26, size: 16, color: '#d4e86e', color2: '#a3b53f', leak: 1, healAura: 14, eyes: 1, counters: ['sentinel', 'prism'] },
+  splitter: { id: 'splitter', shape: 'lumpy', name: 'Splitter', desc: 'Bursts into four swarmlings on death. Pop them where your splash can mop up.', hp: 110, speed: 48, reward: 16, size: 17, color: '#ffc09e', color2: '#c98f6e', leak: 1, splits: { id: 'swarmling', count: 4 }, eyes: 3, counters: ['mortar', 'tesla'] },
+  phase:    { id: 'phase', shape: 'diamond', name: 'Phaser', desc: 'Periodically blinks out of reality — untargetable while shimmering. Slow fields still stick.', hp: 95, speed: 58, reward: 22, size: 13, color: '#ffd9a8', color2: '#cca872', leak: 1, phase: true, eyes: 1, counters: ['cryo', 'flame'] },
   // ------- bosses -------
   mothership: {
-    id: 'mothership', shape: 'circle', name: 'THE MOTHERSHIP', desc: 'Zone 1 boss. A flying fortress that continually deploys Wisps as it drifts toward your base.', hp: 2600, speed: 17, reward: 250, size: 34,
-    color: '#d7b6ff', color2: '#9a79cf', leak: 10, flying: true, boss: true,
+    id: 'mothership', shape: 'circle', name: 'THE MOTHERSHIP', desc: 'Zone 1 boss. A flying fortress that continually deploys Wisps as it drifts toward your base.', hp: 2600, speed: 17, reward: 250, size: 40,
+    color: '#ff9ecf', color2: '#c96f9e', leak: 10, flying: true, boss: true,
     spawnMinion: { id: 'wisp', every: 6, count: 2 }, eyes: 3, counters: ['missile', 'sentinel'],
   },
   colossus: {
-    id: 'colossus', shape: 'square', name: 'THE COLOSSUS', desc: 'Zone 2 boss. Half its bulk is regenerating shield, and its EMP pulse disables nearby towers.', hp: 8000, speed: 14, reward: 400, size: 38,
-    color: '#ffb59b', color2: '#c47a5f', leak: 15, boss: true, shield: 0.5, emp: 9, eyes: 1, counters: ['prism', 'mortar'],
+    id: 'colossus', shape: 'square', name: 'THE COLOSSUS', desc: 'Zone 2 boss. Half its bulk is regenerating shield, and its EMP pulse disables nearby towers.', hp: 8000, speed: 14, reward: 400, size: 46,
+    color: '#ff7f5c', color2: '#c9502f', leak: 15, boss: true, shield: 0.5, emp: 9, eyes: 1, counters: ['prism', 'mortar'],
   },
   leviathan: {
-    id: 'leviathan', shape: 'hex', name: 'THE LEVIATHAN', desc: 'The final boss. Shielded, EMP-armed, and spawns Splitters. Bring everything you have.', hp: 16000, speed: 13, reward: 700, size: 42,
-    color: '#9fe8ff', color2: '#5da8c4', leak: 20, boss: true, shield: 0.35,
+    id: 'leviathan', shape: 'hex', name: 'THE LEVIATHAN', desc: 'The final boss. Shielded, EMP-armed, and spawns Splitters. Bring everything you have.', hp: 16000, speed: 13, reward: 700, size: 52,
+    color: '#ffb85c', color2: '#cc8a2e', leak: 20, boss: true, shield: 0.35,
     spawnMinion: { id: 'splitter', every: 8, count: 1 }, emp: 12, eyes: 5, counters: ['prism', 'missile'],
+  },
+};
+
+// ---------- Palette token table (Starhold 3.0 Phase 3B) ----------
+// Every canvas draw of tower/enemy color routes through Game.pal()/palTower()/palEnemy()
+// instead of reading spec.color/color2 directly, so the whole board (not just HUD chrome)
+// re-themes when Chroma or the accessible palette is active. `default` is GENERATED from
+// the TOWERS/ENEMIES spec fields above — edit a tower/enemy's `color`/`color2` there and
+// PALETTE.default picks it up automatically; `chroma`/`accessible` are separate hand-authored
+// tables since they're deliberate departures from those defaults, not derivations of them.
+export interface PaletteVariant {
+  towers: Record<string, [string, string]>;
+  enemies: Record<string, [string, string]>;
+  rim: string;      // enemy warm rim-light (drawEnemyBody)
+  muzzle: string;    // tower muzzle-flash brightest element
+}
+export const PALETTE: Record<'default' | 'chroma' | 'accessible', PaletteVariant> = {
+  default: {
+    towers: Object.fromEntries(TOWERS.map(t => [t.id, [t.color, t.color2] as [string, string]])),
+    enemies: Object.fromEntries(Object.values(ENEMIES).map(e => [e.id, [e.color, e.color2] as [string, string]])),
+    rim: '#fff4e0',
+    muzzle: '#eaffff',
+  },
+  // Cooler teals / magentas — the board half of the Chroma prestige reward (previously
+  // UI-chrome-only; see PROGRESS-3.md for why the old scope-cut is now obsolete).
+  chroma: {
+    towers: {
+      pulse: ['#6ecbc0', '#3f8f86'], mortar: ['#7ec9d6', '#4f8f9c'], cryo: ['#6fb8e8', '#3f7fb5'],
+      missile: ['#9c8fe0', '#6a5cae'], tesla: ['#7ee8c8', '#4fae8f'], amp: ['#b088ff', '#7a52c9'],
+      prism: ['#ff6bb0', '#c93f83'], ray: ['#7ee8e8', '#4fb0b0'], flame: ['#ff8f6b', '#c95c3f'],
+      sentinel: ['#c993ff', '#9660c9'],
+    },
+    enemies: {
+      drone: ['#ff9ecf', '#c96f9e'], dart: ['#ffb3e0', '#c980ab'], brute: ['#ff7a9e', '#c9506f'],
+      swarmling: ['#ffcf6e', '#c99a3f'], aegis: ['#ff9ecc', '#c96e9c'], wisp: ['#e0a3ff', '#ab6fc9'],
+      raptor: ['#ff6bb0', '#c93f83'], mender: ['#b3e86e', '#83b53f'], splitter: ['#ffb0e0', '#c980ab'],
+      phase: ['#d9b0ff', '#a480c9'], mothership: ['#e896ff', '#b060c9'], colossus: ['#ff5c8f', '#c9305f'],
+      leviathan: ['#ff8fd9', '#c95fab'],
+    },
+    rim: '#ffe0f4',
+    muzzle: '#e0fff8',
+  },
+  // Colorblind-accessible: pushes VALUE separation harder than the default split (towers
+  // darker-cool, enemies lighter-warm) and avoids red/green discrimination — mender shifts
+  // toward yellow and ray toward blue-grey per the plan's explicit call-outs. Enemy `shape`
+  // remains the second redundancy channel (validate.ts asserts unique shape/size-band pairs).
+  accessible: {
+    towers: {
+      pulse: ['#6d9885', '#435f52'], mortar: ['#96795c', '#5c4736'], cryo: ['#5c88a1', '#3a5a6e'],
+      missile: ['#96677a', '#5c3f4c'], tesla: ['#a89759', '#6b5e38'], amp: ['#7259a1', '#4a3a6b'],
+      prism: ['#96506b', '#613447'], ray: ['#9fb4c4', '#6b7f8c'], flame: ['#966048', '#5c3a2b'],
+      sentinel: ['#8360a1', '#543f6b'],
+    },
+    enemies: {
+      drone: ['#ffc999', '#ffb36e'], dart: ['#ffe0a3', '#ffd166'], brute: ['#ffb299', '#ff8f6e'],
+      swarmling: ['#ffe999', '#ffe066'], aegis: ['#ffc2c2', '#ff9e9e'], wisp: ['#ffd1ea', '#ffb3d9'],
+      raptor: ['#ffbcdb', '#ff8fb8'], mender: ['#e8d96e', '#c9bb4f'], splitter: ['#ffd7bf', '#ffc09e'],
+      phase: ['#ffe9c9', '#ffd9a8'], mothership: ['#ffc2e2', '#ff9ecf'], colossus: ['#ffab93', '#ff7f5c'],
+      leviathan: ['#ffd191', '#ffb85c'],
+    },
+    rim: '#fffbe8',
+    muzzle: '#f5ffff',
   },
 };
 

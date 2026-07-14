@@ -1,6 +1,6 @@
 // Run with: node --experimental-strip-types validate.ts
 import { LEVELS } from './src/levels.ts';
-import { ENEMIES, TOWERS, META, UNLOCKS, TUNING, fmt, MUTATORS, MODIFIER_INFO, CELL_TYPES, ZONES, CHALLENGE_POOL, LANDMARKS } from './src/data.ts';
+import { ENEMIES, TOWERS, META, UNLOCKS, TUNING, fmt, MUTATORS, MODIFIER_INFO, CELL_TYPES, ZONES, CHALLENGE_POOL, LANDMARKS, PALETTE } from './src/data.ts';
 import { RESUME_VERSION } from './src/resume.ts';
 import { mulberry32, hashString, seededInt, seededPick } from './src/rng.ts';
 // computeDailyOp itself lives in daily.ts, but daily.ts internally imports from './rng' and
@@ -726,6 +726,37 @@ if (!(RESUME_VERSION >= 1 && Number.isInteger(RESUME_VERSION))) err('RESUME_VERS
     }
   }
   console.log(`  (multi-path portal/base merge: ${mergeTrials} level x tile-size x meander combinations checked)`);
+}
+
+// ---- Phase 3B (3.0): visual identity & readability ----
+{
+  const hexRe = /^#[0-9a-f]{6}$/i;
+  const checkPair = (label: string, pair: [string, string] | undefined) => {
+    if (!pair) { err(`${label}: missing from palette`); return; }
+    for (const h of pair) if (!hexRe.test(h)) err(`${label}: invalid hex '${h}'`);
+  };
+  for (const variant of ['default', 'chroma', 'accessible'] as const) {
+    const pal = PALETTE[variant];
+    if (!hexRe.test(pal.rim)) err(`PALETTE.${variant}.rim: invalid hex '${pal.rim}'`);
+    if (!hexRe.test(pal.muzzle)) err(`PALETTE.${variant}.muzzle: invalid hex '${pal.muzzle}'`);
+    for (const t of TOWERS) checkPair(`PALETTE.${variant}.towers.${t.id}`, pal.towers[t.id]);
+    for (const id of Object.keys(ENEMIES)) checkPair(`PALETTE.${variant}.enemies.${id}`, pal.enemies[id]);
+  }
+
+  // Every non-boss enemy needs a unique (shape, size-band, air/ground) triple — the second
+  // redundancy channel behind color, so the accessible palette (which pushes value
+  // separation instead of hue) still leaves every enemy visually distinguishable by
+  // silhouette alone. Flying is included: fliers already render wings + a flight shadow,
+  // a real silhouette difference from a ground unit of the same shape/size, not just a
+  // stat flag — see drawEnemyBody's `spec.flying` wing-drawing branch.
+  const sizeBand = (s: number) => s < 9 ? 'xs' : s < 12 ? 's' : s < 15 ? 'm' : s < 20 ? 'l' : 'xl';
+  const seen = new Map<string, string>();
+  for (const e of Object.values(ENEMIES)) {
+    if (e.boss) continue;
+    const key = `${e.shape || 'circle'}/${sizeBand(e.size)}/${e.flying ? 'air' : 'ground'}`;
+    if (seen.has(key)) err(`Enemies '${seen.get(key)}' and '${e.id}' share (shape, size-band, air/ground) = ${key} — not distinguishable by silhouette alone`);
+    else seen.set(key, e.id);
+  }
 }
 
 console.log(errors ? `\n${errors} error(s)` : '\nAll checks passed ✓');

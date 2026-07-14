@@ -35,6 +35,7 @@ export interface SaveData {
     pauseOnBuild: boolean; meander: number; haptics: boolean;
     damageNumbers: boolean; reduceFlash: boolean; reduceMotion: boolean;
     perfMode: 'auto' | 'on' | 'off';
+    accessiblePalette: boolean;      // colorblind-accessible tower/enemy board palette (Phase 3B)
   };
 }
 
@@ -73,7 +74,7 @@ export const defaultSave = (): SaveData => ({
   chromaOn: false,
   lastSpeed: 1,
   defaultTargeting: 'first',
-  settings: { master: 0.8, music: true, weapons: true, explosions: true, ui: true, shake: true, tileSize: 48, difficulty: 2, length: 2, pauseOnBuild: true, meander: 0, haptics: true, damageNumbers: true, reduceFlash: false, reduceMotion: false, perfMode: 'auto' },
+  settings: { master: 0.8, music: true, weapons: true, explosions: true, ui: true, shake: true, tileSize: 48, difficulty: 2, length: 2, pauseOnBuild: true, meander: 0, haptics: true, damageNumbers: true, reduceFlash: false, reduceMotion: false, perfMode: 'auto', accessiblePalette: false },
 });
 
 // Idempotent: running on an already-migrated save changes nothing.

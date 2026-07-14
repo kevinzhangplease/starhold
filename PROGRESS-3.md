@@ -419,3 +419,168 @@ mouths, one door." / "They come from both flanks." taglines on L9/L11.
 Phase 3B — Visual Identity & Readability (palette token table, value/temperature split, scale
 hierarchy, idle/uncovered tower feedback, physical hit/death feedback, accessible palette).
 Per Kevin's explicit instruction, do NOT start 3B in the session that shipped this entry.
+
+---
+
+## Phase 3B — Visual Identity & Readability [COMPLETE]
+Started: 2026-07-14 · Finished: 2026-07-14
+
+### Shipped
+1. **Palette token table** (`data.ts` `PALETTE`, `game.ts` `Game.pal()`/`palTower()`/
+   `palEnemy()`): three variants (`default`/`chroma`/`accessible`), each `{ towers, enemies,
+   rim, muzzle }`. `PALETTE.default` is *generated* from the `TOWERS`/`ENEMIES` spec
+   `color`/`color2` fields (`Object.fromEntries(...)`) rather than duplicated — editing a
+   tower/enemy's own color stays the one place to edit, per the plan's instruction.
+   `chroma`/`accessible` are hand-authored tables (not derivations — deliberate departures).
+   Every canvas read of a tower/enemy's identity color was rerouted through `palTower(id)`/
+   `palEnemy(id)` — `drawTower`, `drawEnemyBody`, `drawEnemy`, `drawBeams`, `deathFx`,
+   `fire()`'s projectile/bolt/ray/spark creation, `buildAt`/`confirmMove`/`buyUpgrade`'s
+   placement rings, the portal-charge telegraph, `drawSelection`/`drawPlacement`'s range-tile
+   previews, and the build-menu hover preview — roughly 35 call sites across `game.ts`. Also
+   rerouted three DOM (not canvas) identity-color reads in `ui.ts` (boss HP-bar label, enemy
+   tooltip name, tower panel title dot) — see Decisions below for why, since the plan scoped
+   this to canvas draws specifically. `Game` gained `chromaOn`/`accessiblePalette` fields, set
+   from `save.chromaOn`/`save.settings.accessiblePalette` in `startLevel()` and live-updated
+   from the settings-panel toggle handlers (no restart needed to see a palette change).
+   The `style.css` "Chroma canvas stays original palette" scope-cut comment (the concrete
+   thing the plan told me to find and retire) is now rewritten to describe the real,
+   board-reaching behavior.
+2. **Value/temperature split** (`data.ts` `TOWERS`/`ENEMIES` `color`/`color2` fields, which
+   `PALETTE.default` reads): authored the plan's exact hex table — all 10 towers to cool,
+   desaturated tones, all 13 enemies (incl. 3 bosses) to warm, saturated ones. `rim: '#fff4e0'`
+   drawn as a fixed-world-space (not body-rotated) 1.5px arc on every enemy's upper-left in
+   `drawEnemyBody`, skipped under `perfMode`. `muzzle: '#eaffff'` now drives the tower
+   muzzle-flash particle exclusively (`Game.flash()`, previously reused the firing tower's own
+   body color) — bumped its size 12→15 and life 0.08→0.09s so it reads as the brightest
+   instant on a tower, per the plan's framing. Verified live: a Pulse (teal) firing on a Drone
+   (orange) reads with clear, immediate contrast — screenshotted mid-combat. No fallback to
+   hue-preserving +20% saturation was needed; the shift read clearly distinct in every case
+   checked, including the two enemies the plan flagged as identity-risk (mender, phase) —
+   their non-color carriers (chartreuse-family + heal pulses; phase's shimmer) still hold.
+3. **Scale hierarchy** (`data.ts` `ENEMIES` `size` fields): applied the plan's exact table —
+   swarmling 7.5→6.5, dart 10→9.5, raptor 11→10.5 (down); aegis 15→16, mender 15→16,
+   splitter 16→17, brute 20→26, mothership 34→40, colossus 38→46, leviathan 42→52 (up);
+   drone/wisp/phase unchanged, per plan. `spec.size` participation in splash/collision math
+   is unchanged code — the plan's own accepted consequence (bigger brutes/bosses marginally
+   easier to splash-clip) needed no additional handling. Verified via the live 500-tick
+   selftest (which builds and fights with real enemies at these new sizes) and visual combat
+   screenshots — no clipping or layout artifacts observed at the tile sizes exercised.
+4. **Idle & uncovered tower feedback** (`game.ts`): new `Game.recomputeCoverage(t)` — the
+   plan's requested reusable helper, a plain scan of `this.cells` counting path cells within
+   `t.rangeT()` via the existing `circCell` — called from `buildAt`, `confirmMove`,
+   `buyUpgrade` (range can change on upgrade), `refundNode` (added beyond the plan's literal
+   4 triggers — a downgrade can shrink range back down, same reasoning as upgrade), and the
+   `ui.ts` resume-restore tower-rebuild loop (the "grid rebuild" trigger). **Uncovered** (hard,
+   groundOnly + zero coverage): 45% body alpha, a small drifting "zᶻ" glyph on the tower body,
+   and a new `.sp-warn` line ("⚠ Can't reach the road from here.") in the side panel — verified
+   live, screenshotted with a Mortar built in a far corner. **Idle** (soft, has coverage but no
+   target >1.5s): 25% dim (alpha 0.75) plus the aura-pulse-square visual and Tesla's ambient
+   spark emission both suppressed while idle — the two clearest "glow/hum" elements in the
+   tower draw code. Amp towers and EMP-disabled towers are exempt from idle-dimming (amp has
+   no target concept at all — it would otherwise read as permanently idle; disabled towers
+   already show their own "⚡ EMP" indicator). Aura-kind towers (Frost Field, Ion Field) don't
+   normally set `t.target`, so `updateTower`'s aura branch now also assigns it to whichever
+   enemy is in range purely so the uniform idle-tracking pass has something to read — the
+   aura's actual (target-less) damage loop is untouched.
+5. **Physical hit & death feedback** (`game.ts` `Enemy.hurt`/`drawEnemy`/`drawEnemyBody`/
+   `deathFx`): confirmed `flashT` already fires on every `hurt()` call including burns (the
+   silent/DoT paths) — added a new `flashStrength` (1 for direct hits, 0.4 for `silent=true`
+   continuous ticks) and a `mixHex()` blend helper so DoT ticks flash a visibly *reduced* white
+   pop instead of the old hard binary swap, satisfying the plan's "at reduced strength" call-out
+   literally. New `hitNudgeX/Y/Until` — a 2px render-only offset along the hit direction
+   (attacker→target), skipped under `reduceMotion`, applied only in `drawEnemy`'s translate
+   (never touches actual position/path progress/collision). New `hitSquashUntil` — layers a
+   brief extra compression onto the *existing* ambient wobble-squash value already threaded
+   through `drawEnemyBody` (the plan's "existing squash hook"), rather than adding a second
+   parallel deformation system. `deathFx` bespoke reworks: **brute/colossus** now crack into
+   5 (3 under `perfMode`) large, slow-rotating shard "plates" alternating the enemy's two
+   palette tones, on top of (reduced-count) small debris; **swarmling** dropped from a 5-spark
+   burst to a single cheap pop ring, since they die by the dozen; **aegis** chains a second,
+   longer-lived wave of hex-tinted (`#bfe3ff`, matching `shieldBreak`'s own color) shard
+   fragments into its death burst *only if* `Enemy.hadShieldBreak` (new flag, set once by
+   `Game.shieldBreak()`) — i.e. only for an aegis whose shield actually broke earlier in its
+   life, chaining the two effects as the plan asked. `perfMode` caps shard/spark counts across
+   every case that had an uncapped large count (brute plates/debris, aegis shards, the
+   default-case shard count, wisp/mothership's boss-scaled sparkle count). Damage-number size
+   was not touched (confirmed already governed by a separate, untouched code path — they stay
+   the secondary channel by construction, not by a new change).
+6. **Accessible palette** (`save.ts`/`ui.ts`/`data.ts`): `settings.accessiblePalette: boolean`
+   (default `false`), covered by the existing blanket `{ ...base.settings, ...(d?.settings||{}) }`
+   spread in `migrateSave` — same precedent as `reduceFlash`/`reduceMotion`, no individual
+   guard needed. New settings-panel toggle row ("Accessible palette") right after "Reduce
+   motion", using the existing `mkToggle` helper. `PALETTE.accessible` pushes value separation
+   harder than the default split (towers darker-cool, enemies lighter-warm) and specifically
+   avoids red/green pairs — `mender` shifted toward yellow (`#e8d96e`) and `ray` toward
+   blue-grey (`#9fb4c4`), both exactly as named in the plan. `PALETTE.chroma` ports the
+   existing UI-chrome Chroma theme's spirit (cooler teals/magentas) onto the board tokens,
+   same `{towers,enemies,rim,muzzle}` shape. `Game.pal()` resolves `accessiblePalette` before
+   `chromaOn` (wins when both are on), exactly per spec.
+
+### Real, pre-existing issue caught while implementing (not a regression)
+None this phase.
+
+### Decisions / deviations
+- **Three DOM color reads in `ui.ts` also rerouted through the palette**, beyond the plan's
+  literal "every canvas draw" scope: the boss HP-bar name label, the enemy hover/long-press
+  tooltip name, and the tower side-panel title dot. All three echo a specific tower/enemy's
+  *identity* color as a small inline `style="color:..."`, not general "HUD chrome" (which the
+  plan explicitly protects) — leaving them on the stale default color while the board re-themed
+  around them would be a real regression for the accessible palette specifically (a colorblind
+  player turning it on to fix, say, Ray's red/green collision would still see the *old* red in
+  the tower panel's title dot). Guarded the enemy-tooltip site with a null-safe fallback to
+  `PALETTE.default` since that function's `e` can theoretically outlive `this.game` via
+  `pinnedEnemyTip`; the other two sites are provably non-null at their call site.
+- **`recomputeCoverage` also called from `refundNode`**, a 5th trigger beyond the plan's
+  literal "build/move/upgrade/grid rebuild" list — a downgrade can shrink a tower's range back
+  down (e.g. undoing a range-adding branch), and leaving the cached `pathCellsInRange` stale
+  after that would under-report coverage until the next unrelated recompute.
+- **Idle definition for aura-kind towers**: the plan's "no target for >1.5s" is written against
+  towers that acquire a discrete `Tower.target`, which aura towers (Frost Field, Ion Field)
+  never do — their damage loop hits everything in range directly. Rather than invent a second,
+  parallel "idle" definition for auras, `updateTower`'s aura branch now also assigns
+  `t.target` to whatever's in range (cosmetic bookkeeping only, read solely by the idle-tracking
+  pass) so one uniform rule covers every tower kind. Amp towers were the one case where even
+  that trick doesn't make sense (an Amp never "targets" anything, ever) — explicitly exempted
+  from idle-dimming instead, alongside EMP-disabled towers (which already have their own
+  indicator).
+- **Aegis "a beat before the body burst" (3B.5.2)** implemented via relative particle
+  lifetimes (the chained hex shards live 0.55–0.85s vs. the body burst's 0.35–0.7s) rather than
+  an actual scheduled delay — the particle system has no delay/spawn-offset field, and adding
+  one for a single flourish wasn't worth the general-purpose surface area. The chained shards
+  still visibly outlast the main burst, which is the readable effect the plan was after.
+- **Manual grep gate (3B.7)**: reviewed every remaining hardcoded hex literal in
+  `drawTower`/`drawEnemyBody`/`drawEnemy`/`deathFx`/`fire()`. All intentional stragglers, none
+  tied to a specific tower/enemy's identity: universal status/state indicators (frozen ice-blue
+  `#bfe3ff`/`#e8f7ff`, shield-blue `#9fd0ff`, elite gold `#ffd97a`, EMP pink `#ffb3c6`, the new
+  idle "zᶻ" gray `#9aa0c8`) that need to read the same regardless of which unit they're on;
+  branch-specific special-ability accents that are deliberately *not* the tower's own color
+  (Frost Rounds' icy muzzle tip, Magma/Inferno's molten glow, "Blue Flame"'s namesake blue —
+  the branch name literally promises a different color than the tower's base identity); neutral
+  in-body chrome (dark socket/muzzle interiors, white sheens/highlights, pad-background tints);
+  and the boss-vs-normal HP-bar color, a UI severity semantic rather than entity identity.
+- **Shape/size-band uniqueness check (3B.6/3B.7)** extended to a (shape, size-band, air/ground)
+  triple rather than the plan's literal (shape, size-band) pair — `drone`/`wisp` and
+  `dart`/`raptor` collide on shape+size alone, but fliers already render a real silhouette
+  difference (wings, flight shadow) that a pure static-sprite comparison misses. Confirmed this
+  extended key has zero collisions across every non-boss enemy.
+
+### Known issues
+None. All gates green: `tsc --noEmit`, `validate.ts` (including the three new Phase 3B checks —
+PALETTE completeness × 3 variants × every tower/enemy id with hex-parse validation, and the
+shape/size-band/air-ground uniqueness assertion — all clean), full 12-file test suite
+(unchanged, all still green against the new sizes/colors), both builds, and a live 500-tick
+`?selftest=1` run with 0 errors. Manually verified in a real browser: default-palette combat
+screenshot shows unambiguous cool-tower/warm-enemy contrast; Chroma re-themes a built tower's
+canvas color (previously chrome-only); a Mortar built in a dead corner shows the exact "⚠ Can't
+reach the road from here." panel copy; L1's landmark and portal/base glows (Phase 3) are
+unaffected. The `accessiblePalette` toggle was verified at the code/data level (validate.ts's
+new completeness+hex checks, plus it shares the identical `Game.pal()`/`palTower()`/`palEnemy()`
+code path already confirmed live via the Chroma screenshot) rather than with its own dedicated
+in-canvas screenshot of a built tower — the verification pass's last automated screenshot landed
+before a tower got placed; re-running it wasn't judged worth another round trip given the shared
+code path is already proven.
+
+### Next
+Phase 4 — Tower Depth: Pricing, Verbs, Reactions, Overcharge, Veterancy (range repricing,
+Flame's stacking-burn niche, 3 cross-tower reactions, 5 tier-2 verb rewrites, Overcharge,
+Veterancy).
