@@ -952,3 +952,127 @@ impossible rather than merely avoided.
 
 ### Next
 Phase 7 — Audio as a Second Information Channel.
+
+## Phase 7 — Audio as a Second Information Channel [COMPLETE]
+Started: 2026-07-14 · Finished: 2026-07-14
+
+### Shipped
+1. **New `alerts` bus + settings** (`audio.ts`, `save.ts`, `ui.ts`): a 5th toggleable bus
+   (spawn signatures, mender loop, hull groan, last-stand motif) alongside music/weapons/
+   explosions/ui. `AudioSettings.alerts` (default true) rides the existing `defaultSave()`/
+   `migrateSave()` spread pattern — no explicit migration guard needed, same as every prior
+   settings addition. Sound-settings sub-modal gained an "Alert cues — enemy arrivals &
+   warnings" toggle row via the existing generic `mkToggle` helper.
+2. **Enemy spawn signatures** (`audio.ts` `spawnSig(id)`, called from `game.ts`'s spawn-queue
+   processing, `spawnAt` for boss-spawned minions): one short (≤0.25s) timbre per enemy type
+   per the plan's recipe table, throttled with a two-part gate — the same type is coalesced
+   (silenced) for 3s after playing once, and no more than 4 distinct-type signatures play in
+   any 0.5s window, so neither a swarm rush nor a multi-type wave-start burst walls the mix.
+   **Mender presence loop** (7.2.2, the flagship "hear it, don't hunt it" feature): one shared
+   soft rising-shimmer loop (two detuned sines + slow LFO) runs the whole time ≥1 mender is
+   alive, gain scaling with count; started/stopped from a throttled per-tick mender count in
+   `Game.update()`. Visual twin (new, required by the plan): a slow ~1Hz pulsing ring drawn on
+   every `healAura` enemy in `drawEnemy` — verified live in a real browser across a mender's
+   full spawn-to-death lifecycle with zero console errors.
+3. **Continuous pressure-driven intensity** (`audio.ts` `setPressure`, replacing the old
+   boolean `setIntensity`; computed in `game.ts`'s `update()` on a throttled ~0.25s cadence,
+   not every frame): `p = clamp(0.25 + 0.55×lead + 0.2×mass, 0, 1)` where `lead` is the furthest
+   any live enemy has progressed (ground: `d/path.total`; fliers: `fT/fDur`) and `mass` reuses
+   Phase 6's `towerDPS` model (`totalLiveHp / (teamGroundDPS×10)`, capped at 1). Sweeps a new
+   lowpass filter inserted into the music bus's signal path (900Hz↔7kHz), and above `p > 0.7`
+   the arp layer's pluck scheduler independently rolls BOTH offbeat slots per beat instead of
+   one, audibly doubling note density. `danger` (boss alive / hull < 25%) still gates the
+   percussion layer exactly as the old booleans did.
+4. **Kill sounds mapped to mass** (`audio.ts` `pop`): widened and inverted the size→pitch
+   mapping (`clamp(11000/size, 200, 1700)`) so a swarmling reads bright (~1.6kHz) and the range
+   is meaningfully wider than the old narrow band; brute-class kills (size ≥ 20) get an added
+   70Hz sub-thump layer — "furniture falling over." Elites add a short, duller gold `eliteChing`
+   tail on top of `pop` (deliberately NOT the bell timbre, so a shower of elite credits is never
+   confused with the economy register). Bosses unchanged (`explosion('big')`).
+5. **Leak = hull groan** (`audio.ts` `hullGroan`, replacing the Phase 6 `ui('leak')`
+   placeholder): a deliberately unpleasant descending sawtooth (220Hz → `60+120×livesFrac`,
+   using the fraction remaining AFTER the leak) plus a filtered noise knock and a brief 350ms
+   music duck — pitch descends as hull drops, so a leak at 3/20 hull sounds measurably sicker
+   than the same leak at 18/20 (verified via `tests/audio-cues.ts`'s formula replication).
+6. **Silence as contrast + the wave arc** (`audio.ts` `duckAll`, `klaxon(delay)`; `game.ts`):
+   a general `duckAll(depth, holdMs, releaseMs)` ducks the master gain and is used by NOVA's
+   buildup (duck to 0.15, release timed to land at the blast) and the boss klaxon (400ms of
+   near-silence before the klaxon fires, scheduled sample-accurately via `klaxon`'s new `delay`
+   param rather than a drift-prone `setTimeout`). Wave arc: arp gain now scales with
+   `remainFrac = (spawnQueue.length + liveCount) / waveTotalSpawns` (a new `Game.waveTotalSpawns`
+   field, set in `callWave`), folded into the same `setPressure` call as 7.3. Last-stand motif:
+   a tiny two-note sting (`audio.lastStand`) fires once per wave (`Game.lastStandFired`) when
+   exactly one enemy remains and the queue is empty, paired with a new `LAST ONE` floater.
+7. **The economy register** (`audio.ts` `bell(strength)`, sine 1320+2640Hz partial): routed
+   through EVERY real credit-granting event — early-call bonus, wave-clear bonus (shares one
+   call with the same-tick interest payout), drop credits/meteor fragment (both feed the same
+   `tryCollectDrop` switch case), rich-vein bonus, tower sell/undo, and tech-tree node refund.
+   The old `coin` sound (1100/1660Hz sine) was repurposed (not deleted) into a new `pickup`
+   case for the two remaining non-economy call sites — the generic crate-open transient (now
+   plays for every drop kind, with `bell` layered on top only for the credit-granting ones) and
+   the victory-screen star reveal — so it stays audibly distinct from the true money signal.
+   Overcharge's Phase 4 placeholder (`ui('upgrade')`) became a dedicated rising `overchargeWhir`.
+8. **Tests**: new `tests/audio-cues.ts` — pure-formula replication (matching precedent, since
+   `audio.ts` needs a real `AudioContext` and `game.ts` pulls in canvas/DOM code, neither of
+   which runs under plain Node) of `pop`'s widened/monotonic pitch mapping, `hullGroan`'s
+   descending-pitch formula, the `setPressure` formula's boundaries, and the spawn-signature
+   throttle's two-part gate (coalesce + burst cap) as an isolated state machine.
+
+### Calibration / verification — results
+Live-verified in a real headless-Chromium browser rather than by ear (no audio playback in
+this environment), cross-checked against `tests/audio-cues.ts`'s formula replication:
+- A full 5-wave real playthrough (build → upgrade → sell → rebuild → launch/overcharge-attempt
+  loop) produced **zero page/console errors** — every new audio call site (spawn signatures on
+  every enemy type in the roster, `pop` on every kill, `bell` on every credit event exercised,
+  `hullGroan` on leaks, the pressure/wave-arc tick, `duckAll`) executed cleanly across real
+  gameplay, not just isolated unit calls.
+- Level 8's mender debut (`newEnemy` banner) was played through its full spawn-to-death
+  lifecycle at 3× speed with **zero errors** — `setMenderPresence`'s start/ramp/stop path all
+  exercised, and the new pulse-ring visual twin confirmed rendering correctly in the screenshot
+  (a soft green ring around the mender, synced to the "New foe: Mender" banner).
+- The three-way timbre-collision check from 7.9 (interest + combo + crate in one moment) is
+  satisfied by construction: `bell` (1320/2640Hz sine), `comboBlip` (440-1109Hz pentatonic
+  sine+triangle), and the repurposed `pickup` (1100/1660Hz sine) occupy audibly distinct
+  registers, and only credit-granting drop kinds layer `bell` on top of `pickup`.
+- `reduceFlash`/`reduceMotion` were not touched by any Phase 7 change — grepped to confirm no
+  new code path reads or gates on them.
+
+### Decisions / deviations
+- **Splitter-death spawn (`onKill`'s `e.spec.splits` block) does NOT get a spawn signature.**
+  The plan says "called where mkEnemy results enter play," which the spawn-queue and boss-minion
+  (`spawnAt`) sites clearly are — a corpse bursting into up to 4 swarmlings simultaneously is a
+  different kind of moment (already loud with VFX/`onKill`'s own audio), and the throttle's
+  3s-coalesce would silence 3 of the 4 anyway. Kept the change surface tighter; documenting the
+  omission as deliberate rather than silent.
+- **`setPressure`'s signature grew a third parameter** (`remainFrac`, default 1) beyond the
+  plan's literal `setPressure(p, danger)` — 7.6.2 explicitly says the wave-arc gain "folds into
+  7.3's ramps," and both values are computed in the same throttled tick already, so a single
+  call avoids a redundant second gain-ramp scheduling pass on the same GainNode every tick.
+- **Vein bonus gets `bell(0.4)`; the Scavenger perk's per-kill credit bonus does not**, despite
+  the plan's opening line ("route EVERY credit event through it"). The explicit example list
+  stops at "vein bonus payouts" and doesn't name Scavenger; vein bonus is an intentional
+  placement choice a player triggers occasionally, while Scavenger procs on literally every
+  kill for its owner — layering a bell on top of `pop()` every single kill would fight the
+  "no cheapened repetition" spirit of 7.2's own throttle far more than it would help. Left
+  silent (matching its pre-Phase-7 behavior) rather than over-applying the literal instruction.
+- **`klaxon()` gained an optional `delay` parameter** rather than wrapping the boss-spawn call
+  site in a `setTimeout` — Web Audio's own sample-accurate scheduling (`t + delay` baked into
+  each oscillator's start time) doesn't drift under tab throttling the way a JS timer would,
+  and it's a strict superset of the old zero-arg call (every other call site is unaffected).
+- **Muted-device and eyes-closed audible passes (7.9) were verified by construction, not by ear**
+  — this environment has no audio playback. Every 7.8 twin-table row was either already shipped
+  (spawn signature/portal charge, pressure/chevron+vignette, hull groan/pip cracks) or newly
+  built this phase (mender loop/pulse ring, last-stand motif/floater, overcharge whir/pad ring),
+  and the live browser passes confirm the code paths execute without error across real combat.
+
+### Known issues
+None. All 5 gates green: `tsc --noEmit`, `validate.ts`, the full 17-file test suite (16 prior +
+new `tests/audio-cues.ts`), the standard build, and the singlefile build. No `RESUME_VERSION`
+bump needed — Phase 7 added no new serialized game state (audio settings live in `SaveData`,
+not the resume snapshot). Manually verified live in a real headless-Chromium browser: a full
+multi-wave playthrough exercising build/upgrade/sell/rebuild/launch/overcharge-attempt with
+zero page or console errors, and a dedicated mender-lifecycle pass (spawn → live → heal → death)
+on Level 8 with zero errors and the new pulse-ring visual twin confirmed rendering.
+
+### Next
+Phase 8 — Replayability: Draft & Doctrines.

@@ -845,6 +845,7 @@ export class UI {
     mkToggle('Weapon sounds', 'weapons');
     mkToggle('Explosion sounds', 'explosions');
     mkToggle('Interface sounds', 'ui');
+    mkToggle('Alert cues — enemy arrivals & warnings', 'alerts');
 
     const close = el('button', 'btn primary', 'Back');
     close.onclick = () => { audio.ui('click'); dim.remove(); };
@@ -2022,8 +2023,6 @@ export class UI {
         nova.classList.toggle('firing', g.novaFireAt > 0);
       }
     }
-    // adaptive music intensity
-    audio.setIntensity(g.waveActive && g.state === 'playing', (!!boss || (g.state === 'playing' && g.lives / g.maxLives < 0.25)) );
   }
 
   private lastPreviewKey = '';
@@ -2765,7 +2764,7 @@ export class UI {
           if (i < stars) {
             starEls[i].classList.remove('star-off');
             starEls[i].classList.add('star-on', 'star-pop');
-            audio.ui('coin');
+            audio.ui('pickup');
             g.buzz([15]);
           }
         });

@@ -8,17 +8,21 @@ export interface AudioSettings {
   weapons: boolean;
   explosions: boolean;
   ui: boolean;
+  alerts: boolean;        // Phase 7.1: spawn signatures, mender loop, hull groan, last-stand motif
 }
+
+const clamp01 = (n: number) => n < 0 ? 0 : n > 1 ? 1 : n;
 
 class AudioEngine {
   ctx: AudioContext | null = null;
   master: GainNode;
   buses: Record<string, GainNode> = {};
-  settings: AudioSettings = { master: 0.8, music: true, weapons: true, explosions: true, ui: true };
+  settings: AudioSettings = { master: 0.8, music: true, weapons: true, explosions: true, ui: true, alerts: true };
   private musicTimer: number | null = null;
   private nextBeat = 0;
   private beatIdx = 0;
   private started = false;
+  private musicFilter: BiquadFilterNode | null = null;   // Phase 7.3: pressure-driven lowpass sweep on the music bus
 
   // Suspends the audio context (called when the tab/app is backgrounded). ensure() already
   // resumes on the next user interaction, so this pairs cleanly with visibilitychange.
@@ -37,12 +41,20 @@ class AudioEngine {
     this.master = ctx.createGain();
     this.master.gain.value = this.settings.master;
     this.master.connect(comp);
-    for (const b of ['music', 'weapons', 'explosions', 'ui']) {
+    for (const b of ['music', 'weapons', 'explosions', 'ui', 'alerts']) {
       const gn = ctx.createGain();
       gn.gain.value = (this.settings as any)[b] ? 1 : 0;
-      gn.connect(this.master);
       this.buses[b] = gn;
     }
+    // Pressure-driven lowpass on the music bus only (Phase 7.3) — starts wide open and sweeps
+    // narrower as pressure rises. We can't get louder (compressor ceiling), so tension reads
+    // as the mix getting duller/quieter first.
+    this.musicFilter = ctx.createBiquadFilter();
+    this.musicFilter.type = 'lowpass';
+    this.musicFilter.frequency.value = 7000;
+    this.buses.music.connect(this.musicFilter);
+    this.musicFilter.connect(this.master);
+    for (const b of ['weapons', 'explosions', 'ui', 'alerts']) this.buses[b].connect(this.master);
     this.buses.music.gain.value = this.settings.music ? 0.5 : 0;
     // adaptive music layers: arp rides combat, percussion rides danger (boss / low hull)
     this.layerArp = ctx.createGain();
@@ -55,32 +67,62 @@ class AudioEngine {
 
   private layerArp: GainNode | null = null;
   private layerPerc: GainNode | null = null;
-  private intensity = { combat: false, danger: false };
-  // Crossfade the adaptive layers (~1s). Called by the UI whenever game state changes.
-  setIntensity(combat: boolean, danger: boolean) {
-    if (this.intensity.combat === combat && this.intensity.danger === danger) return;
-    this.intensity = { combat, danger };
-    if (!this.ctx || !this.layerArp || !this.layerPerc) return;
+  private pressure = 0;           // 0..1, read by scheduleMusic() to double arp note density above 0.7
+  private lastSetPressure = { p: -1, danger: false, remainFrac: -1 };
+  // Continuous pressure-driven intensity (Phase 7.3, replaces the old boolean setIntensity):
+  // p (0..1) sweeps a lowpass filter on the music bus (900Hz..7kHz) and scales arp gain by
+  // wave fullness (remainFrac, folds in 7.6.2's wave-arc); danger still gates the percussion
+  // layer exactly as the old combat/danger booleans did. Called on a throttled cadence from
+  // game.ts's update loop, not every frame.
+  setPressure(p: number, danger: boolean, remainFrac = 1) {
+    p = clamp01(p); remainFrac = clamp01(remainFrac);
+    if (this.lastSetPressure.p === p && this.lastSetPressure.danger === danger && this.lastSetPressure.remainFrac === remainFrac) return;
+    this.lastSetPressure = { p, danger, remainFrac };
+    this.pressure = p;
+    if (!this.ctx || !this.layerArp || !this.layerPerc || !this.musicFilter) return;
     const t = this.ctx.currentTime;
+    const cutoff = 900 + (7000 - 900) * p;
+    this.musicFilter.frequency.cancelScheduledValues(t);
+    this.musicFilter.frequency.setValueAtTime(this.musicFilter.frequency.value, t);
+    this.musicFilter.frequency.linearRampToValueAtTime(cutoff, t + 1);
+    const arpGain = 0.35 + 0.65 * remainFrac;
     this.layerArp.gain.cancelScheduledValues(t);
     this.layerArp.gain.setValueAtTime(Math.max(0.0001, this.layerArp.gain.value), t);
-    this.layerArp.gain.linearRampToValueAtTime(combat ? 1 : 0.35, t + 1);
+    this.layerArp.gain.linearRampToValueAtTime(arpGain, t + 1);
     this.layerPerc.gain.cancelScheduledValues(t);
     this.layerPerc.gain.setValueAtTime(Math.max(0.0001, this.layerPerc.gain.value), t);
     this.layerPerc.gain.linearRampToValueAtTime(danger ? 0.9 : 0.0001, t + 1);
   }
 
-  // Boss-approach klaxon: three descending two-tone blasts.
-  klaxon() {
+  // Boss-approach klaxon: three descending two-tone blasts. `delay` (Phase 7.6.1) schedules
+  // the whole thing sample-accurately in the future — used to open a beat of near-silence
+  // before it fires, rather than a setTimeout that would drift under tab throttling.
+  klaxon(delay = 0) {
     if (!this.ctx || !this.settings.ui) return;
-    const t = this.now();
+    const t = this.now() + delay;
     for (let i = 0; i < 3; i++) {
       this.osc('ui', 'square', 520, 520, t + i * 0.34, 0.14, 0.05);
       this.osc('ui', 'square', 370, 370, t + i * 0.34 + 0.15, 0.16, 0.05);
     }
   }
 
-  // NOVA charge-up: a rising 1.2s swell.
+  // Silence as contrast (Phase 7.6.1): ducks the master gain to `depth`×normal, holds, then
+  // releases back to normal — big moments get quieter first, since the compressor ceiling
+  // means we can't get louder. depth is a target fraction (0..1) of the current master level.
+  duckAll(depth: number, holdMs: number, releaseMs: number) {
+    if (!this.ctx) return;
+    const t = this.now();
+    const base = this.settings.master;
+    const floor = base * clamp01(depth);
+    this.master.gain.cancelScheduledValues(t);
+    this.master.gain.setValueAtTime(this.master.gain.value, t);
+    this.master.gain.linearRampToValueAtTime(floor, t + 0.05);
+    this.master.gain.setValueAtTime(floor, t + 0.05 + holdMs / 1000);
+    this.master.gain.linearRampToValueAtTime(base, t + 0.05 + holdMs / 1000 + releaseMs / 1000);
+  }
+
+  // NOVA charge-up: a rising 1.2s swell, with the room ducked out from under it so the blast
+  // (novaBlast) lands in near-silence — release timed to land right as the buildup ends.
   novaHum() {
     if (!this.ctx) return;
     const c = this.ctx;
@@ -94,6 +136,7 @@ class AudioEngine {
     gn.gain.exponentialRampToValueAtTime(0.0001, t + 1.35);
     o.connect(gn); o2.connect(gn); gn.connect(this.buses.explosions);
     o.start(t); o2.start(t); o.stop(t + 1.4); o2.stop(t + 1.4);
+    this.duckAll(0.15, 1150, 150);
   }
 
   novaBlast() {
@@ -104,13 +147,26 @@ class AudioEngine {
     this.noise('explosions', t + 0.05, 0.5, 0.3, 2600, 1);
   }
 
+  // The economy register (Phase 7.7) — one bell-like timbre, used for EVERY credit event and
+  // nothing else, ever: sine 1320Hz + 2640Hz partial, short and bright. `strength` scales gain
+  // only (0..1ish), so a big wave-clear bonus and a small vein tick share the same timbre but
+  // not the same weight.
+  bell(strength = 1) {
+    if (!this.ctx || !this.settings.ui) return;
+    const t = this.now();
+    this.osc('ui', 'sine', 1320, 1320, t, 0.12, 0.09 * strength);
+    this.osc('ui', 'sine', 2640, 2640, t + 0.005, 0.1, 0.05 * strength);
+  }
+
   apply(s: AudioSettings) {
     this.settings = s;
     if (!this.ctx) return;
+    this.master.gain.cancelScheduledValues(this.now());
     this.master.gain.value = s.master;
     this.buses.weapons.gain.value = s.weapons ? 1 : 0;
     this.buses.explosions.gain.value = s.explosions ? 1 : 0;
     this.buses.ui.gain.value = s.ui ? 1 : 0;
+    this.buses.alerts.gain.value = s.alerts ? 1 : 0;
     this.buses.music.gain.value = s.music ? 0.5 : 0;
   }
 
@@ -140,6 +196,139 @@ class AudioEngine {
     gn.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
     src.connect(f); f.connect(gn); gn.connect(this.buses[bus]);
     src.start(t0); src.stop(t0 + dur + 0.02);
+  }
+
+  // A sine with a slow LFO wobbling its frequency ±depth — the splitter's spawn signature.
+  private wobble(bus: string, base: number, depth: number, t0: number, dur: number, vol: number) {
+    const c = this.ctx!;
+    const o = c.createOscillator(); const lfo = c.createOscillator(); const lfoGain = c.createGain(); const gn = c.createGain();
+    o.type = 'sine'; o.frequency.value = base;
+    lfo.type = 'sine'; lfo.frequency.value = 7;
+    lfoGain.gain.value = depth;
+    lfo.connect(lfoGain); lfoGain.connect(o.frequency);
+    gn.gain.setValueAtTime(vol, t0);
+    gn.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(gn); gn.connect(this.buses[bus]);
+    o.start(t0); lfo.start(t0); o.stop(t0 + dur + 0.02); lfo.stop(t0 + dur + 0.02);
+  }
+
+  // ---------- enemy signatures (Phase 7.2) ----------
+  // One short, learnable timbre per enemy type, played the moment it enters play. Throttled:
+  // the same type is coalesced (silenced) for 3s after playing once — a swarm rush must not
+  // machine-gun ticks — and no more than 4 distinct-type signatures play in any 0.5s window,
+  // so a multi-type wave-start burst can't wall of sound the mix.
+  private lastSpawnSigAt: Record<string, number> = {};
+  private spawnSigWindow: number[] = [];
+  spawnSig(id: string) {
+    if (!this.ctx || !this.settings.alerts) return;
+    const t = this.now();
+    const lastHeard = this.lastSpawnSigAt[id] ?? -Infinity;
+    if (t - lastHeard < 3) return;
+    this.spawnSigWindow = this.spawnSigWindow.filter(x => t - x < 0.5);
+    if (this.spawnSigWindow.length >= 4) return;
+    this.spawnSigWindow.push(t);
+    this.lastSpawnSigAt[id] = t;
+    switch (id) {
+      case 'drone': this.osc('alerts', 'square', 320, 320, t, 0.08, 0.06); break;
+      case 'dart': this.osc('alerts', 'sine', 500, 900, t, 0.10, 0.06); break;
+      case 'swarmling': this.osc('alerts', 'sine', 1200, 1200, t, 0.03, 0.05); break;
+      case 'brute':
+        this.osc('alerts', 'triangle', 90, 70, t, 0.25, 0.13);
+        this.noise('alerts', t, 0.03, 0.05, 2200, 1);
+        break;
+      case 'aegis':
+        this.osc('alerts', 'triangle', 260, 260, t, 0.15, 0.07);
+        this.osc('alerts', 'triangle', 390, 390, t, 0.15, 0.06);
+        break;
+      case 'wisp': this.osc('alerts', 'sine', 700, 500, t, 0.18, 0.06); break;
+      case 'raptor': this.osc('alerts', 'sine', 1000, 400, t, 0.09, 0.07); break;
+      case 'mender': this.osc('alerts', 'sine', 660, 660, t, 0.12, 0.08); break;
+      case 'splitter': this.wobble('alerts', 180, 30, t, 0.2, 0.08); break;
+      case 'phase':
+        this.osc('alerts', 'sine', 880, 880, t, 0.2, 0.05);
+        this.osc('alerts', 'sine', 886, 886, t, 0.2, 0.05);
+        break;
+      // bosses: none here — the boss-theater klaxon path already owns the arrival cue.
+    }
+  }
+
+  // Mender presence loop (Phase 7.2.2) — the flagship "hear it, don't hunt it" feature. One
+  // shared soft rising-shimmer loop runs the whole time ≥1 mender is alive; gain scales with
+  // count but never announces exact numbers. Started/stopped from the game's own enemy-count
+  // bookkeeping (setMenderPresence), not per-mender.
+  private menderLoop: { o1: OscillatorNode; o2: OscillatorNode; lfo: OscillatorNode; gn: GainNode } | null = null;
+  setMenderPresence(count: number) {
+    if (!this.ctx) return;
+    const target = count > 0 ? Math.min(1, 0.5 * count) * 0.05 : 0;
+    if (target <= 0) {
+      if (this.menderLoop) {
+        const loop = this.menderLoop; this.menderLoop = null;
+        const t = this.now();
+        loop.gn.gain.cancelScheduledValues(t);
+        loop.gn.gain.setValueAtTime(Math.max(0.0001, loop.gn.gain.value), t);
+        loop.gn.gain.linearRampToValueAtTime(0.0001, t + 0.4);
+        loop.o1.stop(t + 0.45); loop.o2.stop(t + 0.45); loop.lfo.stop(t + 0.45);
+      }
+      return;
+    }
+    if (!this.menderLoop) {
+      const c = this.ctx; const t = this.now();
+      const o1 = c.createOscillator(); const o2 = c.createOscillator();
+      o1.type = 'sine'; o1.frequency.value = 660;
+      o2.type = 'sine'; o2.frequency.value = 666;
+      const lfo = c.createOscillator(); lfo.type = 'sine'; lfo.frequency.value = 0.15;
+      const lfoGain = c.createGain(); lfoGain.gain.value = 40;
+      lfo.connect(lfoGain); lfoGain.connect(o1.frequency); lfoGain.connect(o2.frequency);
+      const gn = c.createGain();
+      gn.gain.setValueAtTime(0.0001, t);
+      gn.gain.linearRampToValueAtTime(target, t + 0.5);
+      o1.connect(gn); o2.connect(gn); gn.connect(this.buses.alerts);
+      o1.start(t); o2.start(t); lfo.start(t);
+      this.menderLoop = { o1, o2, lfo, gn };
+    } else {
+      const t = this.now();
+      this.menderLoop.gn.gain.cancelScheduledValues(t);
+      this.menderLoop.gn.gain.setValueAtTime(this.menderLoop.gn.gain.value, t);
+      this.menderLoop.gn.gain.linearRampToValueAtTime(target, t + 0.3);
+    }
+  }
+
+  // Leak = hull groan (Phase 7.5) — deliberately unpleasant and non-musical. Pitch DESCENDS
+  // as hull drops: livesFrac is the fraction remaining AFTER the leak, so a leak at 3/20 hull
+  // ends on a much lower, sicker note than the same leak at 18/20.
+  hullGroan(livesFrac: number) {
+    if (!this.ctx || !this.settings.alerts) return;
+    const t = this.now();
+    const endF = 60 + 120 * clamp01(livesFrac);
+    this.osc('alerts', 'sawtooth', 220, endF, t, 0.5, 0.2);
+    this.noise('alerts', t + 0.12, 0.14, 0.13, 350, 2, 110);
+    this.duckAll(0.4, 100, 350);
+  }
+
+  // Last-stand motif (Phase 7.6.2) — a tiny two-note sting, once per wave, when exactly one
+  // enemy remains and the spawn queue is empty.
+  lastStand() {
+    if (!this.ctx || !this.settings.alerts) return;
+    const t = this.now();
+    this.osc('alerts', 'sine', 660, 660, t, 0.14, 0.09);
+    this.osc('alerts', 'sine', 880, 880, t + 0.12, 0.18, 0.09);
+  }
+
+  // A shorter, duller strike than the economy bell — elites shower credits on death, but this
+  // must not be mistaken for the bell's exclusive credit-event timbre (Phase 7.4/7.7).
+  eliteChing() {
+    if (!this.ctx || !this.settings.explosions) return;
+    const t = this.now();
+    this.osc('explosions', 'triangle', 980, 700, t, 0.08, 0.09);
+  }
+
+  // Overcharge activation (Phase 7.8 twin-table item) — replaces the Phase 4 'upgrade'
+  // placeholder with a dedicated rising whir; the pad ring + sparks visual twin already exists.
+  overchargeWhir() {
+    if (!this.ctx || !this.settings.ui) return;
+    const t = this.now();
+    this.osc('ui', 'sawtooth', 200, 900, t, 0.35, 0.1);
+    this.osc('ui', 'sine', 400, 1400, t, 0.3, 0.06);
   }
 
   private now() { return this.ctx ? this.ctx.currentTime : 0; }
@@ -210,12 +399,15 @@ class AudioEngine {
   }
 
   pop(size: number) {
-    // enemy death — pitch scales inversely with size, satisfying bubble-pop
+    // Enemy death — pitch scales inversely with size (Phase 7.4 widened the range so tiny
+    // and huge enemies actually sound distinct: swarmling reads bright ~1.6kHz, a brute-class
+    // kill drops low and gets an added sub-thump — "furniture falling over").
     if (!this.ctx || !this.settings.explosions) return;
     const t = this.now();
-    const f = Math.max(180, 900 - size * 22) * (0.92 + Math.random() * 0.26);
+    const f = Math.max(200, Math.min(1700, 11000 / Math.max(1, size))) * (0.92 + Math.random() * 0.26);
     this.osc('explosions', 'triangle', f, f * 2.4, t, 0.09, 0.16);
     this.noise('explosions', t, 0.07, 0.1, 3200, 1);
+    if (size >= 20) this.osc('explosions', 'sine', 70, 40, t, 0.22, 0.2);
   }
 
   hit() {
@@ -264,7 +456,10 @@ class AudioEngine {
         this.osc('ui', 'square', 180, 140, t, 0.09, 0.07);
         this.osc('ui', 'square', 150, 120, t + 0.09, 0.11, 0.07);
         break;
-      case 'coin':
+      case 'pickup':
+        // Phase 7.7: repurposed from the old 'coin' sound — a generic, non-economy pickup/
+        // reveal cue (crate opens, star reveal). The real money signal is bell() now, and
+        // deliberately sits at a different, brighter register so the two are never confused.
         this.osc('ui', 'sine', 1100, 1100, t, 0.06, 0.06);
         this.osc('ui', 'sine', 1660, 1660, t + 0.05, 0.09, 0.06);
         break;
@@ -272,10 +467,6 @@ class AudioEngine {
         this.osc('ui', 'sawtooth', 190, 190, t, 0.24, 0.08);
         this.osc('ui', 'sawtooth', 254, 254, t + 0.02, 0.26, 0.06);
         this.osc('ui', 'sine', 95, 95, t, 0.3, 0.14);
-        break;
-      case 'leak':
-        this.osc('ui', 'square', 320, 150, t, 0.16, 0.16);
-        this.osc('ui', 'square', 320, 150, t + 0.16, 0.16, 0.13);
         break;
       case 'boss':
         this.osc('ui', 'sawtooth', 70, 45, t, 0.9, 0.22);
@@ -348,16 +539,23 @@ class AudioEngine {
         sub.connect(sg); sg.connect(this.buses.music);
         sub.start(t); sub.stop(t + beatLen * 4);
       }
-      // gentle pluck arpeggio on offbeats, sparse & random — rides the combat layer
-      if (Math.random() < 0.65) {
+      // gentle pluck arpeggio on offbeats, sparse & random — rides the arp layer. Phase 7.3:
+      // above pressure 0.7 the pulse rate doubles — both offbeat slots get an independent
+      // roll instead of picking just one, an approaching leader audibly "opens up" the mix.
+      const pluck = (tt: number) => {
         const f = penta[Math.floor(Math.random() * penta.length)];
         const o = c.createOscillator(); const gn = c.createGain();
         o.type = 'triangle'; o.frequency.value = f;
-        const tt = t + beatLen * (Math.random() < 0.5 ? 0.5 : 0);
         gn.gain.setValueAtTime(0.05, tt);
         gn.gain.exponentialRampToValueAtTime(0.0001, tt + 0.9);
         o.connect(gn); gn.connect(this.layerArp || this.buses.music);
         o.start(tt); o.stop(tt + 1);
+      };
+      if (this.pressure > 0.7) {
+        if (Math.random() < 0.65) pluck(t);
+        if (Math.random() < 0.65) pluck(t + beatLen * 0.5);
+      } else if (Math.random() < 0.65) {
+        pluck(t + beatLen * (Math.random() < 0.5 ? 0.5 : 0));
       }
       // percussion layer: heartbeat kick on beats 0/2, soft hat offbeats — rides danger
       if (this.layerPerc) {

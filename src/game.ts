@@ -715,6 +715,10 @@ export class Game {
   patches: Patch[] = [];
   incomings: Incoming[] = [];
   spawnQueue: { t: number; e: string; p: number }[] = [];
+  waveTotalSpawns = 0;      // Phase 7.6.2: total spawns this wave, for the wave-arc remainFrac
+  lastStandFired = false;   // Phase 7.6.2: last-stand motif fires once per wave
+  lastPressureAt = 0;       // Phase 7.3: throttle cadence for the pressure/mender/last-stand tick
+  lastMenderCount = -1;     // Phase 7.2.2: only re-ramps the mender loop's gain when this actually changes
   pendingWave: WaveGroup[] | null = null;   // SERIALIZE: pendingWave, pendingMutator, pending2Wave, pending2Mutator, waveMutator
   pendingMutator: string | null = null;
   pending2Wave: WaveGroup[] | null = null;
@@ -1480,6 +1484,7 @@ export class Game {
     this.recomputeCoverage(t);   // a refunded node can shrink range back down (Phase 3B.4)
     this.recomputeThreat();
     audio.ui('sell');
+    audio.bell(0.6);
     this.floater(t.x, t.y - 30, `+${payout} refunded`, '#fff3b0');
     this.parts.push({ x: t.x, y: t.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 40, color: '#ffb3c6', kind: 'ring' });
     this.onSelect(); this.onHud();
@@ -1632,7 +1637,7 @@ export class Game {
       if (bonus > 0) {
         this.credits += bonus;
         this.floater(W / 2, 120, `Early call +${bonus} ◆ (+${Math.round(frac * 100)}%)`, '#fff3b0');
-        audio.ui('coin');
+        audio.bell(0.8);
       }
     }
     this.waveIdx++;
@@ -1664,6 +1669,8 @@ export class Game {
     const shape = this.level.waveShapes?.[this.waveIdx];
     if (shape) this.applyWaveShape(shape, queued);
     this.spawnQueue.push(...queued);
+    this.waveTotalSpawns = queued.length;
+    this.lastStandFired = false;
     if (this.scriptDrop && this.waveIdx === 1) {
       this.scriptDrop = false;
       this.nextDropAt = this.now + 4;
@@ -1673,7 +1680,13 @@ export class Game {
     if (hasBoss) {
       const bossSpec = ENEMIES[wave.find(grp => ENEMIES[grp.e].boss)!.e];
       this.onBanner(`⚠ ${bossSpec.name} ⚠`, '#ff8fa3', 'critical');
-      if (isUnlocked('boss_theater')) { audio.klaxon(); this.bossVignetteUntil = this.now + 3; }
+      if (isUnlocked('boss_theater')) {
+        // 7.6.1: 400ms of near-silence before the klaxon fires — the red vignette already
+        // fills the visual gap, and the room dropping out first makes the klaxon land harder.
+        audio.duckAll(0.05, 400, 250);
+        audio.klaxon(0.4);
+        this.bossVignetteUntil = this.now + 3;
+      }
       else audio.ui('boss');
       this.shake(8);
     }
@@ -1777,6 +1790,7 @@ export class Game {
     }
     this.enemies.push(e);
     this.spark(near.x, near.y, this.palEnemy(spec.id)[0], 8);
+    if (!spec.boss) audio.spawnSig(spec.id);
   }
   nearestPathD(near: Enemy) {
     let best = 0, bd = Infinity;
@@ -1837,6 +1851,7 @@ export class Game {
         }
         this.enemies.push(e);
         this.portalFx(e);
+        if (!spec.boss) audio.spawnSig(spec.id);   // spawn signature (Phase 7.2) — bosses own the klaxon path
         if (this.level.newEnemy && s.e === this.level.newEnemy.id && !this.seenNewEnemy) {
           this.seenNewEnemy = true;
           this.onBanner(`New foe: ${spec.name}`, this.palEnemy(spec.id)[0], 'medium', spec.desc);
@@ -1860,7 +1875,7 @@ export class Game {
       const bonus = Math.round((30 + this.waveIdx * 4) * this.econScale());
       this.credits += bonus;
       this.floater(W / 2, 120, `Wave clear  +${bonus}`, '#a8e6cf');
-      audio.ui('coin');
+      audio.bell(1.0);
       // banked-credit interest (risk/reward: spend now vs save for the payout)
       if (isUnlocked('interest')) {
         const interest = Math.min(Math.floor((this.credits - bonus) * TUNING.interest.rate), this.interestCap);
@@ -2095,6 +2110,41 @@ export class Game {
     this.rays = this.rays.filter(r => (r.life -= rawDt) > 0);
 
     if (this.shakeT > 0) { this.shakeT -= rawDt; if (this.shakeT <= 0) this.shakeMag = 0; }
+
+    // ---------- Audio: pressure, mender presence, wave-arc, last-stand (7.2.2/7.3/7.6.2) ----------
+    // Throttled to a ~0.25s cadence — the DPS sum + enemy scan are cheap, but the engine's own
+    // ramps run over ~1s anyway, so there's no value in recomputing every frame.
+    if (this.state === 'playing' && now - this.lastPressureAt > 0.25) {
+      this.lastPressureAt = now;
+      let lead = 0, totalHp = 0, menderCount = 0, liveCount = 0;
+      for (const e of this.enemies) {
+        if (e.dead) continue;
+        liveCount++;
+        totalHp += e.hp;
+        if (e.spec.id === 'mender') menderCount++;
+        const f = e.spec.flying ? (e.fDur > 0 ? e.fT / e.fDur : 0) : (e.path.total > 0 ? e.d / e.path.total : 0);
+        if (f > lead) lead = f;
+      }
+      if (menderCount !== this.lastMenderCount) {
+        this.lastMenderCount = menderCount;
+        audio.setMenderPresence(menderCount);
+      }
+      let teamGroundDPS = 0;
+      for (const t of this.towers) teamGroundDPS += this.towerDPS(t).ground;
+      const mass = Math.min(1, totalHp / Math.max(1, teamGroundDPS * 10));
+      const p = this.waveActive ? clamp(0.25 + 0.55 * lead + 0.2 * mass, 0, 1) : 0.15;
+      const boss = this.enemies.find(e => e.spec.boss && !e.dead);
+      const danger = !!boss || this.lives / this.maxLives < 0.25;
+      const remainFrac = this.waveTotalSpawns > 0 ? Math.min(1, (this.spawnQueue.length + liveCount) / this.waveTotalSpawns) : 1;
+      audio.setPressure(p, danger, remainFrac);
+      // Last-stand motif (7.6.2): exactly one enemy left, queue empty, once per wave.
+      if (!this.lastStandFired && this.waveActive && this.spawnQueue.length === 0 && liveCount === 1) {
+        this.lastStandFired = true;
+        audio.lastStand();
+        const last = this.enemies.find(e => !e.dead);
+        if (last) this.floater(last.x, last.y - last.spec.size - 22, 'LAST ONE', '#ffd97a');
+      }
+    }
   }
 
   focusValidFor(t: Tower, R: number) {
@@ -2699,7 +2749,7 @@ export class Game {
       if (dist(d.x, d.y, x, y) > 40) continue;
       this.drops.splice(i, 1);
       const D = TUNING.drops;
-      audio.ui('coin');
+      audio.ui('pickup');
       this.spark(d.x, d.y, '#fff3b0', 12);
       this.parts.push({ x: d.x, y: d.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 52, color: '#fff3b0', kind: 'ring' });
       switch (d.kind) {
@@ -2707,6 +2757,7 @@ export class Game {
         case 'credits':
           this.credits += d.amount;
           this.floater(d.x, d.y - 26, `+${d.amount} ◆`, '#fff3b0');
+          audio.bell(0.7);
           break;
         case 'recharge':
           this.cds.orbital = 0; this.cds.stasis = 0;
@@ -2783,6 +2834,7 @@ export class Game {
       this.credits += v;
       e.lastHitBy.creditsEarned += v;
       this.floater(e.lastHitBy.x, e.lastHitBy.y - 26, `+${v}◆`, '#d6f7ff');
+      audio.bell(0.4);
     }
     // --- Scavenger perk payout (Phase 4.6): flat credit per kill, scaled at payout time
     // (like every other flat credit source) so it holds its relative value all campaign. ---
@@ -2798,6 +2850,7 @@ export class Game {
       this.hitStop(0.05);
       this.shake(4);
       this.ringFx(e.x, e.y, e.spec.size * 2.4, '#ffd97a');
+      audio.eliteChing();
       const shower = Math.max(3, Math.round(reward / 8));
       for (let i = 0; i < shower; i++) {
         const a = Math.random() * Math.PI * 2, sp = rand(60, 220);
@@ -2866,7 +2919,9 @@ export class Game {
     this.leakLedger[e.spec.id] = (this.leakLedger[e.spec.id] || 0) + dmg;
     this.lives = Math.max(0, this.lives - dmg);
     this.livesLostTotal += dmg;
-    audio.ui('leak'); // AUDIO-TWIN: descending-pitch hull groan (Phase 7)
+    // Hull groan (Phase 7.5): pitch descends as hull drops — a leak at 3 hull sounds sicker
+    // than the same leak at 18, using the fraction remaining AFTER this leak.
+    audio.hullGroan(this.maxLives > 0 ? this.lives / this.maxLives : 0);
     // Leak impact (Phase 6.2): louder than a generic hit — bigger shake, a brief hitch, and a
     // base-sprite flash/red-edge pulse (drawPortalsAndBases / drawOverlays read leakFlashUntil).
     this.shake(6);
@@ -3024,7 +3079,7 @@ export class Game {
     this.overchargeLeft--;
     t.overchargedUntil = this.now + TUNING.overcharge.dur;
     this.buzz([18]);
-    audio.ui('upgrade'); // AUDIO-TWIN: a dedicated overcharge whir (Phase 7)
+    audio.overchargeWhir();
     this.floater(t.x, t.y - 30, 'OVERCHARGE!', '#fff3b0');
     for (let i = 0; i < 10; i++) {
       const a = Math.random() * Math.PI * 2;
@@ -3136,6 +3191,7 @@ export class Game {
     this.selected = null;
     this.recomputeThreat();
     audio.ui('sell');
+    audio.bell(0.6);   // a refund is a transaction — shares the economy register (Phase 7.7)
     this.floater(t.x, t.y - 20, undo ? `Undone +${refund}` : `+${refund}`, '#fff3b0');
     for (let i = 0; i < 8; i++) this.smoke(t.x + rand(-12, 12), t.y + rand(-8, 8));
     this.onSelect(); this.onHud();
@@ -4109,6 +4165,17 @@ export class Game {
       g.globalAlpha = e.phased ? 0.3 : 1;
     }
     this.drawEnemyBody(g, e, r, squash);
+
+    if (spec.healAura) {
+      // Mender presence pulse (Phase 7.2.2) — the visual twin to the audio mender loop: a
+      // slow ~1Hz pulsing ring so a mender reads at a glance even with alert cues muted.
+      const pulse = 0.5 + 0.5 * Math.sin(this.now * Math.PI * 2);
+      g.globalAlpha = 0.25 + 0.35 * pulse;
+      g.strokeStyle = '#c0f5b3';
+      g.lineWidth = 2;
+      g.beginPath(); g.arc(0, 0, r + 10 + pulse * 4, 0, 7); g.stroke();
+      g.globalAlpha = 1;
+    }
 
     if (spec.boss) {
       g.fillStyle = this.palEnemy(spec.id)[1];
