@@ -1,5 +1,5 @@
 // ================= Starhold engine (unified grid, top-down) =================
-import { TOWERS, ENEMIES, ABILITIES, ZONES, LANDMARKS, LandmarkSpec, PALETTE, TowerSpec, StageStats, EnemySpec, TUNING, isUnlocked, MUTATORS, MODIFIER_INFO, fmt } from './data';
+import { TOWERS, ENEMIES, ABILITIES, ZONES, LANDMARKS, LandmarkSpec, PALETTE, TowerSpec, StageStats, EnemySpec, TUNING, isUnlocked, MUTATORS, MODIFIER_INFO, fmt, WaveShape, WAVE_SHAPES, ENEMY_INTRO } from './data';
 import { LevelSpec, WaveGroup } from './levels';
 import { mulberry32, hashString, seededInt } from './rng';
 import { audio } from './audio';
@@ -7,6 +7,31 @@ import { audio } from './audio';
 export const W = 1280, H = 720;
 
 const dist = (ax: number, ay: number, bx: number, by: number) => Math.hypot(ax - bx, ay - by);
+
+// Quadratic Bezier helpers (Phase 5.4 flier lanes). p0/p1 are the curve's endpoints (portal/
+// base), c is the single control point that bends the path.
+function bezierAt(p0x: number, p0y: number, cx: number, cy: number, p1x: number, p1y: number, t: number) {
+  const mt = 1 - t;
+  return { x: mt * mt * p0x + 2 * mt * t * cx + t * t * p1x, y: mt * mt * p0y + 2 * mt * t * cy + t * t * p1y };
+}
+function bezierTangentAngle(p0x: number, p0y: number, cx: number, cy: number, p1x: number, p1y: number, t: number) {
+  const mt = 1 - t;
+  const dx = 2 * mt * (cx - p0x) + 2 * t * (p1x - cx);
+  const dy = 2 * mt * (cy - p0y) + 2 * t * (p1y - cy);
+  return Math.atan2(dy, dx);
+}
+// Approximated arc length via a 16-segment polyline — accurate enough to keep flight speed
+// visually consistent regardless of how sharply the lane bends.
+function bezierArcLen(p0x: number, p0y: number, cx: number, cy: number, p1x: number, p1y: number, steps = 16): number {
+  let len = 0;
+  let prev = bezierAt(p0x, p0y, cx, cy, p1x, p1y, 0);
+  for (let i = 1; i <= steps; i++) {
+    const cur = bezierAt(p0x, p0y, cx, cy, p1x, p1y, i / steps);
+    len += dist(prev.x, prev.y, cur.x, cur.y);
+    prev = cur;
+  }
+  return len;
+}
 
 // Evenly resample a level's wave list to a different length (game-length setting).
 // Always keeps the final (boss) wave last.
@@ -190,6 +215,7 @@ export class Enemy {
   d = 0;
   x = 0; y = 0; angle = 0;
   fx0 = 0; fy0 = 0; fx1 = 0; fy1 = 0; fT = 0; fDur = 1;
+  fcx = 0; fcy = 0;   // flier lane control point (Phase 5.4) — defaults to the straight-line midpoint
   slowPct = 0; slowUntil = 0;
   frozenUntil = 0;
   burnDps = 0; burnUntil = 0;
@@ -229,6 +255,11 @@ export class Enemy {
     (this as any).reward = Math.max(1, Math.round(spec.reward * rewardMul));
     if (spec.flying && flyFrom && flyTo) {
       this.fx0 = flyFrom.x; this.fy0 = flyFrom.y; this.fx1 = flyTo.x; this.fy1 = flyTo.y;
+      // Straight-line default: a control point sitting exactly on the midpoint degenerates the
+      // quadratic bezier back into a straight line. Curved wave lanes (Phase 5.4) override this
+      // right after construction; boss-spawned minions (spawnAt) and this default both stay
+      // straight, which is the intended fallback either way.
+      this.fcx = (this.fx0 + this.fx1) / 2; this.fcy = (this.fy0 + this.fy1) / 2;
       this.fDur = Math.max(0.1, dist(this.fx0, this.fy0, this.fx1, this.fy1) / spec.speed);
       this.x = this.fx0; this.y = this.fy0;
     } else {
@@ -376,9 +407,11 @@ export class Enemy {
     if (this.spec.flying) {
       this.fT += (sp / this.spec.speed) * dt;
       const t = clamp(this.fT / this.fDur, 0, 1);
-      this.x = lerp(this.fx0, this.fx1, t);
-      this.y = lerp(this.fy0, this.fy1, t);
-      this.angle = Math.atan2(this.fy1 - this.fy0, this.fx1 - this.fx0);
+      const pos = bezierAt(this.fx0, this.fy0, this.fcx, this.fcy, this.fx1, this.fy1, t);
+      this.x = pos.x; this.y = pos.y;
+      // Tangent-based facing (not a fixed portal->base bearing) — needed once the lane curves,
+      // and degrades gracefully to the old fixed-bearing look when fcx/fcy sit on the midpoint.
+      this.angle = bezierTangentAngle(this.fx0, this.fy0, this.fcx, this.fcy, this.fx1, this.fy1, t);
       if (t >= 1) this.leak(game);
     } else {
       // Null Zone: ground enemies passing within 1.5 tiles of a null cell center are
@@ -1303,10 +1336,36 @@ export class Game {
     return this.endless ? this.genEndlessWave(i) : this.waves[i];
   }
 
+  // Hard+ difficulty composition (Phase 5.5): a deterministic extra enemy group injected into
+  // eligible waves — never wave 1, never a boss wave, never a shaped wave (one twist at a
+  // time). Injected upstream of BOTH the forecast preview and the real spawn queue (both read
+  // pendingWave/pending2Wave exclusively through this function), so the forecast never lies
+  // about what's coming — the same "roll once, upstream" pattern rollMutator already uses.
+  decorateWave(i: number): WaveGroup[] | null {
+    const wave = this.waveAt(i);
+    if (!wave || this.diffTier < 3 || i === 0) return wave;
+    if (wave.some(grp => ENEMIES[grp.e].boss)) return wave;
+    if (this.level.waveShapes?.[i] !== undefined) return wave;
+    const rng = mulberry32(hashString(`${this.level.id}-inj-${i}-${this.diffTier}`));
+    const inWave = new Set(wave.map(grp => grp.e));
+    const pool = Object.keys(ENEMIES).filter(id => !ENEMIES[id].boss && !inWave.has(id) && (ENEMY_INTRO[id] ?? 999) <= this.level.id);
+    if (!pool.length) return wave;
+    const e = pool[Math.floor(rng() * pool.length)];
+    const waveBounty = wave.reduce((a, grp) => a + ENEMIES[grp.e].reward * grp.n, 0);
+    const n = clamp(Math.ceil(waveBounty * 0.12 / ENEMIES[e].reward), 2, 8);
+    const times = wave.flatMap(grp => Array.from({ length: grp.n }, (_, k) => grp.d + k * grp.iv));
+    const d = (Math.min(...times) + Math.max(...times)) / 2;
+    const paths = [...new Set(wave.map(grp => grp.p || 0))];
+    const p = paths[Math.floor(rng() * paths.length)];
+    return [...wave, { e, n, iv: 0.9, d, p }];
+  }
+
   // Roll a mutator for wave index i. Locked at generation time so the forecast
   // is always honest — what's previewed is exactly what arrives.
   rollMutator(i: number, prevMutated: boolean): string | null {
     if (!isUnlocked('mutators')) return null;
+    // A shaped wave never also mutates (Phase 5.2) — one twist per wave, cognitively.
+    if (this.level.waveShapes?.[i] !== undefined) return null;
     const M = TUNING.mutators;
     const fromWave = this.ascTier >= 2 ? TUNING.ascension.mutatorFromWave : M.fromWave;
     if (i + 1 < fromWave) return null;
@@ -1328,12 +1387,12 @@ export class Game {
         this.pendingWave = this.pending2Wave; this.pendingMutator = this.pending2Mutator;
         this.pending2Wave = null; this.pending2Mutator = null;
       } else {
-        this.pendingWave = this.waveAt(this.waveIdx + 1);
+        this.pendingWave = this.decorateWave(this.waveIdx + 1);
         this.pendingMutator = this.pendingWave ? this.rollMutator(this.waveIdx + 1, this.waveMutator !== null) : null;
       }
     }
     if (!this.pending2Wave && this.pendingWave) {
-      this.pending2Wave = this.waveAt(this.waveIdx + 2);
+      this.pending2Wave = this.decorateWave(this.waveIdx + 2);
       this.pending2Mutator = this.pending2Wave ? this.rollMutator(this.waveIdx + 2, this.pendingMutator !== null) : null;
     }
   }
@@ -1347,6 +1406,62 @@ export class Game {
     return this.pendingWave.reduce((a, g) => a + ENEMIES[g.e].reward * g.n * mul, 0);
   }
 
+  // Wave shapes (Phase 5.1/5.2): re-time/reorder an already-expanded spawn queue in place.
+  // Operates on individual spawn entries (post group-expansion), since every transform needs
+  // real per-enemy timing/HP, not the authored group summary. Never touches roster or stats.
+  applyWaveShape(shape: WaveShape, queue: { t: number; e: string; p: number }[]) {
+    if (!queue.length) return;
+    switch (shape) {
+      case 'rush': {
+        const sorted = [...queue].sort((a, b) => a.t - b.t);
+        const t0 = sorted[0].t;
+        const n = sorted.length;
+        sorted.forEach((s, i) => { s.t = n <= 1 ? t0 : t0 + (i / (n - 1)) * 2.0; });
+        break;
+      }
+      case 'trickle': {
+        const sorted = [...queue].sort((a, b) => a.t - b.t);
+        const t0 = sorted[0].t;
+        sorted.forEach((s, i) => { s.t = t0 + i * 3.0; });
+        break;
+      }
+      case 'convoy': {
+        // Multi-path levels: the leader/mender/rest ordering runs independently per path,
+        // since each path is its own visible lane — a leader on path 0 says nothing about
+        // path 1's formation.
+        const hp = (s: { e: string }) => ENEMIES[s.e].hp;
+        for (const p of new Set(queue.map(s => s.p))) {
+          const subset = queue.filter(s => s.p === p);
+          const t0 = Math.min(...subset.map(s => s.t));
+          const menders = subset.filter(s => s.e === 'mender');
+          const rest = subset.filter(s => s.e !== 'mender');
+          let leader: typeof subset[number] | null = null;
+          for (const s of rest) if (!leader || hp(s) > hp(leader)) leader = s;
+          const others = rest.filter(s => s !== leader).sort((a, b) => hp(b) - hp(a));
+          const ordered = leader ? [leader, ...menders, ...others] : [...menders, ...others];
+          ordered.forEach((s, i) => { s.t = t0 + i * 0.5; });
+        }
+        break;
+      }
+      case 'feint': {
+        const sorted = [...queue].sort((a, b) => a.t - b.t);
+        const numPaths = this.paths.length;
+        const hasFliers = sorted.some(s => !!ENEMIES[s.e].flying);
+        if (numPaths <= 1 && hasFliers) {
+          // Single-path levels have no portal to flip to — a wave's fliers already fly their
+          // own curved lane (5.4), so delaying just them in time IS the "different portal" cue.
+          for (const s of sorted) if (ENEMIES[s.e].flying) s.t += 10;
+        } else {
+          const cut = Math.ceil(sorted.length * 0.4);
+          for (let i = cut; i < sorted.length; i++) {
+            sorted[i].t += 10;
+            if (numPaths > 1) sorted[i].p = 1 - sorted[i].p;
+          }
+        }
+        break;
+      }
+    }
+  }
   callWave(early: boolean, auto = false) {
     if (this.state !== 'playing' || this.waveActive || !this.pendingWave) return;
     if (!early) this.lateCallHappened = true;
@@ -1379,12 +1494,20 @@ export class Game {
     this.pendingWave = null;
     this.pendingMutator = null;
     const hordeMul = this.waveMutator === 'horde' ? TUNING.mutators.hordeCountMul : 1;
+    const queued: { t: number; e: string; p: number }[] = [];
     for (const grp of wave) {
       const n = ENEMIES[grp.e].boss ? grp.n : Math.round(grp.n * hordeMul);
       for (let i = 0; i < n; i++) {
-        this.spawnQueue.push({ t: this.now + grp.d + i * grp.iv / hordeMul, e: grp.e, p: grp.p || 0 });
+        queued.push({ t: this.now + grp.d + i * grp.iv / hordeMul, e: grp.e, p: grp.p || 0 });
       }
     }
+    // Wave shapes (Phase 5.1): re-time/reorder the just-expanded queue in place before it
+    // joins the live spawnQueue — this is the ONLY point that matters, since the forecast
+    // preview reads the authored WaveGroup array directly (never the expanded queue), and
+    // shapes are cosmetic/pacing-only (same roster, same total count).
+    const shape = this.level.waveShapes?.[this.waveIdx];
+    if (shape) this.applyWaveShape(shape, queued);
+    this.spawnQueue.push(...queued);
     if (this.scriptDrop && this.waveIdx === 1) {
       this.scriptDrop = false;
       this.nextDropAt = this.now + 4;
@@ -1449,6 +1572,34 @@ export class Game {
     return base * (1 + this.waveIdx * 0.03) * this.diffHp;
   }
 
+  // Flier lanes (Phase 5.4): the curved bezier control point every flier in a given wave
+  // shares — seeded purely by level+wave, so it's identical for every enemy instance (no
+  // shared state needed), for the pre-launch telegraph, and for a mirrored Daily Op (the
+  // seed doesn't depend on portal/base position, only which are already mirrored upstream).
+  // Clamped generously beyond the canvas (portals themselves already sit off-screen) — since a
+  // quadratic bezier's whole curve lies within the convex hull of its 3 points, clamping this
+  // one point is sufficient to guarantee the entire lane stays on/near screen.
+  flierLaneControl(waveIdx: number, portal: { x: number; y: number }, base: { x: number; y: number }): { x: number; y: number } {
+    const r = mulberry32(hashString(`${this.level.id}-fly-${waveIdx}`));
+    const o = (r() < 0.5 ? -1 : 1) * (120 + r() * 120);
+    const dx = base.x - portal.x, dy = base.y - portal.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const px = -dy / len, py = dx / len;
+    const mx = (portal.x + base.x) / 2, my = (portal.y + base.y) / 2;
+    return { x: clamp(mx + px * o, -80, W + 80), y: clamp(my + py * o, -80, H + 80) };
+  }
+  // Phase 6 forward-hook: 16 sampled points along a wave's flier lane, for air-coverage math.
+  // Multi-path levels have one lane per path with fliers; this returns path 0's for simplicity
+  // since nothing consumes it yet — revisit if Phase 6 needs every path's lane.
+  flierLanePoints(waveIdx: number): { x: number; y: number }[] {
+    const portal = this.portalPx[0], base = this.basePx[0];
+    if (!portal || !base) return [];
+    const c = this.flierLaneControl(waveIdx, portal, base);
+    const pts: { x: number; y: number }[] = [];
+    for (let i = 0; i <= 16; i++) pts.push(bezierAt(portal.x, portal.y, c.x, c.y, base.x, base.y, i / 16));
+    return pts;
+  }
+
   mkEnemy(id: string, pathIdx: number, hpMul: number, rewardMul: number) {
     const spec = ENEMIES[id];
     const pi = Math.min(pathIdx, this.paths.length - 1);
@@ -1460,6 +1611,9 @@ export class Game {
     const e = this.mkEnemy(id, near.pathIdx, near.hpMul * 0.7, 1);
     if (spec.flying) {
       e.fx0 = near.x; e.fy0 = near.y;
+      // Boss-spawned minions stay a straight line (Phase 5.4.2) — their origin already varies
+      // with the boss's own position, so a curved lane would be redundant unpredictability.
+      e.fcx = (e.fx0 + e.fx1) / 2; e.fcy = (e.fy0 + e.fy1) / 2;
       e.fDur = Math.max(0.1, dist(near.x, near.y, e.fx1, e.fy1) / spec.speed);
       e.x = near.x; e.y = near.y;
     } else {
@@ -1493,6 +1647,18 @@ export class Game {
         // already includes diffReward, so divide it back out here to apply it exactly once.
         const rewardMul = this.waveRewardMul() / this.diffReward;
         const e = this.mkEnemy(s.e, s.p, hpMul, rewardMul);
+        // Flier lanes (Phase 5.4): every flier THIS wave shares the same seeded curve — the
+        // elite-swift affix speed adjustment below still divides whatever fDur ends up here,
+        // so it must run before that (order preserved from the original straight-line code).
+        if (e.spec.flying) {
+          const pi = Math.min(s.p, this.paths.length - 1);
+          const portal = this.portalPx[pi], base = this.basePx[pi];
+          if (portal && base) {
+            const c = this.flierLaneControl(this.waveIdx, portal, base);
+            e.fcx = c.x; e.fcy = c.y;
+            e.fDur = Math.max(0.1, bezierArcLen(e.fx0, e.fy0, e.fcx, e.fcy, e.fx1, e.fy1) / e.spec.speed);
+          }
+        }
         if (this.waveMutator) this.applyMutator(e);
         // --- elite promotion ---
         if (!e.spec.boss && isUnlocked('elites')) {
@@ -2986,6 +3152,7 @@ export class Game {
     this.drawPatches(g);
     this.drawPortalsAndBases(g);
     this.drawPortalCharge(g);
+    this.drawFlierLaneTelegraph(g);
     this.drawPreviews(g);
 
     for (const t of this.towers) {
@@ -3403,6 +3570,36 @@ export class Game {
       g.globalAlpha = frac * 0.6 * flashCap;
       g.fillStyle = color;
       g.beginPath(); g.arc(0, 0, 8 + frac * 8, 0, 7); g.fill();
+      g.restore();
+    }
+    g.globalAlpha = 1;
+  }
+
+  // Flier lane telegraph (Phase 5.4.3): during an intermission, if the PENDING wave carries
+  // fliers, sketch their shared curved lane ahead of time — this, not the formula, is what
+  // turns anti-air from a build-order habit into a per-wave read. Computable purely from
+  // levelId+waveIdx, so it's exact even before the wave (and its real spawnQueue) exists.
+  drawFlierLaneTelegraph(g: CanvasRenderingContext2D) {
+    if (this.waveActive || !this.pendingWave) return;
+    const wIdx = this.waveIdx + 1;
+    const flierPaths = new Set(this.pendingWave.filter(grp => ENEMIES[grp.e].flying).map(grp => grp.p || 0));
+    if (!flierPaths.size) return;
+    for (const pi of flierPaths) {
+      const portal = this.portalPx[pi], base = this.basePx[pi];
+      if (!portal || !base) continue;
+      const c = this.flierLaneControl(wIdx, portal, base);
+      const flier = this.pendingWave.find(grp => ENEMIES[grp.e].flying && (grp.p || 0) === pi)!;
+      g.save();
+      g.globalAlpha = this.reduceFlash ? 0.18 : 0.3;
+      g.strokeStyle = this.palEnemy(flier.e)[0];
+      g.lineWidth = 2;
+      g.setLineDash([7, 7]);
+      g.beginPath();
+      for (let i = 0; i <= 16; i++) {
+        const p = bezierAt(portal.x, portal.y, c.x, c.y, base.x, base.y, i / 16);
+        if (i === 0) g.moveTo(p.x, p.y); else g.lineTo(p.x, p.y);
+      }
+      g.stroke();
       g.restore();
     }
     g.globalAlpha = 1;

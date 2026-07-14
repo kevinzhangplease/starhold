@@ -706,3 +706,127 @@ readout, and the sell-button forfeit warning exactly as coded.
 
 ### Next
 Phase 5 — Wave Shapes, Flier Lanes & Difficulty Redesign.
+
+---
+
+## Phase 5 — Wave Shapes, Flier Lanes & Difficulty Redesign [COMPLETE]
+Started: 2026-07-14 · Finished: 2026-07-14
+
+### Shipped
+1. **Wave shapes data model** (`data.ts`/`levels.ts`): `WaveShape` type (`rush`/`trickle`/
+   `convoy`/`feint`) + `WAVE_SHAPES` (name/icon/blurb, plan's exact copy). `LevelSpec` gains
+   `waveShapes?: Record<number, WaveShape>` (0-based wave index → shape).
+2. **Shape transforms** (`game.ts` `Game.applyWaveShape()`): operates on the wave's already-
+   expanded spawn-queue entries (real per-enemy timing, not the authored group summary) —
+   **rush** re-spaces the whole wave across a 2.0s window from its earliest spawn; **trickle**
+   re-spaces at flat 3.0s intervals, preserving original arrival order; **convoy** reorders
+   (highest-HP non-mender leader → all menders → everyone else by descending HP) at a tight
+   0.5s cadence, run independently per path on multi-path levels; **feint** stable-splits the
+   queue at ceil(40%), delaying the remaining 60% by +10s (and flipping their path on multi-
+   path levels) — except on a single-path level carrying fliers, where the fliers themselves
+   become the delayed group regardless of the 40/60 cut, since their own curved lane (below)
+   already reads as "a different portal." Wired into `callWave()` right after the queue is
+   built; `rollMutator()` now returns `null` for any shaped wave index — one twist per wave.
+3. **Authored `waveShapes` for L3–L15** per the plan's table, cross-checked against the real
+   wave data (spawn counts, boss/wave-1 exclusion, feint's L7+ gate) — see Decisions below for
+   4 documented deviations where the plan's literal picks violated its own ≤12-spawn trickle
+   guideline against the actual level data.
+4. **Flier lanes** (`game.ts`): straight-line flight replaced with a quadratic bezier —
+   `Enemy` gains `fcx/fcy` (control point, defaults to the straight-line midpoint). A wave's
+   control point is seeded purely by `levelId-fly-waveIdx` (`Game.flierLaneControl`), so every
+   flier in the same wave shares an identical curve, it's exactly reproducible for the pending-
+   wave telegraph before the wave even exists, and it mirrors correctly under a Daily Op
+   (the seed never depends on portal/base position). Flight duration now derives from the
+   curve's actual arc length (16-sample polyline), and facing follows the bezier's tangent
+   instead of a fixed portal→base bearing. Boss-spawned minions (`spawnAt`) explicitly reset
+   their control point back to a straight line — their spawn origin already varies with the
+   boss, a curved lane would be redundant. Elite-swift's `fDur` division (Phase 3-era code)
+   needed no changes — it still divides whatever `fDur` the lane computed. A dashed, enemy-
+   colored arc telegraphs the pending wave's lane during intermission (`drawFlierLaneTelegraph`)
+   whenever it carries fliers, computable before the real spawn queue exists since the seed
+   only needs levelId+waveIdx. `Game.flierLanePoints(waveIdx)` left as a Phase-6 forward-hook
+   (documented simplification: returns path 0's lane only, since nothing consumes it yet).
+5. **Difficulty becomes composition** (`data.ts`/`game.ts`/`ui.ts`): `ENEMY_INTRO` table
+   (enemy id → first-appearance level, cross-validated against every level's `newEnemy` field).
+   `Game.decorateWave(i)` injects one deterministic extra enemy group into eligible Hard+
+   (diffTier ≥ 3) waves — never wave 1, a boss wave, or a shaped wave — seeded by
+   `levelId-inj-i-diffTier`, drawn only from enemies already introduced by that level, sized to
+   ~12% of the wave's bounty (clamped 2–8). Wired into `preparePending()` (both forecast slots
+   route through it, same "roll once, upstream" pattern `rollMutator` already established) so
+   the forecast is never a lie. Brutal (diffTier = 4) replaces the second forecast slot with a
+   "? JAMMED" placeholder — the *current* pending wave stays fully visible; only the one after
+   it goes dark. Difficulty settings rows gained one-line tooltip descriptors, including the
+   Hard/Brutal composition effects.
+6. **Forecast/preview UI** (`ui.ts`): the pill now composes a shape chip OR a mutator chip
+   (never both, by construction — `rollMutator` already excludes shaped waves) with an ✈ badge
+   whenever the composition (including an injected extra group) carries a flier, plus the
+   Brutal blackout card — all reusing the exact `waveIdx+1`/`waveIdx+2` correspondence
+   `preparePending()` guarantees.
+7. **Validation & tests**: `validate.ts` gained a Phase 5 section — `ENEMY_INTRO` completeness/
+   consistency against `newEnemy`, wave-shape authoring rules (no wave 1, no boss wave, feint
+   L7+), and a flier-lane bounds sweep across every level/path/wave at maximum offset (all
+   clean with a 200px canvas margin — no level needed clamping). New `tests/wave-shapes.ts`:
+   pure-formula replication of all 4 transforms, `flierLaneControl` determinism and mirror-
+   safety, and a bounds check across every real level/path/wave combination. `tests/daily-op.ts`
+   extended with `decorateWave` determinism (every level, both runs identical), the wave-1/
+   boss/shaped exclusions, the sub-Hard no-op case, and injected-group well-formedness.
+
+### Real, pre-existing issue caught while implementing (not a regression)
+The wave-forecast pill (`#wave-preview`, right-anchored) and the centered credits/lives/wave
+HUD cluster (`#hud-top`) already shared enough horizontal territory at 1280px width to visually
+overlap during an intermission (when the Launch-wave button also occupies the same row) — this
+predates Phase 5 and was reproducible on a plain, unshaped Normal-difficulty wave. Phase 5's
+content (shape/mutator chips, the ✈ badge, an injected 4th enemy type, and especially the
+Brutal "SIGNAL JAMMED" placeholder) made it wide enough to trigger far more often, and the
+plan's own 5.6 exit criteria explicitly asked to verify width-fit — so fixed it here rather
+than deferring to Phase 6 (whose plan text explicitly assumes the forecast "already fits").
+Fix: `#hud-right` now wraps (`flex-wrap`), with the forecast pill reordered last in the DOM so
+it — not the fixed-width gear/Launch-wave button — is what drops to its own row when space
+runs out; both `#hud-right` and `#wave-preview`'s max-width were widened now that a second row
+has real room to grow into. "SIGNAL JAMMED" also shortened to "JAMMED" (paired with the '?'
+glyph and its full-text tooltip) since even the widened pill couldn't fit the original 13-
+character label pinned as the very last item in an already-long composition row.
+
+### Decisions / deviations
+- **4 trickle wave-shape retargets**: the plan's table picked several trickle waves that
+  violate its own stated ≤12-spawn authoring rule against the levels' *actual* data (only
+  L6's pick was compliant). L9's trickle moved from idx1 (14 spawns) to idx2 (exactly 12,
+  losing the "splitters spaced out" flavor text but gaining exact compliance — trickle's
+  mechanical benefit doesn't depend on which enemy type is involved). L13's moved from idx9
+  (42 spawns — 126s at 3s/spawn, clearly untenable) to idx6 (19 spawns, the smallest available
+  alternative once idx3's the only true ≤12 wave was needed for convoy). L8 (15 spawns) and
+  L14 (16 spawns) were left as mild, documented overages — no compliant alternative existed in
+  L8 without breaking its convoy pairing, and L14's isolated-phaser-blink flavor was judged
+  worth the small stretch over a flavorless exact-fit swap. Full rationale live in `levels.ts`
+  as inline comments at each site.
+- **Cold Focus-style "leader" tie-break for convoy**: when two path-groups in a multi-path
+  convoy wave are literally identical enemy types (e.g. L12's `splitter×5` on both lanes), the
+  "highest-HP non-mender leader" reduces to an arbitrary-but-stable pick among equals — accepted
+  since the transform still produces a valid, deterministic convoy formation per path; the
+  visual "leader" distinction just isn't meaningful when both candidates are the same unit.
+- **`ENEMY_INTRO`'s pool for Hard+ injection uses `this.level.id` even in endless** (`id: 99`),
+  making the entire non-boss roster eligible — a deliberate simplification consistent with
+  endless already unlocking everything else; not special-cased since the plan's own wording
+  ("wherever waveAt(i) feeds preparePending") doesn't exclude endless.
+- **`hard_plus` challenge description left unchanged** — checked per the plan's own hedge ("if
+  it enumerates difficulty effects"); it reads "Win this level on Hard difficulty or higher,"
+  which doesn't enumerate anything and needed no update.
+
+### Known issues
+None. All gates green: `tsc --noEmit`, `validate.ts` (including the 3 new Phase 5 checks —
+`ENEMY_INTRO` consistency, wave-shape authoring rules, and the flier-lane bounds sweep across
+every level/path/wave), full 14-file test suite (13 prior + new `tests/wave-shapes.ts`,
+`daily-op.ts` extended), both builds, and a live 500-tick `?selftest=1` run with 0 errors.
+Manually verified live in a real browser (dev-jump + the "Clear wave" cheat to step through
+waves quickly): L8 wave 3's convoy visibly leads with a brute and tucks a mender directly
+behind it, with the forecast pill correctly labeled "🚚 Convoy"; L4's pending all-wisp wave
+shows a genuinely curved dashed lane arc from portal to base during the intermission, paired
+with the ✈ forecast badge; Hard difficulty on L6 shows a visibly injected 3rd enemy type in
+both forecast slots (and it happened to be a flier, correctly triggering the ✈ badge on the
+injected composition too); Brutal shows the "? JAMMED" second-slot placeholder while the
+current pending wave stays fully detailed; the forecast pill's widened, wrapped layout holds up
+cleanly at both 1280×800 and the 846×390 coarse viewport with the widest real combination
+(Hard-injected 3-type composition + ✈ badge) in both forecast slots simultaneously.
+
+### Next
+Phase 6 — HUD & Information Hierarchy.

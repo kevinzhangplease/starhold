@@ -42,6 +42,17 @@ export const MUTATORS: Record<string, MutatorSpec> = {
   phasing:  { id: 'phasing', name: 'Phasing', icon: '◇', color: '#b0fff4', blurb: '1 in 5 enemies can blink out of reality.', hard: true },
 };
 
+// ---------- Wave shapes (Starhold 3.0 Phase 5) ----------
+// A shape re-times/reorders a wave's already-authored spawn queue — it never changes
+// enemy rosters or stats. See game.ts applyWaveShape() for the transforms themselves.
+export type WaveShape = 'rush' | 'trickle' | 'convoy' | 'feint';
+export const WAVE_SHAPES: Record<WaveShape, { name: string; icon: string; blurb: string }> = {
+  rush:    { name: 'Rush',    icon: '⏩', blurb: 'The whole wave arrives within seconds. Burst damage or bust.' },
+  trickle: { name: 'Trickle', icon: '⋯', blurb: 'One at a time, endlessly spaced. Single-target damage matters.' },
+  convoy:  { name: 'Convoy',  icon: '🚚', blurb: 'A tank leads; support hides behind it. Check your targeting priorities.' },
+  feint:   { name: 'Feint',   icon: '◇', blurb: 'A small opener — then a second group, later, from somewhere else.' },
+};
+
 // ---------- Level modifiers ----------
 export interface ModifierSpec { id: string; name: string; icon: string; blurb: string; gate: string; }
 export const MODIFIER_INFO: Record<string, ModifierSpec> = {
@@ -514,6 +525,14 @@ export const ENEMIES: Record<string, EnemySpec> = {
     color: '#ffb85c', color2: '#cc8a2e', leak: 20, boss: true, shield: 0.35,
     spawnMinion: { id: 'splitter', every: 8, count: 1 }, emp: 12, eyes: 5, counters: ['prism', 'missile'],
   },
+};
+
+// Level id each non-boss enemy first appears at (mirrors each level's `newEnemy` field —
+// validate.ts asserts the two stay consistent). Hard+ wave injection (Phase 5.5) draws only
+// from enemies the player has already met, so an injected extra never introduces a brand-new
+// threat without its own dedicated debut moment.
+export const ENEMY_INTRO: Record<string, number> = {
+  drone: 1, dart: 1, swarmling: 2, brute: 3, wisp: 4, aegis: 6, raptor: 7, mender: 8, splitter: 9, phase: 11,
 };
 
 // ---------- Palette token table (Starhold 3.0 Phase 3B) ----------

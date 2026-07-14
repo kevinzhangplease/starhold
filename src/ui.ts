@@ -1,5 +1,5 @@
 // ================= UI layer =================
-import { TOWERS, META, ABILITIES, ZONES, ENEMIES, PALETTE, TowerSpec, EnemySpec, airClass, setUnlockedLevel, fmt, isUnlocked, MUTATORS, MODIFIER_INFO, CHALLENGE_POOL, CELL_TYPES, TUNING } from './data';
+import { TOWERS, META, ABILITIES, ZONES, ENEMIES, PALETTE, TowerSpec, EnemySpec, airClass, setUnlockedLevel, fmt, isUnlocked, MUTATORS, MODIFIER_INFO, CHALLENGE_POOL, CELL_TYPES, TUNING, WaveShape, WAVE_SHAPES } from './data';
 import { LEVELS, ENDLESS_LEVEL, LevelSpec } from './levels';
 import { Game, Tower, Enemy, W, H } from './game';
 import { audio } from './audio';
@@ -658,12 +658,13 @@ export class UI {
 
     // A labelled segmented control that stacks its label above the chips so the
     // chips can wrap onto a second line instead of forcing horizontal scroll.
-    const mkSegRow = (label: string, options: string[], get: () => number, set: (i: number) => void, restarts: boolean) => {
+    const mkSegRow = (label: string, options: string[], get: () => number, set: (i: number) => void, restarts: boolean, titles?: string[]) => {
       const block = el('div', 'set-block');
       block.append(el('div', 'set-label', label));
       const seg = el('div', 'seg-row');
       options.forEach((opt, i) => {
         const b = el('button', `seg-chip${get() === i ? ' on' : ''}`, opt);
+        if (titles?.[i]) b.title = titles[i];
         b.onclick = () => {
           if (get() === i) return;
           const apply = () => {
@@ -771,7 +772,10 @@ export class UI {
     mkSegRow('Meander', ['Low', 'Medium', 'High'],
       () => s.meander ?? 0, i => { s.meander = i; }, true);
     mkSegRow('Difficulty', ['Relaxed', 'Easy', 'Normal', 'Hard', 'Brutal'],
-      () => s.difficulty ?? 2, i => { s.difficulty = i; }, true);
+      () => s.difficulty ?? 2, i => { s.difficulty = i; }, true,
+      ['Weaker waves, gentler curve.', 'A softer challenge.', 'The default experience.',
+       'Elites and mutators strike more often — and every wave smuggles in an extra enemy type.',
+       'Hard, and the long-range forecast is jammed — only the very next wave is ever visible.']);
     mkSegRow('Game length', ['Short', 'Quick', 'Standard', 'Long', 'Marathon'],
       () => s.length ?? 2, i => { s.length = i; }, true);
     card.append(el('div', 'tiny-note', 'Tile size, meander, difficulty, and game length restart the current level.'));
@@ -1395,7 +1399,11 @@ export class UI {
     this.lastPreviewKey = '';
     const set = el('button', 'icon-btn', '⚙');
     set.onclick = () => { audio.ui('click'); this.showSettings(true); };
-    right.append(preview, call, set);
+    // Order matters for wrapping (Phase 5.6): the settings gear and Launch-wave button are
+    // fixed-width and always belong on the top line; the forecast pill is the variable-width
+    // one, so it goes last — when the row runs out of room it wraps onto its own line below,
+    // rather than bumping the gear/launch button around unpredictably.
+    right.append(call, set, preview);
 
     // boss health bar — top-center, hidden until a boss is alive
     const bossBar = el('div', '');
@@ -1892,8 +1900,14 @@ export class UI {
     };
     const counts = agg(wave);
     const counts2 = g.pending2Wave ? agg(g.pending2Wave) : null;
+    // Shape lookup (Phase 5.6): pendingWave/pending2Wave always correspond to waveIdx+1/+2 —
+    // preparePending() re-fetches both exactly whenever waveIdx advances, so this holds at
+    // every call site, not just right after a wave launches.
+    const shape1 = g.level.waveShapes?.[g.waveIdx + 1] || null;
+    const shape2 = g.level.waveShapes?.[g.waveIdx + 2] || null;
+    const jammed = g.diffTier === 4; // Brutal blackout (5.5.3): the second slot is never shown
     const key = [...counts.entries()].map(([k, v]) => `${k}:${v}`).join(',')
-      + `|${g.pendingMutator || ''}|${counts2 ? [...counts2.keys()].join(',') : ''}|${g.pending2Mutator || ''}`;
+      + `|${g.pendingMutator || ''}|${shape1 || ''}|${jammed ? 'jammed' : counts2 ? [...counts2.keys()].join(',') : ''}|${g.pending2Mutator || ''}|${shape2 || ''}`;
     if (key === this.lastPreviewKey) return;
     this.lastPreviewKey = key;
     wrap.innerHTML = '';
@@ -1905,8 +1919,25 @@ export class UI {
       chip.title = m.blurb;
       parent.append(chip);
     };
+    // A shaped wave never also mutates (game.ts's rollMutator excludes it), so shape and
+    // mutator chips are mutually exclusive by construction — never both render.
+    const mkTwistChip = (shape: WaveShape | null, mid: string | null, parent: HTMLElement) => {
+      if (shape) {
+        const s = WAVE_SHAPES[shape];
+        const chip = el('span', 'wp-mut wp-shape', `${s.icon} ${s.name}`);
+        chip.title = s.blurb;
+        parent.append(chip);
+      } else mkChip(mid, parent);
+    };
+    const hasFlier = (w: { e: string }[]) => w.some(grp => ENEMIES[grp.e].flying);
+    const flierBadge = (parent: HTMLElement) => {
+      const b = el('span', 'wp-flier', '✈');
+      b.title = 'Fliers inbound — check the intermission for their lane.';
+      parent.append(b);
+    };
     wrap.append(el('span', 'wp-label', 'Next:'));
-    mkChip(g.pendingMutator, wrap);
+    mkTwistChip(shape1, g.pendingMutator, wrap);
+    if (hasFlier(wave)) flierBadge(wrap);
     for (const [id, n] of counts) {
       const spec = ENEMIES[id];
       const item = el('div', `wp-item${spec.boss ? ' boss' : ''}`);
@@ -1917,21 +1948,30 @@ export class UI {
       item.title = `${spec.name} — ${spec.desc}${spec.counters ? `\nWeak to: ${spec.counters.map(c2 => TOWERS.find(t => t.id === c2)?.name).filter(Boolean).join(', ')}` : ''}`;
       wrap.append(item);
     }
-    // dimmed second-wave forecast
+    // second-wave forecast: dimmed composition normally, or a "SIGNAL JAMMED" placeholder on
+    // Brutal — the slot itself is kept either way so the layout never jumps between waves.
     if (counts2) {
       const then = el('div', 'wp-then');
       then.append(el('span', 'wp-label', 'Then:'));
-      mkChip(g.pending2Mutator, then);
-      let shown = 0;
-      for (const [id, n] of counts2) {
-        if (shown++ >= 3) { then.append(el('span', 'wp-count', '…')); break; }
-        const spec = ENEMIES[id];
-        const item = el('div', `wp-item${spec.boss ? ' boss' : ''}`);
-        const mini = document.createElement('canvas');
-        mini.width = 96; mini.height = 96;
-        this.drawMiniEnemy(mini, spec);
-        item.append(mini, el('span', 'wp-count', spec.boss ? spec.name : `×${n}`));
-        then.append(item);
+      if (jammed) {
+        const jam = el('div', 'wp-item wp-jammed');
+        jam.append(el('span', 'wp-jam-q', '?'), el('span', 'wp-count', 'JAMMED'));
+        jam.title = 'Brutal difficulty jams the long-range forecast — only the very next wave is visible.';
+        then.append(jam);
+      } else {
+        mkTwistChip(shape2, g.pending2Mutator, then);
+        if (hasFlier(g.pending2Wave!)) flierBadge(then);
+        let shown = 0;
+        for (const [id, n] of counts2) {
+          if (shown++ >= 3) { then.append(el('span', 'wp-count', '…')); break; }
+          const spec = ENEMIES[id];
+          const item = el('div', `wp-item${spec.boss ? ' boss' : ''}`);
+          const mini = document.createElement('canvas');
+          mini.width = 96; mini.height = 96;
+          this.drawMiniEnemy(mini, spec);
+          item.append(mini, el('span', 'wp-count', spec.boss ? spec.name : `×${n}`));
+          then.append(item);
+        }
       }
       wrap.append(then);
     }

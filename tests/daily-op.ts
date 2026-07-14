@@ -4,6 +4,8 @@
 // execution — same workaround already used in validate.ts, reimplementing the short
 // orchestration logic against the REAL, directly-importable rng.ts primitives).
 // Run: node --experimental-strip-types tests/daily-op.ts
+import { ENEMIES, ENEMY_INTRO } from '../src/data.ts';
+import { LEVELS } from '../src/levels.ts';
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
   return function () {
@@ -139,5 +141,74 @@ function applyWin(state: DailyState, today: string): DailyState {
   check(yearS.streak === 9, `year-boundary consecutive day: streak=9, got ${yearS.streak}`);
 }
 
-console.log(fails ? `${fails} FAILURES` : `daily-op: all checks passed (${dates.length} dates x2 determinism + streak-across-dates logic)`);
+// ---------- Hard+ wave decoration determinism (Phase 5.5) ----------
+// Mirrors game.ts's decorateWave() exactly. The Daily Op is always Hard (difficulty 3, see
+// computeDailyOp above) and must reproduce byte-identical decorated waves across runs — this
+// is the actual bar the plan asks for ("same daily seed twice -> identical waves").
+interface WaveGroup { e: string; n: number; iv: number; d: number; p?: number }
+function decorateWave(waves: WaveGroup[][], waveShapes: Record<number, string> | undefined, levelId: number, diffTier: number, i: number): WaveGroup[] | null {
+  const wave = waves[i] || null;
+  if (!wave || diffTier < 3 || i === 0) return wave;
+  if (wave.some(grp => ENEMIES[grp.e]?.boss)) return wave;
+  if (waveShapes?.[i] !== undefined) return wave;
+  const rng = mulberry32(hashString(`${levelId}-inj-${i}-${diffTier}`));
+  const inWave = new Set(wave.map(grp => grp.e));
+  const pool = Object.keys(ENEMIES).filter(id => !ENEMIES[id].boss && !inWave.has(id) && (ENEMY_INTRO[id] ?? 999) <= levelId);
+  if (!pool.length) return wave;
+  const e = pool[Math.floor(rng() * pool.length)];
+  const waveBounty = wave.reduce((a, grp) => a + ENEMIES[grp.e].reward * grp.n, 0);
+  const n = Math.max(2, Math.min(8, Math.ceil(waveBounty * 0.12 / ENEMIES[e].reward)));
+  const times = wave.flatMap(grp => Array.from({ length: grp.n }, (_, k) => grp.d + k * grp.iv));
+  const d = (Math.min(...times) + Math.max(...times)) / 2;
+  const paths = [...new Set(wave.map(grp => grp.p || 0))];
+  const p = paths[Math.floor(rng() * paths.length)];
+  return [...wave, { e, n, iv: 0.9, d, p }];
+}
+{
+  let checked = 0;
+  for (const lv of LEVELS) {
+    for (let i = 0; i < lv.waves.length; i++) {
+      const a = decorateWave(lv.waves, lv.waveShapes, lv.id, 3, i);
+      const b = decorateWave(lv.waves, lv.waveShapes, lv.id, 3, i);
+      check(JSON.stringify(a) === JSON.stringify(b), `L${lv.id} wave ${i}: decorateWave is deterministic (Hard, same seed twice)`);
+      checked++;
+    }
+  }
+  check(checked > 100, `sanity: exercised every wave of every level (${checked})`);
+}
+{
+  // wave 1, boss waves, and shaped waves are NEVER decorated — even on Brutal
+  const lv = LEVELS.find(l => l.id === 5)!; // has a boss wave (mothership) at the end
+  const bossIdx = lv.waves.length - 1;
+  check(JSON.stringify(decorateWave(lv.waves, lv.waveShapes, lv.id, 4, 0)) === JSON.stringify(lv.waves[0]), 'wave 1 is never decorated, even on Brutal');
+  check(JSON.stringify(decorateWave(lv.waves, lv.waveShapes, lv.id, 4, bossIdx)) === JSON.stringify(lv.waves[bossIdx]), 'a boss wave is never decorated');
+  const lv13 = LEVELS.find(l => l.id === 13)!;
+  const shapedIdx = Object.keys(lv13.waveShapes || {}).map(Number)[0];
+  check(JSON.stringify(decorateWave(lv13.waves, lv13.waveShapes, lv13.id, 4, shapedIdx)) === JSON.stringify(lv13.waves[shapedIdx]), 'a shaped wave is never also decorated');
+}
+{
+  // below Hard, decoration is a pure no-op regardless of wave index
+  const lv = LEVELS.find(l => l.id === 3)!;
+  for (let i = 1; i < lv.waves.length - 1; i++) {
+    check(JSON.stringify(decorateWave(lv.waves, lv.waveShapes, lv.id, 2, i)) === JSON.stringify(lv.waves[i]), `L3 wave ${i}: no decoration below Hard (diffTier 2)`);
+  }
+}
+{
+  // when decoration DOES apply, the injected group is well-formed
+  const lv = LEVELS.find(l => l.id === 8)!;
+  let sawInjection = false;
+  for (let i = 1; i < lv.waves.length - 1; i++) {
+    const decorated = decorateWave(lv.waves, lv.waveShapes, lv.id, 3, i);
+    if (!decorated || decorated.length === lv.waves[i].length) continue;
+    sawInjection = true;
+    const injected = decorated[decorated.length - 1];
+    check(!ENEMIES[injected.e].boss, `L8 wave ${i}: injected enemy '${injected.e}' is never a boss`);
+    check(ENEMY_INTRO[injected.e] <= lv.id, `L8 wave ${i}: injected enemy '${injected.e}' has already been introduced by level ${lv.id}`);
+    check(!lv.waves[i].some(grp => grp.e === injected.e), `L8 wave ${i}: injected enemy '${injected.e}' wasn't already in the wave`);
+    check(injected.n >= 2 && injected.n <= 8, `L8 wave ${i}: injected count clamped to [2,8], got ${injected.n}`);
+  }
+  check(sawInjection, 'at least one L8 wave actually got a Hard+ injection (sanity the test isn\'t vacuous)');
+}
+
+console.log(fails ? `${fails} FAILURES` : `daily-op: all checks passed (${dates.length} dates x2 determinism + streak-across-dates logic + decorateWave determinism)`);
 process.exit(fails ? 1 : 0);

@@ -1,6 +1,7 @@
 // ================= Levels =================
 // Coordinates live in a 1280x720 logical playfield.
 // Paths are polylines; ground enemies follow them, fliers cut straight to the base.
+import type { WaveShape } from './data';
 
 export interface WaveGroup { e: string; n: number; iv: number; d: number; p?: number }
 export type Wave = WaveGroup[];
@@ -15,6 +16,7 @@ export interface LevelSpec {
   baseHp: number;
   hpMul: number;
   waves: Wave[];
+  waveShapes?: Record<number, WaveShape>;  // 0-based wave index -> shape (see WAVE_SHAPES in data.ts)
   newEnemy?: { id: string; hint: string };
   modifiers?: string[];      // level-identity modifiers (see MODIFIER_INFO in data.ts)
   challenges?: { id: string; param?: number }[]; // exactly 2 per level, L2+ (see CHALLENGE_POOL in data.ts)
@@ -67,6 +69,7 @@ export const LEVELS: LevelSpec[] = [
       [g('brute', 4, 2.0), g('swarmling', 16, 0.3, 4)],
       [g('brute', 5, 1.8), g('dart', 14, 0.4, 3), g('drone', 10, 0.6, 8)],
     ],
+    waveShapes: { 3: 'rush' },  // dart wave compressed: the rush debut on a fragile-heavy wave
   },
   {
     id: 4, name: 'High Wind', zone: 0, challenges: [{ id: 'specialist', param: 2 }, { id: 'never_sell' }], modifiers: ['asteroids'], startCredits: 320, baseHp: 20, hpMul: 1.5,
@@ -84,6 +87,7 @@ export const LEVELS: LevelSpec[] = [
       [g('brute', 4, 2.0), g('dart', 12, 0.45, 2), g('wisp', 8, 0.8, 6)],
       [g('drone', 16, 0.5), g('wisp', 10, 0.7, 3), g('brute', 3, 2.2, 8)],
     ],
+    waveShapes: { 5: 'rush' },  // the all-wisp wave
   },
   {
     id: 5, name: 'The Mothership', zone: 0, challenges: [{ id: 'perfect_hull' }, { id: 'no_abilities' }], startCredits: 360, baseHp: 20, hpMul: 1.7,
@@ -100,6 +104,7 @@ export const LEVELS: LevelSpec[] = [
       [g('drone', 18, 0.45), g('wisp', 10, 0.7, 4), g('brute', 4, 1.8, 9)],
       [g('mothership', 1, 0, 2), g('wisp', 8, 1.4, 6), g('dart', 12, 0.6, 10)],
     ],
+    waveShapes: { 2: 'convoy', 4: 'rush' },  // brutes+swarmlings convoy; a rush debut
   },
 
   // ---------------- ZONE 2 · Ember Drift ----------------
@@ -124,6 +129,7 @@ export const LEVELS: LevelSpec[] = [
       [g('swarmling', 30, 0.22), g('brute', 4, 1.8, 4)],
       [g('aegis', 8, 1.0), g('brute', 5, 1.6, 5), g('wisp', 8, 0.8, 9)],
     ],
+    waveShapes: { 1: 'trickle', 6: 'rush' },  // 4 aegis, 1-at-a-time shield duels; a rush
   },
   {
     id: 7, name: 'Twin Lanes', zone: 1, challenges: [{ id: 'minimalist', param: 7 }, { id: 'no_abilities' }], startCredits: 380, baseHp: 20, hpMul: 2.3,
@@ -145,6 +151,7 @@ export const LEVELS: LevelSpec[] = [
       [g('dart', 16, 0.35, 0, 0), g('dart', 16, 0.35, 0, 1), g('wisp', 8, 0.8, 4)],
       [g('brute', 6, 1.4, 0, 0), g('brute', 6, 1.4, 0, 1), g('raptor', 9, 0.7, 6)],
     ],
+    waveShapes: { 3: 'convoy', 7: 'feint' },  // darts split across the twin lanes
   },
   {
     id: 8, name: 'The Coil', zone: 1, challenges: [{ id: 'perfect_hull' }, { id: 'never_sell' }], modifiers: ['meteors'], startCredits: 400, baseHp: 20, hpMul: 2.7,
@@ -163,6 +170,11 @@ export const LEVELS: LevelSpec[] = [
       [g('brute', 7, 1.3), g('mender', 3, 2.2, 3), g('raptor', 8, 0.7, 7)],
       [g('drone', 24, 0.35), g('mender', 4, 2.0, 4), g('brute', 5, 1.5, 8)],
     ],
+    // Deviation (Phase 5.3): the trickle wave (idx5, aegis+wisp) runs 15 spawns, 3 over the
+    // plan's <=12 authoring guideline — no smaller wave was free (idx2 is the convoy lesson,
+    // every other wave in this level runs 17+). 15 spawns * 3s = 45s, still a reasonable
+    // single-target duel; accepted rather than break the convoy pairing or force a mismatch.
+    waveShapes: { 2: 'convoy', 5: 'trickle' },  // brutes+menders convoy lesson; a stretched trickle
   },
   {
     id: 9, name: 'Shatterfield', zone: 1, challenges: [{ id: 'speedrunner' }, { id: 'specialist', param: 3 }], startCredits: 420, baseHp: 20, hpMul: 3.1,
@@ -196,6 +208,10 @@ export const LEVELS: LevelSpec[] = [
       [g('brute', 8, 1.2, 0, 0), g('splitter', 6, 1.3, 4, 1), g('dart', 16, 0.35, 8, 0)],
       [g('splitter', 10, 1.0, 0, 0), g('mender', 4, 2.0, 2, 1), g('brute', 6, 1.3, 6, 0), g('wisp', 10, 0.7, 10, 1)],
     ],
+    // Deviation (Phase 5.3): the plan's literal target for trickle was idx1 ("splitters spaced
+    // out", splitter+dart = 14 spawns, 2 over the <=12 cap). Retargeted to idx2 (aegis+raptor =
+    // exactly 12) — a clean, fully-compliant fit one wave later, same "duel" pacing intent.
+    waveShapes: { 2: 'trickle', 7: 'feint' },
   },
   {
     id: 10, name: 'The Colossus', zone: 1, challenges: [{ id: 'perfect_hull' }, { id: 'hard_plus' }], modifiers: ['asteroids', 'rich-veins'], startCredits: 460, baseHp: 20, hpMul: 3.6,
@@ -213,6 +229,7 @@ export const LEVELS: LevelSpec[] = [
       [g('drone', 26, 0.3), g('brute', 6, 1.3, 5), g('wisp', 12, 0.6, 8)],
       [g('colossus', 1, 0, 2), g('aegis', 6, 1.8, 8), g('raptor', 8, 1.0, 14)],
     ],
+    waveShapes: { 2: 'convoy', 6: 'feint' },
   },
 
   // ---------------- ZONE 3 · The Void Reach ----------------
@@ -246,6 +263,7 @@ export const LEVELS: LevelSpec[] = [
       [g('brute', 9, 1.1, 0, 0), g('phase', 8, 1.0, 4, 1), g('mender', 4, 1.8, 8, 0)],
       [g('phase', 12, 0.8, 0, 0), g('splitter', 8, 1.1, 4, 1), g('brute', 6, 1.2, 9, 0), g('wisp', 12, 0.6, 12, 1)],
     ],
+    waveShapes: { 4: 'convoy', 5: 'feint' },  // brutes+menders convoy; phasers/wisps across lanes
   },
   {
     id: 12, name: 'Crossfire', zone: 2, challenges: [{ id: 'speedrunner' }, { id: 'never_sell' }], modifiers: ['ion-storms'], startCredits: 480, baseHp: 20, hpMul: 4.9,
@@ -267,6 +285,7 @@ export const LEVELS: LevelSpec[] = [
       [g('splitter', 8, 1.0, 0, 0), g('splitter', 8, 1.0, 0, 1), g('phase', 8, 0.9, 5)],
       [g('brute', 9, 1.0, 0, 0), g('aegis', 9, 0.9, 1, 1), g('mender', 4, 1.8, 6), g('raptor', 12, 0.55, 9)],
     ],
+    waveShapes: { 2: 'rush', 7: 'feint' },  // splitters both lanes
   },
   {
     id: 13, name: 'Long Night', zone: 2, challenges: [{ id: 'specialist', param: 2 }, { id: 'perfect_hull' }], modifiers: ['meteors', 'rich-veins'], startCredits: 520, baseHp: 20, hpMul: 5.7,
@@ -286,6 +305,12 @@ export const LEVELS: LevelSpec[] = [
       [g('phase', 12, 0.75), g('aegis', 10, 0.8, 4), g('dart', 20, 0.3, 8)],
       [g('brute', 12, 0.9), g('mender', 5, 1.6, 4), g('splitter', 10, 0.9, 8), g('raptor', 14, 0.5, 12)],
     ],
+    // Deviation (Phase 5.3): the plan's literal trickle target was idx9 (phase+aegis+dart =
+    // 42 spawns — at 3s/spawn that's 126s, an untenable single wave). idx3 (the only <=12 wave
+    // in this level) is already the convoy pairing. Retargeted trickle to idx6 (brute+aegis =
+    // 19 spawns, 57s) — the smallest available alternative, still a real deviation from <=12
+    // but far closer to workable than the plan's literal pick.
+    waveShapes: { 3: 'convoy', 6: 'trickle', 7: 'rush' },  // brute+mender convoy; a stretched trickle; the raptor storm
   },
   {
     id: 14, name: 'The Gauntlet', zone: 2, challenges: [{ id: 'hard_plus' }, { id: 'speedrunner' }], modifiers: ['meteors', 'ion-storms'], startCredits: 560, baseHp: 20, hpMul: 6.6,
@@ -306,6 +331,11 @@ export const LEVELS: LevelSpec[] = [
       [g('aegis', 12, 0.7), g('mender', 6, 1.4, 3), g('splitter', 10, 0.9, 7)],
       [g('brute', 14, 0.8), g('phase', 12, 0.7, 5), g('wisp', 16, 0.4, 9), g('mender', 5, 1.5, 12)],
     ],
+    // Deviation (Phase 5.3): trickle at idx1 (phase+aegis = 16 spawns) runs 4 over the plan's
+    // <=12 guideline — the isolated-phaser-blink flavor is exactly what sells "single-target
+    // damage matters", and 48s is still a perfectly normal wave length, so kept as-is rather
+    // than trade the thematic fit away for an exact-compliant but flavorless alternative.
+    waveShapes: { 1: 'trickle', 6: 'convoy', 8: 'feint' },  // phasers/aegis trickle; brute-led convoy; single-path feint (fliers delay)
   },
   {
     id: 15, name: 'The Leviathan', zone: 2, challenges: [{ id: 'perfect_hull' }, { id: 'hard_plus' }], modifiers: ['asteroids', 'meteors', 'ion-storms'], startCredits: 620, baseHp: 20, hpMul: 7.6,
@@ -326,6 +356,7 @@ export const LEVELS: LevelSpec[] = [
       [g('brute', 14, 0.8), g('mender', 6, 1.4, 4), g('raptor', 16, 0.4, 8), g('phase', 12, 0.7, 12)],
       [g('leviathan', 1, 0, 2), g('aegis', 8, 1.6, 10), g('splitter', 8, 1.6, 18), g('raptor', 12, 0.9, 26)],
     ],
+    waveShapes: { 3: 'convoy', 7: 'rush', 9: 'feint' },  // brute+mender convoy; raptors+wisps; a time-only feint
   },
 ];
 

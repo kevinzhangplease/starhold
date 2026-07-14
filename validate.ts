@@ -1,6 +1,6 @@
 // Run with: node --experimental-strip-types validate.ts
 import { LEVELS } from './src/levels.ts';
-import { ENEMIES, TOWERS, META, UNLOCKS, TUNING, fmt, MUTATORS, MODIFIER_INFO, CELL_TYPES, ZONES, CHALLENGE_POOL, LANDMARKS, PALETTE } from './src/data.ts';
+import { ENEMIES, TOWERS, META, UNLOCKS, TUNING, fmt, MUTATORS, MODIFIER_INFO, CELL_TYPES, ZONES, CHALLENGE_POOL, LANDMARKS, PALETTE, ENEMY_INTRO, WAVE_SHAPES } from './src/data.ts';
 import { RESUME_VERSION } from './src/resume.ts';
 import { mulberry32, hashString, seededInt, seededPick } from './src/rng.ts';
 // computeDailyOp itself lives in daily.ts, but daily.ts internally imports from './rng' and
@@ -765,6 +765,67 @@ if (!(RESUME_VERSION >= 1 && Number.isInteger(RESUME_VERSION))) err('RESUME_VERS
     const key = `${e.shape || 'circle'}/${sizeBand(e.size)}/${e.flying ? 'air' : 'ground'}`;
     if (seen.has(key)) err(`Enemies '${seen.get(key)}' and '${e.id}' share (shape, size-band, air/ground) = ${key} — not distinguishable by silhouette alone`);
     else seen.set(key, e.id);
+  }
+}
+
+// ---- Phase 5 (3.0): wave shapes, flier lanes & difficulty composition ----
+{
+  // ENEMY_INTRO must cover every non-boss enemy exactly once, and agree with whatever level
+  // actually first introduces it via `newEnemy` (the two are independent tables authored by
+  // hand — this is the thing that keeps them from drifting apart).
+  const nonBoss = Object.values(ENEMIES).filter(e => !e.boss);
+  for (const e of nonBoss) if (!(e.id in ENEMY_INTRO)) err(`ENEMY_INTRO missing entry for non-boss enemy '${e.id}'`);
+  for (const id of Object.keys(ENEMY_INTRO)) if (!(id in ENEMIES) || ENEMIES[id].boss) err(`ENEMY_INTRO has a stale/boss entry '${id}'`);
+  for (const lv of LEVELS) {
+    if (!lv.newEnemy) continue;
+    const introAt = ENEMY_INTRO[lv.newEnemy.id];
+    if (introAt !== lv.id) err(`Level ${lv.id}'s newEnemy '${lv.newEnemy.id}' debuts here, but ENEMY_INTRO says level ${introAt}`);
+  }
+
+  // Wave shape authoring rules (5.3): never wave 1, never a boss wave, feint only L7+.
+  // Trickle's <=12-spawn guideline is intentionally NOT a hard assertion here — several
+  // levels' actual wave data can't satisfy it without breaking a stronger constraint
+  // (convoy claiming the only small wave in the level); those are documented, judged
+  // deviations in levels.ts itself, not authoring bugs to keep re-flagging forever.
+  for (const lv of LEVELS) {
+    if (!lv.waveShapes) continue;
+    for (const [idxStr, shape] of Object.entries(lv.waveShapes)) {
+      const idx = Number(idxStr);
+      if (!(shape in WAVE_SHAPES)) err(`Level ${lv.id} wave ${idx}: unknown shape '${shape}'`);
+      if (idx === 0) err(`Level ${lv.id} wave ${idx}: shapes never apply to wave 1`);
+      const wave = lv.waves[idx];
+      if (!wave) { err(`Level ${lv.id} wave ${idx}: waveShapes references a wave that doesn't exist`); continue; }
+      if (wave.some(grp => ENEMIES[grp.e]?.boss)) err(`Level ${lv.id} wave ${idx}: shapes never apply to a boss wave`);
+      if (shape === 'feint' && lv.id < 7) err(`Level ${lv.id} wave ${idx}: feint is gated to L7+`);
+    }
+  }
+
+  // Flier lane bounds (5.4.6): the curve's control point (and therefore, by the convex-hull
+  // property of a quadratic bezier, the ENTIRE lane) must stay near the 1280x720 canvas for
+  // every level's portal/base pairs, at both possible offset signs and magnitudes.
+  const W = 1280, H = 720;
+  function flierLaneControl(levelId: number, waveIdx: number, portal: { x: number; y: number }, base: { x: number; y: number }) {
+    const r = mulberry32(hashString(`${levelId}-fly-${waveIdx}`));
+    const o = (r() < 0.5 ? -1 : 1) * (120 + r() * 120);
+    const dx = base.x - portal.x, dy = base.y - portal.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const px = -dy / len, py = dx / len;
+    const mx = (portal.x + base.x) / 2, my = (portal.y + base.y) / 2;
+    return { x: mx + px * o, y: my + py * o };
+  }
+  const MARGIN = 200; // generous — portals themselves already sit ~40px off-canvas by design
+  for (const lv of LEVELS) {
+    for (let pi = 0; pi < lv.paths.length; pi++) {
+      const path = lv.paths[pi];
+      const portal = { x: path[0][0], y: path[0][1] };
+      const base = { x: path[path.length - 1][0], y: path[path.length - 1][1] };
+      for (let waveIdx = 0; waveIdx < lv.waves.length; waveIdx++) {
+        const c = flierLaneControl(lv.id, waveIdx, portal, base);
+        if (c.x < -MARGIN || c.x > W + MARGIN || c.y < -MARGIN || c.y > H + MARGIN) {
+          err(`Level ${lv.id} path ${pi} wave ${waveIdx}: flier lane control point (${c.x.toFixed(0)},${c.y.toFixed(0)}) strays far outside the canvas`);
+        }
+      }
+    }
   }
 }
 
