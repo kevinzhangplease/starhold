@@ -145,6 +145,10 @@ export const TUNING = {
     earlyCallCap: 0.40,        // ...capped at +40% of the wave's bounty
     bountyCoef: 0.27,          // was 0.22 inline in game.ts — moved here and raised (see PROGRESS-3.md)
   },
+  // ---- Starhold 3.0 Phase 3: map, path & portal identity ----
+  portals: {
+    chargeLead: 2,             // seconds before a spawn that its portal starts telegraphing
+  },
 } as const;
 
 export interface StageStats {
@@ -507,6 +511,31 @@ export const ZONES = [
   { name: 'The Void Reach', bg: '#101d22', nebula: ['#1c3a41', '#252b52'], accent: '#a0d8ef',
     tagline: 'Past this point, nothing has ever come back to tell what waits.' },
 ];
+
+// ---------- Background landmarks (Starhold 3.0 Phase 3) ----------
+// Hand-authored, edge/corner-only silhouettes painted onto the cached background canvas —
+// cosmetic, never gameplay-relevant. Coordinates are in the 1280x720 logical playfield.
+// `s` is a 0.6-1.6 scale multiplier. Endless (id 99) has no fixed set — it seed-picks 2
+// entries from this same table at buildBg() time instead (see game.ts).
+export type LandmarkKind = 'planet' | 'moon' | 'derelict' | 'station' | 'comet';
+export interface LandmarkSpec { kind: LandmarkKind; x: number; y: number; s: number }
+export const LANDMARKS: Record<number, LandmarkSpec[]> = {
+  1: [{ kind: 'planet', x: 1180, y: 90, s: 1.3 }, { kind: 'moon', x: 120, y: 640, s: 0.7 }],
+  2: [{ kind: 'station', x: 1150, y: 620, s: 0.9 }, { kind: 'moon', x: 90, y: 100, s: 0.6 }],
+  3: [{ kind: 'comet', x: 200, y: 80, s: 1.0 }, { kind: 'moon', x: 1200, y: 660, s: 0.8 }],
+  4: [{ kind: 'planet', x: 80, y: 620, s: 1.2 }, { kind: 'comet', x: 1150, y: 100, s: 0.8 }],
+  5: [{ kind: 'derelict', x: 1160, y: 120, s: 1.1 }, { kind: 'moon', x: 140, y: 620, s: 0.6 }],
+  6: [{ kind: 'planet', x: 1190, y: 640, s: 1.4 }, { kind: 'comet', x: 150, y: 90, s: 0.7 }],
+  7: [{ kind: 'station', x: 640, y: 60, s: 0.8 }, { kind: 'moon', x: 80, y: 660, s: 0.7 }],
+  8: [{ kind: 'derelict', x: 90, y: 90, s: 0.9 }, { kind: 'moon', x: 1210, y: 650, s: 0.9 }],
+  9: [{ kind: 'comet', x: 1180, y: 80, s: 1.1 }, { kind: 'derelict', x: 110, y: 640, s: 0.8 }],
+  10: [{ kind: 'planet', x: 70, y: 90, s: 1.5 }, { kind: 'station', x: 1190, y: 650, s: 0.7 }],
+  11: [{ kind: 'moon', x: 1200, y: 90, s: 1.0 }, { kind: 'comet', x: 100, y: 640, s: 0.9 }],
+  12: [{ kind: 'station', x: 640, y: 680, s: 0.9 }, { kind: 'moon', x: 90, y: 80, s: 0.6 }],
+  13: [{ kind: 'planet', x: 1200, y: 640, s: 1.3 }, { kind: 'derelict', x: 100, y: 100, s: 0.7 }],
+  14: [{ kind: 'derelict', x: 640, y: 70, s: 1.0 }, { kind: 'comet', x: 1180, y: 640, s: 0.8 }],
+  15: [{ kind: 'planet', x: 640, y: -60, s: 1.6 }, { kind: 'station', x: 120, y: 640, s: 0.8 }],
+};
 
 // helper for UI: air-targeting classification
 export function airClass(spec: TowerSpec): 'no-air' | 'air' | 'air-bonus' | 'support' {

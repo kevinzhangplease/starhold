@@ -282,3 +282,140 @@ placed Sinkhole cell showed the correct tooltip (name, effect text, and `Best fo
 ### Next
 Phase 3 — Map, Path & Portal Identity (seeded backgrounds + landmarks, path channel +
 chevrons, portal charge telegraphs, L9/L11 structural reworks).
+
+---
+
+## Phase 3 — Map, Path & Portal Identity [COMPLETE]
+Started: 2026-07-14 · Finished: 2026-07-14
+
+**Scope note:** executed 3.1-3.7 only, per explicit instruction — Phase 3B ("Visual Identity &
+Readability") was NOT started this session and remains next in the phase map.
+
+### Shipped
+1. **Seeded, persistent backgrounds** (`Game.buildBg()`): nebula blobs, background landmarks,
+   and the star field now all draw from one `mulberry32(hashString('bg-<levelId>'))` stream
+   (endless: `hashString('bg-endless-<runSeed>')`, `runSeed` a new unserialized per-instance
+   `Game` field) instead of `Math.random()`. Reloading the same level now always generates the
+   same sky — verified live via two consecutive Playwright loads of L9 producing
+   pixel-identical screenshots. The rng is threaded through in draw order (blobs -> landmarks
+   -> stars), matching the plan's "continue drawing from it" instruction.
+2. **Hand-authored landmarks** (`data.ts` `LANDMARKS`, `game.ts` `drawLandmarks`/
+   `drawLandmark`): the plan's exact per-level placement table (L1-L15, edge/corner-only,
+   `s` 0.6-1.6) plus five palette-neutral draw recipes (planet/moon/derelict/station/comet),
+   all alpha <=0.5 in the zone's nebula tone with a thin accent rim, painted onto the cached bg
+   canvas. Endless seed-picks 2 entries from the flattened L1-15 table each run (the plan's
+   "positions from a small preset list" — reusing the authored table itself as that preset
+   list, rather than maintaining a second parallel list, since it already has the right shape
+   and variety). Verified live: L6's comet + planet limb and L1's ringed-planet limb are both
+   clearly visible in the corners in the browser.
+3. **The road becomes a road** (`drawTiles`): path tiles are now a genuinely recessed channel
+   (darker fill, softer top overlay, an inset stroke) instead of the old flat tile treatment.
+   The previous plain animated dashed line along each path polyline was removed and replaced
+   with the plan's marching chevrons — small triangles on every second path cell (every third
+   under `perfMode`), offset along each cell's local direction-to-base by `(now*28) % cell`,
+   static under `reduceMotion`. Direction comes from a new `Game.pathOrderedCells` field
+   (renamed from buildGrid()'s existing local `pathCellsOrderedAll`, now stored on the
+   instance instead of discarded after cell placement). Hot portal / calm base: both
+   `drawPortalsAndBases` glows are new — a persistent soft accent-colored radial glow at every
+   portal, a calmer teal one at every base — layered underneath the existing swirl/base icons.
+4. **Portal charge telegraph** (new `Game.drawPortalCharge`, `TUNING.portals.chargeLead = 2`):
+   reads the earliest un-spawned time per path directly out of `spawnQueue`, and renders an
+   expanding ring + brightening core in that pending group's own enemy color, ramping up over
+   the last 2 seconds before it spawns. Because it reads `spawnQueue` rather than wave data,
+   it needs no Phase-5-specific work later for Feint's delayed second group, exactly as the
+   plan predicted — left an `AUDIO-TWIN` comment for Phase 7. `reduceFlash` caps the ramp.
+5. **L9 "Shatterfield" -> fork-rejoin, L11 "Void Door" -> converging lanes** (`levels.ts`):
+   both levels' `paths` replaced with the plan's exact two-polyline arrays; both levels'
+   `waves` rewritten with explicit `p:0`/`p:1` assignments (first group of each wave -> p:0,
+   second -> p:1, third alternates back to p:0, etc.) preserving every wave's original
+   composition, counts, and timings — no engine changes were needed for this, since per-group
+   path assignment (`WaveGroup.p`) and multi-path spawning already existed and are already
+   exercised by L7/L12. Added `LevelSpec.tagline?: string` (new, small) so the level-select
+   card can advertise the structural read — "Two mouths, one door." (L9), "They come from
+   both flanks." (L11) — verified showing on the actual cards. L11's Minimalist challenge
+   param bumped 8 -> 9 per the plan (two lanes with 8 towers was calibrated for one lane).
+   Both levels' `cellPlan` comments updated from forward-looking ("gets a Phase 3 rework") to
+   confirming the placement algorithm needed no changes, since it only ever reads the
+   resulting `pathTiles` set, not the path shape that produced it.
+6. **Asteroid nudges**: L9's original 5 static asteroid positions (authored for the old single
+   winding path) collided with the new fork-rejoin polylines at multiple tile-size/meander
+   combinations — found via a headless collision check (faithfully reimplementing
+   `buildGrid()`'s meander pipeline), all 5 repositioned into verified-safe open pockets
+   between the two lanes. While building that check, it also caught a **real, pre-existing**
+   bug unrelated to this phase's own changes: **Level 6's original asteroid array already
+   collided with Level 6's own (untouched) path** at several tile-size/meander combinations —
+   never caught before because no prior check ever re-applied meander to a static asteroid
+   check (`tests/asteroid-vein-seeding.ts` only covers the *seeded* asteroid/vein modifier
+   cells, which read `pathTiles` as a given rather than needing meander re-applied). Fixed by
+   the same nudge-and-reverify technique, entirely within L6's existing path and roster.
+7. **Validation** (`validate.ts`, new Phase 3 section): LANDMARKS coordinate-bounds and
+   per-level 1-3 entry-count checks (3.2.4); a from-scratch, permanent static
+   asteroid-vs-path collision check across every level with an `asteroids` array x 3 tile
+   sizes x 3 meander tiers (this is the check that caught the L6 bug above, and now guards
+   L6/L9 — and any future level's static asteroids — against regressing); a multi-path
+   portal/base merge check (no two portals or two bases may ever snap to the same tile) across
+   every multi-path level x tile size x meander tier, covering the "widen y-separation to
+   60px if snapping merges them" contingency from 3.5.3 — it never triggered at any tested
+   combo, so no widening was needed. (Path-bounds validation itself — 3.6's other named
+   requirement — was already covered by a pre-existing check from an earlier phase; confirmed
+   it already holds against both new levels' waypoints, nothing to add there.)
+8. Full regression: `tests/mirror-meander-fuzz.ts` (360 trials — all real levels, mirrored +
+   unmirrored, all tile sizes/meander tiers) and `tests/asteroid-vein-seeding.ts` (57
+   level x tile-size combos) both stayed green against the reworked L9/L11, with no changes
+   needed to either test file.
+
+### Decisions / deviations
+- **RESUME_VERSION was NOT bumped, and `runSeed` was NOT added to `ResumeSnapshot`** —
+  contradicts the plan's literal 3.1.3 instruction. Investigated `ui.ts` directly:
+  `saveResumeSnapshot()` unconditionally returns early for endless runs
+  (`if (!g || this.isEndless) return;`, pre-existing, unrelated to this phase) — endless mode
+  has never produced a resume snapshot at all, for anything. The plan's own parenthetical
+  justification for storing `runSeed` was specifically "across a resume" continuity for
+  endless; since that resume path doesn't exist in the engine, persisting `runSeed` would be
+  a dead field with no consumer. Implemented `runSeed` as a plain, unserialized `Game`
+  instance field instead (assigned once per construction, `Math.random()`-seeded) — this
+  exactly matches the existing, accepted precedent already set by the asteroid/vein/cell
+  seeded-placement code in the same file, none of which round-trip across a resume for
+  endless either. If endless resume is ever added in a later phase, `runSeed` becomes a
+  one-line addition to `ResumeSnapshot` at that point, with the version bump that actually
+  needs it.
+- **Recessed-channel inner shadow simplified**: the plan describes a 2px inner shadow "along
+  both long edges" of each path cell, implying per-cell orientation awareness. Implemented as
+  a uniform inset stroke around all 4 edges instead — the marching chevrons already carry the
+  directional read the per-edge version would have added, so tracking each cell's local path
+  orientation a second time (beyond what the chevron pass already computes) would have been
+  bookkeeping for a marginal visual gain. Noted inline in `drawTiles`.
+- **The old plain dashed direction-line was removed**, not kept alongside the new chevrons —
+  the plan doesn't explicitly say to remove it, but two different "which way does the road
+  go" cues stacked on the same tiles would be redundant noise, not reinforcement.
+- **Endless landmark "small preset list" (3.2.3)**: implemented as a seeded pick of 2 from the
+  flattened L1-15 `LANDMARKS` table itself, rather than authoring a second, separate preset
+  list. The full table already is a small, curated, on-theme set — reusing it avoids
+  duplicated authoring surface for no gameplay difference (landmarks are purely cosmetic).
+- **Two new validate.ts checks added beyond the plan's literal 3.6 list** (static
+  asteroid/path collision; multi-path portal/base merge) — both were built as the actual
+  *verification method* for 3.5's own instructions ("check each [asteroid] against both
+  polylines' cell footprints", "widen the y-separation... if grid snapping merges the adjacent
+  portal/base cells"), then kept as permanent `validate.ts` gates rather than thrown away
+  after a one-time manual check, since they're cheap and the asteroid check immediately paid
+  for itself by catching the pre-existing L6 bug (item 6 above).
+- **3.6's path-bounds-check item**: already existed from an earlier phase (`validate.ts`
+  section 1, checking every waypoint against a slightly larger box than the plan's literal
+  `[-40,1320]x[100,680]`); confirmed it already passes against L9/L11's new polylines, so
+  nothing new was added for it specifically.
+
+### Known issues
+None. All gates green: `tsc --noEmit`, `validate.ts` (now including the two new Phase 3
+checks — LANDMARKS bounds/count, static asteroid/path collision, multi-path portal/base
+merge — all clean), full 12-file test suite (unchanged from Phase 2, all still green against
+the reworked levels), both builds, and a live 500-tick `?selftest=1` run with 0 errors.
+Manually verified in a real browser: L9 reloaded twice produced byte-identical background
+screenshots; L9's fork-rejoin and L11's converging lanes both render and play correctly with
+visible chevrons and portal/base glows; L6 and L1 both show their authored landmarks (comet +
+planet limb, ringed planet limb) clearly in the corners; level-select cards show the new "Two
+mouths, one door." / "They come from both flanks." taglines on L9/L11.
+
+### Next
+Phase 3B — Visual Identity & Readability (palette token table, value/temperature split, scale
+hierarchy, idle/uncovered tower feedback, physical hit/death feedback, accessible palette).
+Per Kevin's explicit instruction, do NOT start 3B in the session that shipped this entry.

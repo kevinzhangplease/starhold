@@ -1,6 +1,6 @@
 // Run with: node --experimental-strip-types validate.ts
 import { LEVELS } from './src/levels.ts';
-import { ENEMIES, TOWERS, META, UNLOCKS, TUNING, fmt, MUTATORS, MODIFIER_INFO, CELL_TYPES, ZONES, CHALLENGE_POOL } from './src/data.ts';
+import { ENEMIES, TOWERS, META, UNLOCKS, TUNING, fmt, MUTATORS, MODIFIER_INFO, CELL_TYPES, ZONES, CHALLENGE_POOL, LANDMARKS } from './src/data.ts';
 import { RESUME_VERSION } from './src/resume.ts';
 import { mulberry32, hashString, seededInt, seededPick } from './src/rng.ts';
 // computeDailyOp itself lives in daily.ts, but daily.ts internally imports from './rng' and
@@ -535,6 +535,197 @@ if (!(RESUME_VERSION >= 1 && Number.isInteger(RESUME_VERSION))) err('RESUME_VERS
     }
   }
   console.log(`  (special-cell placement: ${trials} level x tile-size combinations checked)`);
+}
+
+// ---- Phase 3 (3.0): map, path & portal identity ----
+{
+  // 3.2.4: every LANDMARKS coordinate within [-100,1380]x[-100,820]; every level 1-15 has
+  // 1-3 entries.
+  for (let id = 1; id <= 15; id++) {
+    const list = LANDMARKS[id];
+    if (!list || list.length < 1 || list.length > 3) err(`Level ${id}: LANDMARKS should have 1-3 entries (got ${list?.length ?? 0})`);
+    for (const lm of list || []) {
+      if (lm.x < -100 || lm.x > 1380 || lm.y < -100 || lm.y > 820) err(`Level ${id}: landmark ${lm.kind} out of bounds (${lm.x},${lm.y})`);
+    }
+  }
+
+  // Faithful copy of buildGrid()'s meander pipeline (from game.ts) — needed here (unlike the
+  // seeded-placement checks above) because meander tier genuinely changes which tiles the
+  // path occupies, and that's exactly what the two checks below depend on: a static asteroid
+  // colliding with the road, or two portals/bases snapping onto the same tile.
+  interface CPt { c: number; r: number }
+  const ptKey = (p: CPt) => `${p.c},${p.r}`;
+  function rectilinearize(pts: CPt[]): CPt[] {
+    const out: CPt[] = [pts[0]];
+    for (let i = 1; i < pts.length; i++) {
+      const prev = out[out.length - 1], next = pts[i];
+      if (prev.c !== next.c && prev.r !== next.r) out.push({ c: next.c, r: prev.r });
+      out.push(next);
+    }
+    return out;
+  }
+  function walkTiles(pts: CPt[]): CPt[] {
+    const out: CPt[] = [pts[0]];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const a = pts[i], b = pts[i + 1];
+      const dc = Math.sign(b.c - a.c), dr = Math.sign(b.r - a.r);
+      let c = a.c, r = a.r;
+      while (!(c === b.c && r === b.r)) { c += dc; r += dr; out.push({ c, r }); }
+    }
+    return out;
+  }
+  function buildBumps(a: CPt, b: CPt, bumps: number, depth: number, cols: number, rows: number): CPt[] {
+    const horiz = a.r === b.r;
+    const total = horiz ? b.c - a.c : b.r - a.r;
+    const dir = Math.sign(total), mainLen = Math.abs(total), baseline = horiz ? a.r : a.c;
+    const raw: CPt[] = [a];
+    let sign = 1;
+    for (let i = 1; i <= bumps; i++) {
+      const travelled = Math.round((mainLen * i) / (bumps + 1));
+      const mainCoord = (horiz ? a.c : a.r) + dir * travelled;
+      const offRaw = baseline + depth * sign;
+      const off = horiz ? Math.max(1, Math.min(rows - 2, offRaw)) : Math.max(1, Math.min(cols - 2, offRaw));
+      raw.push(horiz ? { c: mainCoord, r: off } : { c: off, r: mainCoord });
+      sign *= -1;
+    }
+    raw.push(b);
+    return rectilinearize(raw);
+  }
+  function meanderSegment(a: CPt, b: CPt, tier: number, cols: number, rows: number, forbidden: Set<string>): CPt[] {
+    const straight = [a, b];
+    if (tier <= 0 || (a.c !== b.c && a.r !== b.r)) return straight;
+    const horiz = a.r === b.r;
+    const mainLen = Math.abs(horiz ? b.c - a.c : b.r - a.r);
+    const minLen = tier >= 2 ? 5 : 7;
+    if (mainLen < minLen) return straight;
+    const maxBumps = tier >= 2 ? Math.max(2, Math.round(mainLen / 4)) : Math.max(1, Math.round(mainLen / 6));
+    const maxDepth = tier >= 2 ? 2 : 1;
+    for (let depth = maxDepth; depth >= 1; depth--) {
+      for (let bumps = maxBumps; bumps >= 1; bumps--) {
+        const candidate = buildBumps(a, b, bumps, depth, cols, rows);
+        const tiles = walkTiles(candidate);
+        const seen = new Set<string>();
+        let collides = false;
+        for (let i = 1; i < tiles.length - 1; i++) {
+          const k = ptKey(tiles[i]);
+          if (forbidden.has(k) || seen.has(k)) { collides = true; break; }
+          seen.add(k);
+        }
+        if (!collides) return candidate;
+      }
+    }
+    return straight;
+  }
+  function applyMeanderV(cellsPts: CPt[], tier: number, cols: number, rows: number): CPt[] {
+    if (cellsPts.length < 2 || tier <= 0) return cellsPts;
+    const spine = new Set(walkTiles(cellsPts).map(ptKey));
+    const claimed = new Set<string>();
+    const markClaimed = (pts: CPt[]) => { for (const p of walkTiles(pts)) claimed.add(ptKey(p)); };
+    const out: CPt[] = [cellsPts[0]];
+    markClaimed([cellsPts[0]]);
+    for (let i = 0; i < cellsPts.length - 1; i++) {
+      const a = cellsPts[i], b = cellsPts[i + 1];
+      const segSpine = new Set(walkTiles([a, b]).map(ptKey));
+      const forbidden = new Set<string>();
+      for (const k of spine) if (!segSpine.has(k)) forbidden.add(k);
+      for (const k of claimed) forbidden.add(k);
+      const seg = meanderSegment(a, b, tier, cols, rows, forbidden);
+      markClaimed(seg);
+      for (let j = 1; j < seg.length; j++) out.push(seg[j]);
+    }
+    return out;
+  }
+  function snapRaw(rawPts: number[][], cell: number) {
+    const top = 70, bottom = 720 - 22;
+    const cols = Math.floor((1280 - 12) / cell);
+    const rows = Math.floor((bottom - top) / cell);
+    const gx0 = (1280 - cols * cell) / 2;
+    const gy0 = top + ((bottom - top) - rows * cell) / 2;
+    const cellsPts: CPt[] = [];
+    for (let i = 0; i < rawPts.length; i++) {
+      let c = Math.round((rawPts[i][0] - gx0 - cell / 2) / cell);
+      let r = Math.round((rawPts[i][1] - gy0 - cell / 2) / cell);
+      r = Math.max(0, Math.min(rows - 1, r));
+      if (i === 0) c = -2;
+      else if (i === rawPts.length - 1) c = cols + 1;
+      else c = Math.max(1, Math.min(cols - 2, c));
+      if (i > 0) {
+        const prev = cellsPts[cellsPts.length - 1];
+        const horiz = Math.abs(rawPts[i][0] - rawPts[i - 1][0]) >= Math.abs(rawPts[i][1] - rawPts[i - 1][1]);
+        if (horiz) r = prev.r; else c = prev.c;
+        if (c === prev.c && r === prev.r) continue;
+      }
+      cellsPts.push({ c, r });
+    }
+    return { cellsPts, cols, rows, gx0, gy0 };
+  }
+  function carveTiles(cellsPts: CPt[], cols: number, rows: number) {
+    const pathTiles = new Set<string>();
+    let firstIn: CPt | null = null, lastIn: CPt | null = null;
+    for (let i = 0; i < cellsPts.length - 1; i++) {
+      const a = cellsPts[i], b = cellsPts[i + 1];
+      const dc = Math.sign(b.c - a.c), dr = Math.sign(b.r - a.r);
+      let c = a.c, r = a.r;
+      while (true) {
+        if (c >= 0 && c < cols && r >= 0 && r < rows) { pathTiles.add(`${c},${r}`); if (!firstIn) firstIn = { c, r }; lastIn = { c, r }; }
+        if (c === b.c && r === b.r) break;
+        c += dc; r += dr;
+      }
+    }
+    return { pathTiles, firstIn: firstIn || cellsPts[0], lastIn: lastIn || cellsPts[cellsPts.length - 1] };
+  }
+
+  // 3.5: the STATIC per-level `asteroids` array must never collide with the actually-carved
+  // path, across every meander tier (meander genuinely changes the tile footprint, so unlike
+  // the seeded-placement checks above, it is NOT skipped here).
+  let asteroidTrials = 0;
+  for (const lv of LEVELS) {
+    if (!lv.asteroids || !lv.asteroids.length) continue;
+    for (const tileSize of [40, 48, 58]) {
+      for (const meander of [0, 1, 2]) {
+        const centers: { x: number; y: number }[] = [];
+        for (const rawPts of lv.paths) {
+          const { cellsPts, cols, rows, gx0, gy0 } = snapRaw(rawPts, tileSize);
+          const meandered = applyMeanderV(cellsPts, meander, cols, rows);
+          const { pathTiles } = carveTiles(meandered, cols, rows);
+          for (const key of pathTiles) {
+            const [c, r] = key.split(',').map(Number);
+            centers.push({ x: gx0 + c * tileSize + tileSize / 2, y: gy0 + r * tileSize + tileSize / 2 });
+          }
+        }
+        asteroidTrials++;
+        for (const a of lv.asteroids) {
+          if (centers.some(p => Math.hypot(p.x - a.x, p.y - a.y) < a.r + tileSize * 0.2)) {
+            err(`Level ${lv.id} tile=${tileSize} meander=${meander}: static asteroid (${a.x},${a.y}) collides with the path`);
+          }
+        }
+      }
+    }
+  }
+  console.log(`  (static asteroid/path collision: ${asteroidTrials} level x tile-size x meander combinations checked)`);
+
+  // Multi-path levels: portals must never snap onto the same tile as each other (nor bases),
+  // across every tile size x meander tier — a merge would silently turn two lanes into one.
+  let mergeTrials = 0;
+  for (const lv of LEVELS) {
+    if (lv.paths.length < 2) continue;
+    for (const tileSize of [40, 48, 58]) {
+      for (const meander of [0, 1, 2]) {
+        const portalKeys: string[] = [], baseKeys: string[] = [];
+        for (const rawPts of lv.paths) {
+          const { cellsPts, cols, rows } = snapRaw(rawPts, tileSize);
+          const meandered = applyMeanderV(cellsPts, meander, cols, rows);
+          const { firstIn, lastIn } = carveTiles(meandered, cols, rows);
+          portalKeys.push(`${firstIn.c},${firstIn.r}`);
+          baseKeys.push(`${lastIn.c},${lastIn.r}`);
+        }
+        mergeTrials++;
+        if (new Set(portalKeys).size < portalKeys.length) err(`Level ${lv.id} tile=${tileSize} meander=${meander}: two portals snap to the same cell`);
+        if (new Set(baseKeys).size < baseKeys.length) err(`Level ${lv.id} tile=${tileSize} meander=${meander}: two bases snap to the same cell`);
+      }
+    }
+  }
+  console.log(`  (multi-path portal/base merge: ${mergeTrials} level x tile-size x meander combinations checked)`);
 }
 
 console.log(errors ? `\n${errors} error(s)` : '\nAll checks passed ✓');

@@ -19,6 +19,7 @@ export interface LevelSpec {
   modifiers?: string[];      // level-identity modifiers (see MODIFIER_INFO in data.ts)
   challenges?: { id: string; param?: number }[]; // exactly 2 per level, L2+ (see CHALLENGE_POOL in data.ts)
   cellPlan?: { ridge?: number; sinkhole?: number; conduitPairs?: number; anchor?: number; nullcell?: number }; // special terrain (see CELL_TYPES in data.ts)
+  tagline?: string;          // shown on the level-select card; used to call out structural identity (Phase 3)
 }
 
 const g = (e: string, n: number, iv = 0.9, d = 0, p = 0): WaveGroup => ({ e, n, iv, d, p });
@@ -107,7 +108,11 @@ export const LEVELS: LevelSpec[] = [
     // Conduit debuts where veins already teach "cells matter".
     cellPlan: { conduitPairs: 1, sinkhole: 1 },
     newEnemy: { id: 'aegis', hint: 'Aegis shields regenerate if left alone. Keep hitting them.' },
-    asteroids: [{ x: 520, y: 300, r: 46 }, { x: 860, y: 480, r: 54 }, { x: 300, y: 560, r: 40 }],
+    // Nudged (Phase 3): the original 3 positions collided with this level's own path at
+    // several tile-size/meander combos — a pre-existing authoring bug caught by validate.ts's
+    // new static asteroid/path collision check (see 3.6), unrelated to this phase's rework
+    // but trivial to fix once found. Re-verified clear across tile 40-58 x meander 0-2.
+    asteroids: [{ x: 740, y: 330, r: 46 }, { x: 1180, y: 510, r: 44 }, { x: 60, y: 530, r: 40 }],
     paths: [[[-40, 160], [640, 160], [640, 400], [320, 400], [320, 620], [1000, 620], [1000, 320], [1320, 320]]],
     waves: [
       [g('drone', 12, 0.7), g('dart', 8, 0.5, 4)],
@@ -161,23 +166,35 @@ export const LEVELS: LevelSpec[] = [
   },
   {
     id: 9, name: 'Shatterfield', zone: 1, challenges: [{ id: 'speedrunner' }, { id: 'specialist', param: 3 }], startCredits: 420, baseHp: 20, hpMul: 3.1,
-    // Splitter swarms — cluster play around the anchor. (Path gets a Phase 3 rework —
-    // this placement is path-relative and survives it untouched; do not special-case it.)
+    // Splitter swarms — cluster play around the anchor. (Reworked into a fork-rejoin in
+    // Phase 3 — this placement is path-relative and needed no changes.)
     cellPlan: { anchor: 1, nullcell: 1, ridge: 1 },
+    // Two mouths, one door. (Phase 3 structural rework: fork-rejoin — adjacent portals fork
+    // immediately, adjacent bases read as a rejoined mouth. See PLAN-3.md 3.5.1.)
+    tagline: 'Two mouths, one door.',
     newEnemy: { id: 'splitter', hint: 'Splitters burst into swarmlings on death. Pop them where your splash can mop up.' },
-    asteroids: [{ x: 380, y: 250, r: 42 }, { x: 700, y: 500, r: 58 }, { x: 950, y: 250, r: 44 }, { x: 200, y: 540, r: 38 }, { x: 1120, y: 520, r: 36 }],
-    paths: [[[-40, 380], [300, 380], [300, 150], [820, 150], [820, 380], [560, 380], [560, 620], [1180, 620], [1180, 380], [1320, 380]]],
+    // Nudged off the new fork-rejoin path footprint (Phase 3) — the original 5 positions,
+    // authored for the old single winding path, collided with the new polylines at several
+    // tile-size/meander combos. Re-verified clear across tile 40-58 x meander 0-2 x mirror
+    // (validate.ts's static asteroid/path collision check now guards this permanently).
+    asteroids: [{ x: 280, y: 450, r: 42 }, { x: 500, y: 350, r: 38 }, { x: 720, y: 110, r: 40 }, { x: 940, y: 650, r: 40 }, { x: 720, y: 630, r: 44 }],
+    paths: [
+      [[-40, 380], [200, 380], [200, 160], [640, 160], [640, 300], [1000, 300], [1000, 380], [1320, 380]],
+      [[-40, 420], [200, 420], [200, 600], [640, 600], [640, 460], [1000, 460], [1000, 420], [1320, 420]],
+    ],
+    // Explicit path assignments (Phase 3): first group of each wave -> p:0, second -> p:1,
+    // third alternates back to p:0, and so on — preserves the original composition/totals.
     waves: [
-      [g('splitter', 3, 2.0), g('drone', 10, 0.6, 2)],
-      [g('splitter', 4, 1.7), g('dart', 10, 0.45, 3)],
-      [g('aegis', 6, 1.2), g('raptor', 6, 0.9, 4)],
-      [g('splitter', 6, 1.4), g('swarmling', 16, 0.26, 4)],
-      [g('brute', 5, 1.5), g('mender', 2, 2.6, 2)],
-      [g('splitter', 6, 1.3), g('wisp', 10, 0.7, 3)],
-      [g('swarmling', 34, 0.2), g('aegis', 6, 1.1, 5)],
-      [g('splitter', 8, 1.1), g('mender', 3, 2.2, 3), g('raptor', 8, 0.7, 6)],
-      [g('brute', 8, 1.2), g('splitter', 6, 1.3, 4), g('dart', 16, 0.35, 8)],
-      [g('splitter', 10, 1.0), g('mender', 4, 2.0, 2), g('brute', 6, 1.3, 6), g('wisp', 10, 0.7, 10)],
+      [g('splitter', 3, 2.0, 0, 0), g('drone', 10, 0.6, 2, 1)],
+      [g('splitter', 4, 1.7, 0, 0), g('dart', 10, 0.45, 3, 1)],
+      [g('aegis', 6, 1.2, 0, 0), g('raptor', 6, 0.9, 4, 1)],
+      [g('splitter', 6, 1.4, 0, 0), g('swarmling', 16, 0.26, 4, 1)],
+      [g('brute', 5, 1.5, 0, 0), g('mender', 2, 2.6, 2, 1)],
+      [g('splitter', 6, 1.3, 0, 0), g('wisp', 10, 0.7, 3, 1)],
+      [g('swarmling', 34, 0.2, 0, 0), g('aegis', 6, 1.1, 5, 1)],
+      [g('splitter', 8, 1.1, 0, 0), g('mender', 3, 2.2, 3, 1), g('raptor', 8, 0.7, 6, 0)],
+      [g('brute', 8, 1.2, 0, 0), g('splitter', 6, 1.3, 4, 1), g('dart', 16, 0.35, 8, 0)],
+      [g('splitter', 10, 1.0, 0, 0), g('mender', 4, 2.0, 2, 1), g('brute', 6, 1.3, 6, 0), g('wisp', 10, 0.7, 10, 1)],
     ],
   },
   {
@@ -200,23 +217,34 @@ export const LEVELS: LevelSpec[] = [
 
   // ---------------- ZONE 3 · The Void Reach ----------------
   {
-    id: 11, name: 'Void Door', zone: 2, challenges: [{ id: 'minimalist', param: 8 }, { id: 'no_abilities' }], startCredits: 440, baseHp: 20, hpMul: 4.2,
+    id: 11, name: 'Void Door', zone: 2, challenges: [{ id: 'minimalist', param: 9 }, { id: 'no_abilities' }], startCredits: 440, baseHp: 20, hpMul: 4.2,
     // Phasers slip past — null slow near the base is the safety net you build around.
-    // (Path gets a Phase 3 rework — this placement is path-relative and survives it untouched.)
+    // (Reworked into converging lanes in Phase 3 — this placement is path-relative and
+    // needed no changes.)
     cellPlan: { ridge: 2, nullcell: 1 },
+    // They come from both flanks. (Phase 3 structural rework: two separate portals — one
+    // top-left, one bottom-left — converging to adjacent base rows on the right. Minimalist's
+    // param bumped 8 -> 9: two lanes with 8 towers was calibrated for one lane. See
+    // PLAN-3.md 3.5.2.)
+    tagline: 'They come from both flanks.',
     newEnemy: { id: 'phase', hint: 'Phasers blink out of reality — untargetable while shimmering. Slows still stick.' },
-    paths: [[[-40, 200], [500, 200], [500, 460], [180, 460], [180, 640], [820, 640], [820, 360], [1120, 360], [1120, 180], [1320, 180]]],
+    paths: [
+      [[-40, 180], [420, 180], [420, 340], [860, 340], [860, 260], [1320, 260]],
+      [[-40, 560], [300, 560], [300, 460], [700, 460], [700, 300], [1320, 300]],
+    ],
+    // Explicit path assignments (Phase 3): first group of each wave -> p:0, second -> p:1,
+    // third alternates back to p:0, and so on — preserves the original composition/totals.
     waves: [
-      [g('phase', 4, 1.6), g('drone', 12, 0.5, 2)],
-      [g('phase', 6, 1.3), g('dart', 12, 0.4, 3)],
-      [g('aegis', 7, 1.1), g('raptor', 8, 0.8, 3)],
-      [g('phase', 7, 1.1), g('splitter', 5, 1.4, 4)],
-      [g('brute', 7, 1.2), g('mender', 3, 2.0, 3)],
-      [g('phase', 8, 1.0), g('wisp', 10, 0.7, 4)],
-      [g('swarmling', 36, 0.19), g('splitter', 6, 1.3, 6)],
-      [g('phase', 9, 0.9), g('aegis', 8, 1.0, 3), g('raptor', 9, 0.7, 7)],
-      [g('brute', 9, 1.1), g('phase', 8, 1.0, 4), g('mender', 4, 1.8, 8)],
-      [g('phase', 12, 0.8), g('splitter', 8, 1.1, 4), g('brute', 6, 1.2, 9), g('wisp', 12, 0.6, 12)],
+      [g('phase', 4, 1.6, 0, 0), g('drone', 12, 0.5, 2, 1)],
+      [g('phase', 6, 1.3, 0, 0), g('dart', 12, 0.4, 3, 1)],
+      [g('aegis', 7, 1.1, 0, 0), g('raptor', 8, 0.8, 3, 1)],
+      [g('phase', 7, 1.1, 0, 0), g('splitter', 5, 1.4, 4, 1)],
+      [g('brute', 7, 1.2, 0, 0), g('mender', 3, 2.0, 3, 1)],
+      [g('phase', 8, 1.0, 0, 0), g('wisp', 10, 0.7, 4, 1)],
+      [g('swarmling', 36, 0.19, 0, 0), g('splitter', 6, 1.3, 6, 1)],
+      [g('phase', 9, 0.9, 0, 0), g('aegis', 8, 1.0, 3, 1), g('raptor', 9, 0.7, 7, 0)],
+      [g('brute', 9, 1.1, 0, 0), g('phase', 8, 1.0, 4, 1), g('mender', 4, 1.8, 8, 0)],
+      [g('phase', 12, 0.8, 0, 0), g('splitter', 8, 1.1, 4, 1), g('brute', 6, 1.2, 9, 0), g('wisp', 12, 0.6, 12, 1)],
     ],
   },
   {

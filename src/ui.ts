@@ -524,6 +524,7 @@ export class UI {
         );
         if (chBadges) card.append(el('div', 'lv-challenges', chBadges));
         if (cellLine) card.append(el('div', 'lv-cells', cellLine));
+        if (lv.tagline) card.append(el('div', 'lv-tagline', lv.tagline));
         if (bothEarned) card.classList.add('all-challenges');
         const bestAsc = this.save.ascension.bestPerLevel[lv.id] || 0;
         if (bestAsc > 0) {

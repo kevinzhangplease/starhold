@@ -813,6 +813,7 @@ body.perf-mode #cell-tip { backdrop-filter: none; -webkit-backdrop-filter: none;
 /* level-card special-cell inventory (Phase 2) — "think about the map on the bus" */
 .level-card .lv-cells { display: flex; gap: 5px; justify-content: center; margin-top: 1px; font-size: 10px; color: var(--sky); cursor: help; }
 .level-card .lv-cell { font-size: 11px; }
+.level-card .lv-tagline { font-size: 9px; font-style: italic; color: var(--ink-dim); text-align: center; opacity: 0.75; margin-top: 1px; }
 
 /* ascension selector row on level select */
 .asc-row { display: flex; align-items: center; gap: 8px; padding: 0 22px 4px; }

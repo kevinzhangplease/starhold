@@ -1,5 +1,5 @@
 // ================= Starhold engine (unified grid, top-down) =================
-import { TOWERS, ENEMIES, ABILITIES, ZONES, TowerSpec, StageStats, EnemySpec, TUNING, isUnlocked, MUTATORS, MODIFIER_INFO, fmt } from './data';
+import { TOWERS, ENEMIES, ABILITIES, ZONES, LANDMARKS, LandmarkSpec, TowerSpec, StageStats, EnemySpec, TUNING, isUnlocked, MUTATORS, MODIFIER_INFO, fmt } from './data';
 import { LevelSpec, WaveGroup } from './levels';
 import { mulberry32, hashString, seededInt } from './rng';
 import { audio } from './audio';
@@ -626,6 +626,13 @@ export class Game {
   nullCellPx: { x: number; y: number }[] = [];            // precomputed centers, for the ground-slow check
   portalPx: { x: number; y: number }[] = [];
   basePx: { x: number; y: number }[] = [];
+  // Ordered path-cell sequence per path (portal -> base), in travel order — the road's
+  // "flow" direction for Phase 3's marching chevrons (and Null Zone's final-third rule).
+  pathOrderedCells: { c: number; r: number }[][] = [];
+  // Per-run identity for endless's background (Phase 3). Not serialized: endless never
+  // produces a resume snapshot (saveResumeSnapshot() bails out for endless runs — see
+  // ui.ts), so there is nothing to round-trip and no RESUME_VERSION bump is needed for it.
+  runSeed = (Math.random() * 1e9) | 0;
 
   selected: Tower | null = null;
   focus: Enemy | null = null;
@@ -733,10 +740,18 @@ export class Game {
     this.totalWaves = endless ? 9999 : this.waves.length;
     this.interT = 9 * (this.ascTier >= 5 ? TUNING.ascension.intermissionMul : 1);
     this.interMax = this.interT;
-    const starCount = this.perfMode ? 66 : 110; // perf mode: -40% starfield density
-    for (let i = 0; i < starCount; i++) this.stars.push({ x: Math.random() * W, y: Math.random() * H, s: rand(0.6, 2.1), p: Math.random() * 7 });
     this.buildGrid();
-    this.buildBg();
+    // Seeded (Phase 3) so the same level always generates the same sky + landmarks. Endless
+    // gets a per-run identity via runSeed instead of the level id — stable for this Game
+    // instance's lifetime, matching the precedent already set by asteroids/veins/cells (see
+    // buildGrid()), none of which round-trip across a resume for endless either.
+    const bgRng = mulberry32(this.endless ? hashString(`bg-endless-${this.runSeed}`) : hashString(`bg-${this.level.id}`));
+    this.buildBg(bgRng);
+    // Star field continues drawing from the same rng, right after the nebula blobs and
+    // landmarks buildBg() already consumed it for — so a level's whole sky, stars included,
+    // is one stable seeded draw.
+    const starCount = this.perfMode ? 66 : 110; // perf mode: -40% starfield density
+    for (let i = 0; i < starCount; i++) this.stars.push({ x: bgRng() * W, y: bgRng() * H, s: 0.6 + bgRng() * 1.5, p: bgRng() * 7 });
     this.preparePending();
     this.lastT = performance.now();
     let watchTime = 0, watchFrames = 0;
@@ -1106,6 +1121,7 @@ export class Game {
         () => 0, true);
     }
 
+    this.pathOrderedCells = pathCellsOrderedAll;
     this.cells = [];
     this.occupied = [];
     this.nullCells = [];
@@ -2589,14 +2605,14 @@ export class Game {
   }
 
   // ---------- background ----------
-  buildBg() {
+  buildBg(rng: () => number) {
     const c = document.createElement('canvas');
     c.width = W; c.height = H;
     const g = c.getContext('2d')!;
     g.fillStyle = this.zone.bg;
     g.fillRect(0, 0, W, H);
     for (let i = 0; i < 7; i++) {
-      const x = Math.random() * W, y = Math.random() * H, r = rand(140, 340);
+      const x = rng() * W, y = rng() * H, r = 140 + rng() * 200;
       const grad = g.createRadialGradient(x, y, 0, x, y, r);
       const col = this.zone.nebula[i % 2];
       grad.addColorStop(0, col + 'aa');
@@ -2604,7 +2620,91 @@ export class Game {
       g.fillStyle = grad;
       g.beginPath(); g.arc(x, y, r, 0, 7); g.fill();
     }
+    this.drawLandmarks(g, rng);
     this.bgCanvas = c;
+  }
+
+  // Hand-authored, edge/corner-only silhouettes (Phase 3) — cosmetic only, painted onto the
+  // cached bg canvas after nebulas, before the grid. Endless has no fixed set: it seed-picks
+  // 2 entries from the same table every run, using the rng continued from the nebula draw.
+  drawLandmarks(g: CanvasRenderingContext2D, rng: () => number) {
+    let list: LandmarkSpec[];
+    if (this.endless) {
+      const pool = Object.values(LANDMARKS).flat();
+      const picks: LandmarkSpec[] = [];
+      for (let i = 0; i < 2 && pool.length; i++) picks.push(pool.splice(seededInt(rng, 0, pool.length - 1), 1)[0]);
+      list = picks;
+    } else {
+      list = LANDMARKS[this.level.id] || [];
+    }
+    for (const lm of list) this.drawLandmark(g, lm, rng);
+  }
+
+  drawLandmark(g: CanvasRenderingContext2D, lm: LandmarkSpec, rng: () => number) {
+    const tone = this.zone.nebula[0];
+    const accent = this.zone.accent;
+    g.save();
+    g.translate(lm.x, lm.y);
+    g.scale(lm.s, lm.s);
+    switch (lm.kind) {
+      case 'planet': {
+        const r = 200;
+        g.globalAlpha = 0.5; g.fillStyle = tone;
+        g.beginPath(); g.arc(0, 0, r, 0, 7); g.fill();
+        g.globalAlpha = 0.35; g.strokeStyle = accent; g.lineWidth = 3;
+        g.beginPath(); g.ellipse(0, 0, r * 1.18, r * 0.22, -0.35, 0, 7); g.stroke();
+        break;
+      }
+      case 'moon': {
+        const r = 40;
+        g.globalAlpha = 0.45; g.fillStyle = tone;
+        g.beginPath(); g.arc(0, 0, r, 0, 7); g.fill();
+        g.globalAlpha = 0.5; g.strokeStyle = accent; g.lineWidth = 1.5;
+        g.beginPath(); g.arc(0, 0, r, -2.4, -1.4); g.stroke();
+        g.globalAlpha = 0.3; g.fillStyle = '#05060f';
+        const craters = 2 + Math.floor(rng() * 2);
+        for (let i = 0; i < craters; i++) {
+          const a = rng() * Math.PI * 2, d = rng() * r * 0.55;
+          g.beginPath(); g.arc(Math.cos(a) * d, Math.sin(a) * d, r * (0.12 + rng() * 0.08), 0, 7); g.fill();
+        }
+        break;
+      }
+      case 'derelict': {
+        g.globalAlpha = 0.45; g.fillStyle = tone;
+        (g as any).beginPath(); (g as any).roundRect(-52, -16, 104, 32, 12); g.fill();
+        g.beginPath(); g.moveTo(-52, -16); g.lineTo(-72, -30); g.lineTo(-52, 4); g.closePath(); g.fill();
+        g.beginPath(); g.moveTo(52, -16); g.lineTo(72, -30); g.lineTo(52, 4); g.closePath(); g.fill();
+        g.globalAlpha = 0.35; g.strokeStyle = accent; g.lineWidth = 1.5;
+        (g as any).beginPath(); (g as any).roundRect(-52, -16, 104, 32, 12); g.stroke();
+        g.globalAlpha = 0.5; g.fillStyle = accent;
+        for (let i = -1; i <= 1; i++) { g.beginPath(); g.arc(i * 24, -2, 3, 0, 7); g.fill(); }
+        break;
+      }
+      case 'station': {
+        g.globalAlpha = 0.4; g.strokeStyle = tone; g.lineWidth = 10;
+        g.beginPath(); g.arc(0, 0, 46, 0, 7); g.stroke();
+        g.globalAlpha = 0.5; g.fillStyle = tone;
+        g.beginPath(); g.arc(0, 0, 16, 0, 7); g.fill();
+        g.globalAlpha = 0.35; g.strokeStyle = accent; g.lineWidth = 3;
+        g.beginPath(); g.moveTo(-46, 0); g.lineTo(46, 0); g.moveTo(0, -46); g.lineTo(0, 46); g.stroke();
+        break;
+      }
+      case 'comet': {
+        const cornerX = lm.x < W / 2 ? 0 : W, cornerY = lm.y < H / 2 ? 0 : H;
+        const ang = Math.atan2(cornerY - lm.y, cornerX - lm.x);
+        const tx = Math.cos(ang) * 220, ty = Math.sin(ang) * 220;
+        const grad = g.createLinearGradient(0, 0, tx, ty);
+        grad.addColorStop(0, accent + 'aa');
+        grad.addColorStop(1, accent + '00');
+        g.globalAlpha = 0.5; g.strokeStyle = grad; g.lineWidth = 14; g.lineCap = 'round';
+        g.beginPath(); g.moveTo(0, 0); g.lineTo(tx, ty); g.stroke();
+        g.globalAlpha = 0.5; g.fillStyle = '#ffffff';
+        g.beginPath(); g.arc(0, 0, 8, 0, 7); g.fill();
+        break;
+      }
+    }
+    g.restore();
+    g.globalAlpha = 1;
   }
 
   // =================================================================
@@ -2631,6 +2731,7 @@ export class Game {
     this.drawModFx(g);
     this.drawPatches(g);
     this.drawPortalsAndBases(g);
+    this.drawPortalCharge(g);
     this.drawPreviews(g);
 
     for (const t of this.towers) {
@@ -2717,11 +2818,18 @@ export class Game {
     for (const c of this.cells) {
       const i = this.idx(c.col, c.row);
       if (c.path) {
-        // path tile — soft filled tile with subtle shadow edge
-        g.fillStyle = 'rgba(0,0,0,0.3)';
+        // recessed channel (Phase 3): the road is the most legible surface on the board —
+        // darker than terrain, with a soft inset edge. (A per-edge inner shadow oriented to
+        // each cell's local path direction was considered but skipped: the marching chevrons
+        // below already carry that directional read, so a uniform inset stroke gets the
+        // "recessed" feel without duplicating bookkeeping for a marginal visual gain.)
+        g.fillStyle = 'rgba(0,0,0,0.42)';
         (g as any).beginPath(); (g as any).roundRect(c.x - s / 2 - 2, c.y - s / 2, s + 4, s + 5, rad); g.fill();
-        g.fillStyle = 'rgba(238,240,255,0.085)';
+        g.fillStyle = 'rgba(238,240,255,0.05)';
         (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2, s, s, rad); g.fill();
+        g.strokeStyle = 'rgba(0,0,0,0.3)';
+        g.lineWidth = 2;
+        (g as any).beginPath(); (g as any).roundRect(c.x - s / 2 + 1, c.y - s / 2 + 1, s - 2, s - 2, Math.max(2, rad - 1)); g.stroke();
         continue;
       }
       if (c.rock) {
@@ -2849,19 +2957,31 @@ export class Game {
     }
     g.globalAlpha = 1;
 
-    // animated direction dashes along each path polyline
-    for (const path of this.paths) {
-      g.strokeStyle = 'rgba(255,255,255,0.14)';
-      g.lineWidth = 3;
-      g.lineCap = 'round';
-      g.setLineDash([12, 26]);
-      g.lineDashOffset = -(this.now * 40) % 38;
-      g.beginPath();
-      g.moveTo(path.pts[0][0], path.pts[0][1]);
-      for (let i = 1; i < path.pts.length; i++) g.lineTo(path.pts[i][0], path.pts[i][1]);
-      g.stroke();
-      g.setLineDash([]);
+    // Directional flow (Phase 3): small chevrons marching toward the base on every second
+    // path cell — supersedes the old plain dashed line, which read as "a road" but not as
+    // "which way." `perfMode` thins to every third cell; `reduceMotion` freezes the march.
+    const chevStep = this.perfMode ? 3 : 2;
+    const chevAlpha = this.reduceMotion ? 0.3 : 0.35;
+    for (const ordered of this.pathOrderedCells) {
+      for (let ci = 0; ci < ordered.length; ci += chevStep) {
+        const cur = ordered[ci];
+        const nxt = ordered[Math.min(ci + 1, ordered.length - 1)];
+        let dx = nxt.c - cur.c, dy = nxt.r - cur.r;
+        if (dx === 0 && dy === 0) continue; // corner tiles can repeat in travel order — skip, direction undefined here
+        const len = Math.hypot(dx, dy); dx /= len; dy /= len;
+        const cx = this.cx(cur.c), cy = this.cy(cur.r);
+        const march = this.reduceMotion ? 0 : (this.now * 28) % this.cell;
+        const ox = cx + dx * march, oy = cy + dy * march;
+        g.save();
+        g.translate(ox, oy);
+        g.rotate(Math.atan2(dy, dx));
+        g.globalAlpha = chevAlpha;
+        g.fillStyle = '#eef0ff';
+        g.beginPath(); g.moveTo(-5, -6); g.lineTo(5, 0); g.lineTo(-5, 6); g.closePath(); g.fill();
+        g.restore();
+      }
     }
+    g.globalAlpha = 1;
   }
 
   // tile-accurate Chebyshev range indicator
@@ -2939,6 +3059,22 @@ export class Game {
     const k = this.k;
     for (let pi = 0; pi < this.paths.length; pi++) {
       const s = this.portalPx[pi];
+      // Hot portal / calm base (Phase 3.3.3): a persistent soft glow so the two ends of the
+      // road read as "in" and "out" at a glance, independent of the charge telegraph on top.
+      const pGlowR = 60 * k;
+      const pGlow = g.createRadialGradient(s.x, s.y, 0, s.x, s.y, pGlowR);
+      pGlow.addColorStop(0, this.zone.accent + '33');
+      pGlow.addColorStop(1, this.zone.accent + '00');
+      g.fillStyle = pGlow;
+      g.beginPath(); g.arc(s.x, s.y, pGlowR, 0, 7); g.fill();
+      const bp = this.basePx[pi];
+      const bGlowR = 55 * k;
+      const bGlow = g.createRadialGradient(bp.x, bp.y, 0, bp.x, bp.y, bGlowR);
+      bGlow.addColorStop(0, '#a0d8ef2e');
+      bGlow.addColorStop(1, '#a0d8ef00');
+      g.fillStyle = bGlow;
+      g.beginPath(); g.arc(bp.x, bp.y, bGlowR, 0, 7); g.fill();
+
       g.save();
       g.translate(s.x, s.y);
       g.scale(k, k);
@@ -2983,6 +3119,39 @@ export class Game {
       g.beginPath(); g.arc(Math.cos(t * 1.4) * 14, Math.sin(t * 1.4) * 14, 2.6, 0, 7); g.fill();
       g.restore();
     }
+  }
+
+  // Portal charge telegraph (Phase 3.4): reads straight off spawnQueue, so a delayed second
+  // group (Phase 5's Feint shape) automatically telegraphs its own portal a beat ahead with
+  // zero extra work here. AUDIO-TWIN: spawn signature (Phase 7).
+  drawPortalCharge(g: CanvasRenderingContext2D) {
+    if (!this.spawnQueue.length) return;
+    const lead = TUNING.portals.chargeLead;
+    const perPath = new Map<number, { t: number; e: string }>();
+    for (const sq of this.spawnQueue) {
+      const cur = perPath.get(sq.p);
+      if (!cur || sq.t < cur.t) perPath.set(sq.p, { t: sq.t, e: sq.e });
+    }
+    const flashCap = this.reduceFlash ? 0.6 : 1;
+    for (const [pi, info] of perPath) {
+      const until = info.t - this.now;
+      if (until > lead || until < -0.4) continue; // small grace so it doesn't cut out a frame early
+      const frac = 1 - clamp(until / lead, 0, 1); // 0 at lead-in, 1 right at spawn
+      const portal = this.portalPx[pi];
+      if (!portal) continue;
+      const color = ENEMIES[info.e].color;
+      g.save();
+      g.translate(portal.x, portal.y);
+      g.globalAlpha = (0.15 + frac * 0.55) * flashCap;
+      g.strokeStyle = color;
+      g.lineWidth = 2.4;
+      g.beginPath(); g.arc(0, 0, 18 + frac * 14, 0, 7); g.stroke();
+      g.globalAlpha = frac * 0.6 * flashCap;
+      g.fillStyle = color;
+      g.beginPath(); g.arc(0, 0, 8 + frac * 8, 0, 7); g.fill();
+      g.restore();
+    }
+    g.globalAlpha = 1;
   }
 
   ampRing(g: CanvasRenderingContext2D, x: number, y: number, _r: number, strong = false) {
