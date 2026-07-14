@@ -12,8 +12,8 @@ const fakeGame = {
   mods: new Set(['meteors', 'rich-veins']), waveIdx: 4, credits: 733, lives: 17,
   novaCharge: 42, novaNeed: 90, cds: { orbital: 3.2, stasis: 0 },
   towers: [
-    { spec: { id: 'pulse' }, cell: 55, stage: 2, branch: 1, branchStage: 1, mode: 'strong', spent: 480, dmgDealt: 12034.5, kills: 61, creditsEarned: 610, vein: true },
-    { spec: { id: 'mortar' }, cell: 88, stage: 0, branch: -1, branchStage: 0, mode: 'first', spent: 120, dmgDealt: 340, kills: 4, creditsEarned: 40, vein: false },
+    { spec: { id: 'pulse' }, cell: 55, stage: 2, branch: 1, branchStage: 1, mode: 'strong', spent: 480, dmgDealt: 12034.5, kills: 61, creditsEarned: 610, vein: true, perk: 'sharp' },
+    { spec: { id: 'mortar' }, cell: 88, stage: 0, branch: -1, branchStage: 0, mode: 'first', spent: 120, dmgDealt: 340, kills: 4, creditsEarned: 40, vein: false, perk: null },
   ],
 };
 const daily = { dateStr: '2026-07-08', levelId: 8, modifiers: ['ion-storms'], mutatorBonus: 0.25, difficulty: 3 };
@@ -33,6 +33,8 @@ check(JSON.stringify([...fakeGame.mods].sort()) === JSON.stringify([...snap!.mod
 check(snap!.towers.length === 2, 'both towers round-trip');
 check(snap!.towers[0].specId === 'pulse' && snap!.towers[0].branch === 1 && snap!.towers[0].vein === true, 'tower[0] fields round-trip');
 check(snap!.towers[1].specId === 'mortar' && snap!.towers[1].kills === 4, 'tower[1] fields round-trip');
+check(snap!.towers[0].perk === 'sharp', 'veteran perk round-trips (Phase 4.6)');
+check(snap!.towers[1].perk === null, 'null perk round-trips as null, not dropped');
 check(snap!.daily !== null && snap!.daily.dateStr === '2026-07-08', 'daily context round-trips');
 
 // --- graceful discard on version mismatch ---

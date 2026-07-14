@@ -70,6 +70,15 @@ for (const t of TOWERS) {
   }
 }
 
+// 3b. Sentinel must be the most expensive BASE tower — range solves coverage AND uptime
+// simultaneously, so it carries the price tag (Phase 4.1).
+{
+  const baseCosts = TOWERS.map(t => ({ id: t.id, cost: t.stages[0].cost }));
+  const maxCost = Math.max(...baseCosts.map(b => b.cost));
+  const sentinel = baseCosts.find(b => b.id === 'sentinel')!;
+  if (sentinel.cost !== maxCost) err(`Sentinel should be the priciest base tower (${sentinel.cost}), but found ${maxCost}`);
+}
+
 // 4. meta requirements resolve
 for (const m of META) {
   if (m.requires && !META.find(x => x.id === m.requires)) err(`Meta ${m.id}: unknown requirement`);

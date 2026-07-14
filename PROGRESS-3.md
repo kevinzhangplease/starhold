@@ -584,3 +584,125 @@ code path is already proven.
 Phase 4 — Tower Depth: Pricing, Verbs, Reactions, Overcharge, Veterancy (range repricing,
 Flame's stacking-burn niche, 3 cross-tower reactions, 5 tier-2 verb rewrites, Overcharge,
 Veterancy).
+
+---
+
+## Phase 4 — Tower Depth: Pricing, Verbs, Reactions, Overcharge, Veterancy [COMPLETE]
+Started: 2026-07-14 · Finished: 2026-07-14
+
+### Shipped
+1. **Range repricing** (`data.ts`): re-priced every Sentinel stage up (Mk I 110→170 through
+   High Warden 340→360) so it's unambiguously the most expensive base-tier tower, matching its
+   half-map reach; Flame Mk I nudged down 120→110 to offset its new stacking-burn niche costing
+   more to *use well* (see below) than a flat stat line would. Added a `validate.ts` assertion
+   (3b) that Sentinel's base-stage cost equals the max base cost across all towers, so a future
+   balance edit can't silently undercut the "reach is never cheap" rule. Blurb copy updated on
+   both towers to state the tradeoff explicitly.
+2. **Flame's stacking-burn niche** (`data.ts`/`game.ts`): `Enemy.igniteStack(dps, dur, now)`
+   replaces a flat `ignite()` — up to 3 stacking applications on the same target
+   (`TUNING.flame.stackMax`), each adding `+50%` effective `burnDps` (`stackStep`), decaying
+   back to 0 stacks if the burn window (`flameStackUntil`) lapses. Fire-particle emission rate
+   scales visibly with stack count so a 3-stacked target reads as "on fire," not just numerically
+   hotter. Hellmouth's `burnSpread: 70` (Phase 4.4) tags a burning-kill's fire to leap to the
+   nearest enemy within 70px, carrying the dying enemy's own current burn stats forward.
+3. **Cross-tower reactions** (`game.ts`, discovery-first via `toastOnce` on first proc):
+   - **Shatter**: any frozen (`frozenUntil > now`), non-boss kill explodes for
+     `min(maxHp × 30%, 250 × currentHpScale())` to nearby foes — the campaign-scaled cap keeps
+     it dangerous-but-bounded from L1 through L15, never a flat trivial number late-game.
+   - **Conduction**: a Tesla chain hit does `×1.5` damage to a target that's already burning.
+   - **Cold Focus**: a Prism's damage ramp normally resets the instant its target dies; a
+     *chilled* kill instead opens a 1s grace window (`coldFocusUntil`) — a fresh target landing
+     within it keeps the ramp climbing instead of restarting at 0. The dead target reference is
+     nulled the instant the window opens so the grace can't be silently re-extended frame after
+     frame by the same stale death.
+   - Codex: new "Synergies" section in the Tower codex explains all three by name and formula,
+     since they're meant to be discovered in play first and looked up second.
+4. **5 tier-2 verb rewrites** (`data.ts`/`game.ts`) — replacing a pure stat bump with a new
+   mechanical read at the tower's signature branch stage:
+   - **Star Lance** (Pulse): `pierceRamp: 0.4` — each enemy struck by the same piercing bolt
+     takes `(1+0.4)^k` more than the last, rewarding a clean line-up over spraying wide.
+   - **Nova Torpedo** (Missile): `directStun: 0.5` — the direct-hit target (not splash victims)
+     is stunned half a second on top of the boom.
+   - **Farlance** (Ray): `farTiles: 3, farMul: 1.5` — the beam does 50% more to anything 3+
+     tiles out along its own line, rewarding long, uninterrupted sightlines.
+   - **Storm Sentinel** (Sentinel): `freshMul: 1.5` — a target still at full HP *and* full
+     shield (if any) takes 50% more, paying off the tower's "First" targeting default.
+   - **Hellmouth** (Flame): `burnSpread: 70` — described above, folds Flame's stacking niche
+     into a genuine area-denial payoff at the top of its tree.
+5. **Overcharge** (`data.ts`/`game.ts`/`ui.ts`): 3 charges per wave (`TUNING.overcharge`),
+   resetting at `callWave()`. Activating a tower (double-tap on the map within 350ms, or the
+   side-panel "⚡ Overcharge (N left)" button) doubles its fire rate for 3s — or its damage,
+   for rate-0 towers (Prism/auras), via the same branch `Tower.stats()` already used for every
+   other multiplier. `Game.canOvercharge`/`activateOvercharge` gate on unlock level, an active
+   wave, remaining charges, not-already-active, and exclude Amp (nothing to double). Feedback:
+   a depleting gold ring + brightened, occasionally-sparking muzzle on the tower (`reduceFlash`
+   caps the brightness pop), a floater, `buzz([18])`, and 3 HUD pips (⚡⚡⚡) that live inside the
+   ability stack itself so they never overlap Orbital/Stasis/NOVA regardless of which are owned,
+   and vanish entirely below the unlock level. Audio reuses `audio.ui('upgrade')` behind an
+   `// AUDIO-TWIN` comment pending Phase 7's dedicated whir.
+6. **Veterancy** (`data.ts`/`game.ts`/`ui.ts`/`resume.ts`): a tower crossing 45 kills
+   (`TUNING.veterancy.kills`) fires a one-time floater/buzz/toast and offers a permanent,
+   irrevocable perk choice the moment its panel is next opened — **Sharp** (+12% damage),
+   **Rapid** (+12% rate), or **Scavenger** (flat bonus credits per kill, scaled by `econScale()`
+   like every other flat credit source so it holds its value all campaign). The choice applies
+   as a flat multiplier layered on top of every other modifier in `Tower.stats()` (buffs, cell
+   type, Overcharge). A gold chevron badge pulses on an eligible-but-unchosen tower and sits
+   steady once a perk is picked (mirrors the Phase 3B.4 uncovered-glyph placement, opposite
+   side). Selling a veteran tower shows a title warning that the perk is forfeit and unrecoverable.
+   `resume.ts`: `RESUME_VERSION` bumped 1→2, `ResumeTower.perk` added and round-tripped through
+   `serializeResume`/`deserializeResume`/the resume-restore path in `ui.ts`.
+7. **Tests**: new `tests/reactions.ts` — pure-formula/state-machine replication (matching
+   precedent) of every Phase 4 system against the real `TUNING` object: Shatter's cap-vs-percent
+   math and campaign scaling, the boss-exclusion gate, Conduction's multiplier, a full Cold
+   Focus grace-window state machine (unchilled reset / chilled-kill grace-open / fresh-target-
+   within-grace / grace-lapsed reset), pierceRamp's compounding math down a 3-enemy line,
+   freshMul's full-hp-and-shield gate, Flame's 3-stack burn scaling, Overcharge's rate-vs-damage
+   branch by tower kind and its full `canOvercharge` gate matrix, and Veterancy's exact-45
+   threshold/perk-math/scav-scaling. `tests/resume.ts` extended with perk round-trip coverage
+   (a chosen `'sharp'` perk and an explicit `null` both round-trip correctly — `null` was
+   deliberately checked separately since a naive spread could silently drop it as `undefined`).
+
+### Real, pre-existing issue caught while implementing (not a regression)
+The plan's phrasing implied `Enemy.ignite()` had two call sites (Flame and Magma/Sunfire
+Mortar's burn). Grepping the actual codebase found exactly one real caller — Mortar's burn is
+a wholly separate ground-"patch" mechanic that applies damage directly via `e.hurt()` in the
+patch-processing loop, bypassing `Enemy.ignite`/`burnDps` entirely. Retargeted the one real
+caller to `igniteStack()` and deleted the now-fully-unused `ignite()` rather than leave dead
+code behind.
+
+### Decisions / deviations
+- **Cold Focus grace-window bug caught before it shipped**: an early draft re-checked
+  `t.target.dead && t.target.slowUntil > now` every frame without ever clearing the stale dead
+  reference, which would have re-opened (re-extended) the grace window indefinitely as long as
+  no new target appeared. Fixed by nulling `t.target` immediately after the one-time check, so
+  the window can only open once per actual death.
+- **Overcharge HUD pips live inside `#ability-stack`** rather than as an independently
+  absolutely-positioned element (the plan's literal "bottom-left action cluster" reading).
+  A first pass placed them at a fixed `bottom:` offset and they visually collided with
+  Orbital/Stasis in headless-browser verification — moving them into the flex-column stack
+  itself means they always land in the right place regardless of which abilities are owned or
+  whether NOVA (gate 7) is unlocked yet, with zero magic-number pixel math to keep in sync.
+- **Sell-button veteran warning uses the existing `title` attribute** (a native tooltip) rather
+  than a new confirmation modal — consistent with the panel's existing lightweight-tooltip
+  pattern for other soft warnings (e.g. the "Can't reach the road" panel copy), and selling is
+  already a single click with an undo window (Phase 1.4) for the first `sellUndoWindow` seconds.
+- **Scav's payout formula reuses `econScale()`** (the same helper backing every other Phase 1
+  flat-credit scaling decision) rather than inventing a Veterancy-specific curve, per the
+  established "flat credit sources scale with econScale, always" precedent from Phase 1.
+
+### Known issues
+None. All gates green: `tsc --noEmit`, `validate.ts` (including the new Sentinel-is-priciest
+assertion), full 13-file test suite (12 prior + new `tests/reactions.ts`, `resume.ts` extended),
+both builds (standard + singlefile), and a live 500-tick `?selftest=1` run with 0 errors —
+exercising `fire()`, `updateProjs()`, `updateTower()`, `onKill()`, `drawTower()`, and
+`Tower.stats()` with every Phase 4 addition wired into the real game loop. Manually verified
+live in a real browser: Overcharge's panel button correctly enables only during an active wave
+and with charges remaining, disables itself and shows "⚡ Overcharged!" on click, the tower
+gets a visible depleting gold ring, and the HUD pips drop from 3 full to 2 full + 1 empty in
+lockstep; a hand-built `resume.ts` snapshot (captured from a real in-game save, then edited to
+`kills: 45`) round-trips through the Resume flow and correctly shows the 3-button "🎖 Veteran —
+choose a permanent perk" chooser, which on click sets the gold badge, the panel performance
+readout, and the sell-button forfeit warning exactly as coded.
+
+### Next
+Phase 5 — Wave Shapes, Flier Lanes & Difficulty Redesign.

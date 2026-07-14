@@ -193,6 +193,8 @@ export class Enemy {
   slowPct = 0; slowUntil = 0;
   frozenUntil = 0;
   burnDps = 0; burnUntil = 0;
+  flameStacks = 0; flameStackUntil = 0;   // Flame's stacking-burn niche (Phase 4.2)
+  flameSpread = false;                    // set when ignited by a Hellmouth-branch tower (Phase 4.4)
   dead = false; leaked = false;
   wobble = Math.random() * 10;
   flashT = 0;
@@ -271,9 +273,17 @@ export class Enemy {
   applySlow(pct: number, dur: number, now: number) {
     if (pct >= this.slowPct || now >= this.slowUntil) { this.slowPct = pct; this.slowUntil = now + dur; }
   }
-  ignite(dps: number, dur: number, now: number) {
-    this.burnDps = Math.max(this.burnDps, dps);
+  // Flame's niche (Phase 4.2): repeated ignitions from a held Flame stack up to 3x
+  // instead of just refreshing a max-based burn — "nothing melts a chokepoint like a
+  // committed Flame." This is the only ignition path in the game (Magma/Sunfire Mortar's
+  // burn is a separate ground-patch mechanic that calls hurt() directly, not this method).
+  igniteStack(dps: number, dur: number, now: number) {
+    if (now > this.flameStackUntil) this.flameStacks = 0;
+    this.flameStacks = Math.min(TUNING.flame.stackMax, this.flameStacks + 1);
+    const eff = dps * (1 + TUNING.flame.stackStep * (this.flameStacks - 1));
+    this.burnDps = Math.max(this.burnDps, eff);
     this.burnUntil = Math.max(this.burnUntil, now + dur);
+    this.flameStackUntil = this.burnUntil;
   }
   update(dt: number, now: number, game: Game) {
     if (this.dead) return;
@@ -291,7 +301,12 @@ export class Enemy {
     }
     if (now < this.burnUntil && this.burnDps > 0) {
       this.hurt(this.burnDps * dt, game, true);
-      if (Math.random() < dt * 10) game.fireFx(this.x + rand(-6, 6), this.y + rand(-6, 6));
+      // Fire-particle emission scales with flame stacks (Phase 4.2) — a triple-stacked
+      // burn visibly rages harder than a single tick.
+      const emitRate = this.flameStacks > 0 && now < this.flameStackUntil ? 10 + this.flameStacks * 6 : 10;
+      if (Math.random() < dt * emitRate) game.fireFx(this.x + rand(-6, 6), this.y + rand(-6, 6));
+    } else if (now > this.flameStackUntil) {
+      this.flameStacks = 0;
     }
     if (this.maxShield && this.shield < this.maxShield && now > this.shieldRegenAt) {
       this.shield = Math.min(this.maxShield, this.shield + this.maxShield * 0.28 * dt);
@@ -459,6 +474,10 @@ export class Tower {
   // --- idle & uncovered feedback (Phase 3B.4) ---
   pathCellsInRange = 0;   // cached; recomputed on build/move/upgrade/grid-rebuild (Game.recomputeCoverage)
   noTargetSince = -1;     // game-time the tower last had no target/beam/aura-hit; -1 while actively engaged
+  // --- Phase 4: tower depth ---
+  coldFocusUntil = 0;         // Cold Focus reaction (4.3): grace window a Prism's ramp survives a chilled kill
+  overchargedUntil = 0;       // Overcharge (4.5): not serialized — resume snapshots are wave-clear only and charges replenish at wave launch
+  perk: 'sharp' | 'rapid' | 'scav' | null = null;   // Veterancy (4.6): chosen once at the 45-kill threshold, irrevocable
 
   constructor(spec: TowerSpec, x: number, y: number) {
     this.spec = spec; this.x = x; this.y = y;
@@ -476,13 +495,25 @@ export class Tower {
   rangeT() { return Math.max(1, Math.round(this.raw.range * (1 + this.bRange)) + this.cellRangeAdd); }
   stats(game: Game) {
     const r = this.raw;
+    // Overcharge (Phase 4.5): firing towers (rate > 0) get a fire-rate multiplier;
+    // rate-0 towers (Prism/auras) get a damage multiplier instead, since there's no fire
+    // rate to boost. Stacks multiplicatively with the supply-drop Overclock — rare and
+    // short enough that the double-dip is a delightful spike, not a balance problem.
+    const overcharged = game.now < this.overchargedUntil;
+    const OC = TUNING.overcharge;
+    // Veterancy (Phase 4.6): a chosen perk applies a flat multiplier on top of everything else.
+    const V = TUNING.veterancy.perks;
+    const perkDmgMul = this.perk === 'sharp' ? 1 + V.sharp : 1;
+    const perkRateMul = this.perk === 'rapid' ? 1 + V.rapid : 1;
+    const dmgMul = (1 + this.bDmg) * game.metaDmgMul * this.cellDmgMul * perkDmgMul * (overcharged && r.rate === 0 ? OC.rateMul : 1);
+    const rateMul = (1 + this.bRate) * (game.now < game.overclockUntil ? 1 + TUNING.drops.overclockRate : 1)
+      * (game.stormRow0 >= 0 && game.now > game.stormWarnUntil && this.row >= game.stormRow0 && this.row < game.stormRow0 + TUNING.ionStorms.bandRows ? 1 - TUNING.ionStorms.ratePenalty : 1)
+      * this.cellRateMul * perkRateMul * (overcharged && r.rate > 0 ? OC.rateMul : 1);
     return {
       ...r,
-      dmg: r.dmg * (1 + this.bDmg) * game.metaDmgMul * this.cellDmgMul,
-      burnDps: r.burnDps ? r.burnDps * (1 + this.bDmg) * game.metaDmgMul * this.cellDmgMul : r.burnDps,
-      rate: r.rate * (1 + this.bRate) * (game.now < game.overclockUntil ? 1 + TUNING.drops.overclockRate : 1)
-        * (game.stormRow0 >= 0 && game.now > game.stormWarnUntil && this.row >= game.stormRow0 && this.row < game.stormRow0 + TUNING.ionStorms.bandRows ? 1 - TUNING.ionStorms.ratePenalty : 1)
-        * this.cellRateMul,
+      dmg: r.dmg * dmgMul,
+      burnDps: r.burnDps ? r.burnDps * dmgMul : r.burnDps,
+      rate: r.rate * rateMul,
       range: this.rangeT(),
       crit: (r.crit || 0) + this.bCrit,
     };
@@ -509,12 +540,15 @@ interface Bullet {
   color: string; pierce: number; hit: Set<Enemy>; life: number; w: number;
   target?: Enemy | null;
   slow?: number; slowDur?: number; freeze?: number; crit?: number; trail: number[][];
+  pierceRamp?: number;   // Star Lance (Phase 4.4): each pierced enemy takes (1+pierceRamp)^k more
+  freshMul?: number;     // Storm Sentinel (Phase 4.4): multiplier vs targets still at full hp/shield
   owner?: Tower;
 }
 interface Missile {
   kind: 'missile'; x: number; y: number; vx: number; vy: number; speed: number;
   target: Enemy | null; dmg: number; splash: number; airMul: number; color: string;
   life: number; wig: number; trail: number[][];
+  directStun?: number;   // Nova Torpedo (Phase 4.4): stun seconds on the direct target only
   owner?: Tower;
 }
 interface Shell {
@@ -585,6 +619,9 @@ export class Game {
   nextDropAt = 0;
   forceNextDrop = false;
   overclockUntil = -99;
+  // --- Overcharge (Phase 4.5) --- not serialized: resume snapshots are wave-clear only and
+  // charges replenish at wave launch, so there's nothing mid-wave to round-trip.
+  overchargeLeft = 0;
   // --- scripted first encounters (set by UI for fresh saves) ---
   scriptElite = false;
   scriptDrop = false;
@@ -1330,6 +1367,13 @@ export class Game {
     this.waveIdx++;
     this.waveActive = true;
     this.interT = 0;
+    if (isUnlocked('overcharge')) {
+      this.overchargeLeft = TUNING.overcharge.charges;
+      // L4 is the "things you TAP" level alongside drops — deliberate pairing (Phase 4.5).
+      if (!this.endless && this.level.id === 4 && this.waveIdx === 0) {
+        this.onToast('overcharge', 'OVERCHARGE — tap a tower during a wave, then hit ⚡ to double its fire rate for 3 seconds. 3 charges per wave.');
+      }
+    }
     const wave = this.pendingWave;
     this.waveMutator = this.pendingMutator;
     this.pendingWave = null;
@@ -1774,8 +1818,24 @@ export class Game {
         inRange.unshift(this.focus);
       }
       const targets = inRange.slice(0, beams);
-      if (targets.length && targets[0] === t.target) t.rampT += dt;
-      else { t.rampT = targets.length ? dt : 0; t.target = targets[0] || null; }
+      if (targets.length && targets[0] === t.target) {
+        t.rampT += dt;
+      } else {
+        // Cold Focus (Phase 4.3): a chilled kill doesn't break the ramp — open a grace
+        // window instead of resetting immediately; a fresh target within it continues the
+        // ramp. The dead reference is consumed (nulled) right after the check so this can
+        // only fire once per death, not re-extend the window every subsequent frame.
+        if (t.target && t.target.dead && t.target.slowUntil > this.now) {
+          t.coldFocusUntil = this.now + TUNING.reactions.coldFocusGrace;
+          this.onToast('react_coldfocus', "COLD FOCUS! A chilled kill doesn't break a Prism's ramp — land a fresh target within a second and it keeps building.");
+        }
+        if (t.target && t.target.dead) t.target = null;
+        if (this.now < t.coldFocusUntil) {
+          if (targets.length) { t.rampT += dt; t.target = targets[0]; }
+        } else {
+          t.rampT = targets.length ? dt : 0; t.target = targets[0] || null;
+        }
+      }
       t.beamTargets = targets;
       if (targets.length) {
         t.angle = Math.atan2(targets[0].y - t.y, targets[0].x - t.x);
@@ -1848,6 +1908,7 @@ export class Game {
           kind: 'bullet', owner: t, x: bx, y: by, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed,
           dmg: s.dmg, color: this.palTower(t.spec.id)[0], pierce: s.pierce || 0, hit: new Set(), life: 1.6,
           w: s.pierce ? 5 : 3.4, crit: s.crit, trail: [], target: e,
+          pierceRamp: s.pierceRamp, freshMul: s.freshMul,
         });
         break;
       }
@@ -1871,6 +1932,7 @@ export class Game {
             kind: 'missile', owner: t, x: bx, y: by, vx: Math.cos(a) * 120, vy: Math.sin(a) * 120,
             speed: 150, target: e, dmg: s.dmg, splash: s.splash || 24, airMul: s.airMul || 1,
             color: this.palTower(t.spec.id)[0], life: 5, wig: Math.random() * 9, trail: [],
+            directStun: s.directStun,
           });
         }
         break;
@@ -1909,7 +1971,14 @@ export class Game {
           this.bolts.push({ pts: this.mkBolt(px, py, en.x, en.y), life: 0.14, color: this.palTower(t.spec.id)[0] });
           px = en.x; py = en.y;
           const crit = Math.random() < (s.crit || 0) ? 2.5 : 1;
-          en.hurt(s.dmg * Math.pow(falloff, i) * crit, this, false, t);
+          let dmg = s.dmg * Math.pow(falloff, i) * crit;
+          // Conduction (Phase 4.3): burning enemies take extra from Tesla chains.
+          if (en.burnUntil > this.now) {
+            dmg *= TUNING.reactions.conductionMul;
+            this.spark(en.x, en.y, '#ffd97a', 3);
+            this.onToast('react_conduction', 'CONDUCTION! Burning enemies take +50% from Tesla chains — Flame sets them alight, Tesla cashes in.');
+          }
+          en.hurt(dmg, this, false, t);
           if (s.stun && Math.random() < s.stun) { en.frozenUntil = Math.max(en.frozenUntil, this.now + 0.8); this.spark(en.x, en.y, '#fff3b0', 4); }
           this.spark(en.x, en.y, '#fff3b0', 2);
         });
@@ -1930,7 +1999,11 @@ export class Game {
           const perp = Math.abs((en.x - t.x) * dy - (en.y - t.y) * dx);
           if (perp < w + en.spec.size * 0.6) {
             const crit = Math.random() < (s.crit || 0) ? 2.5 : 1;
-            en.hurt(s.dmg * crit, this, false, t);
+            // Farlance (4.4): a real placement verb — build it far back and enemies deep in
+            // its beam take extra, pairing naturally with ridge cells.
+            const farDist = Math.max(Math.abs(this.colOf(en.x) - t.col), Math.abs(this.rowOf(en.y) - t.row));
+            const farBonus = s.farTiles && farDist >= s.farTiles ? (s.farMul || 1) : 1;
+            en.hurt(s.dmg * crit * farBonus, this, false, t);
             this.spark(en.x, en.y, this.palTower(t.spec.id)[0], 2);
           }
         }
@@ -1950,7 +2023,8 @@ export class Game {
           while (diff < -Math.PI) diff += Math.PI * 2;
           if (Math.abs(diff) < cone) {
             en.hurt(s.dmg, this, true, t);
-            en.ignite(s.burnDps || 10, s.burnDur || 2.5, this.now);
+            en.igniteStack(s.burnDps || 10, s.burnDur || 2.5, this.now);
+            if (s.burnSpread) en.flameSpread = true;   // Hellmouth (Phase 4.4): tag for onKill's spread check
             if (Math.random() < 0.5) this.fireFx(en.x + rand(-5, 5), en.y + rand(-5, 5));
           }
         }
@@ -1999,9 +2073,14 @@ export class Game {
           // non-piercing homing bullets only connect with their own target
           if (!p.pierce && p.target && e !== p.target) continue;
           if (dist(p.x, p.y, e.x, e.y) < e.spec.size + 6) {
+            const pierceK = p.hit.size;   // Star Lance (4.4): pierce index of THIS hit, 0 for the first enemy struck
             p.hit.add(e);
             const crit = Math.random() < (p.crit || 0) ? 2.5 : 1;
-            e.hurt(p.dmg * crit, this, false, p.owner);
+            const pierceMul = p.pierceRamp ? Math.pow(1 + p.pierceRamp, pierceK) : 1;
+            // Storm Sentinel (4.4): the "First" targeting read pays off — a target still at
+            // full hp (and full shield, if shielded) takes extra, rewarding a clean opener.
+            const fresh = p.freshMul && e.hp >= e.maxHp && (e.maxShield === 0 || e.shield >= e.maxShield);
+            e.hurt(p.dmg * crit * pierceMul * (fresh ? p.freshMul! : 1), this, false, p.owner);
             if (crit > 1) this.floater(e.x, e.y - 22, 'CRIT', '#fff3b0');
             if (p.slow) { e.applySlow(p.slow, p.slowDur || 2, now); this.spark(e.x, e.y, '#a0d8ef', 3); }
             if (p.freeze && Math.random() < p.freeze) { e.frozenUntil = now + 1.2; e.brittle = true; audio.freezeCrack(); this.spark(e.x, e.y, '#ffffff', 6); }
@@ -2034,6 +2113,11 @@ export class Game {
         if (p.target && dist(p.x, p.y, p.target.x, p.target.y) < p.target.spec.size + 8) boom = true;
         if (boom) {
           this.projs.splice(i, 1);
+          // Nova Torpedo (Phase 4.4): the direct target gets stunned — splash victims don't.
+          if (p.directStun && p.target && !p.target.dead) {
+            p.target.frozenUntil = Math.max(p.target.frozenUntil, now + p.directStun);
+            this.spark(p.target.x, p.target.y, '#fff3b0', 4);
+          }
           this.explode(p.x, p.y, p.splash, p.dmg, p.color, p.airMul, false, (p as any).owner);
         }
       } else {
@@ -2358,8 +2442,18 @@ export class Game {
     }
     // --- per-tower stats: kill + credit attribution (for the side-panel readout) ---
     if (e.lastHitBy && this.towers.includes(e.lastHitBy)) {
-      e.lastHitBy.kills++;
-      e.lastHitBy.creditsEarned += reward;
+      const kt = e.lastHitBy;
+      kt.kills++;
+      kt.creditsEarned += reward;
+      // Veterancy (Phase 4.6): crossing the kill threshold offers a one-time, irrevocable
+      // perk choice. The badge/pulse itself is drawn every frame straight off kills/perk
+      // (drawTower); this just fires the one-time floater/haptic/toast at the crossing.
+      if (isUnlocked('veterancy') && kt.kills === TUNING.veterancy.kills && !kt.perk) {
+        this.floater(kt.x, kt.y - 34, 'VETERAN', '#ffd97a');
+        this.buzz([12, 30, 12]);
+        this.onToast('veterancy', 'VETERAN — this tower earned a perk. Open its panel to choose one; the choice is permanent, and selling forfeits it.');
+        if (this.selected === kt) this.onSelect();   // panel already open — show the chooser immediately
+      }
     }
     // --- rich vein bonus: killing blow landed by a tower on a vein cell ---
     if (e.lastHitBy && e.lastHitBy.vein && this.towers.includes(e.lastHitBy)) {
@@ -2367,6 +2461,14 @@ export class Game {
       this.credits += v;
       e.lastHitBy.creditsEarned += v;
       this.floater(e.lastHitBy.x, e.lastHitBy.y - 26, `+${v}◆`, '#d6f7ff');
+    }
+    // --- Scavenger perk payout (Phase 4.6): flat credit per kill, scaled at payout time
+    // (like every other flat credit source) so it holds its relative value all campaign. ---
+    if (e.lastHitBy && e.lastHitBy.perk === 'scav' && this.towers.includes(e.lastHitBy)) {
+      const v = Math.max(1, Math.round(TUNING.veterancy.perks.scav * this.econScale()));
+      this.credits += v;
+      e.lastHitBy.creditsEarned += v;
+      this.floater(e.lastHitBy.x, e.lastHitBy.y - 26, `+${v}◆`, '#ffd97a');
     }
     // --- elite bonus ---
     if (e.isElite) {
@@ -2398,6 +2500,34 @@ export class Game {
         const child = this.mkEnemy(e.spec.splits.id, e.pathIdx, e.hpMul, 1);
         child.d = Math.max(0, e.d + rand(-16, 16));
         this.enemies.push(child);
+      }
+    }
+    // --- Shatter (Phase 4.3): frozen enemies explode on death. Runs after splits spawn, so
+    // a shattering splitter's own blast can catch its freshly-spawned swarmlings — allowed,
+    // delightful chain reaction. The kill source doesn't matter; "frozen things shatter" is
+    // the whole learnable rule (the Cryo->splash pairing emerges naturally since splash is
+    // what kills groups of frozen enemies). ---
+    if (e.frozenUntil > this.now && !e.spec.boss) {
+      const R = TUNING.reactions;
+      const dmg = Math.min(e.maxHp * R.shatterFrac, R.shatterCap * this.currentHpScale());
+      this.explode(e.x, e.y, R.shatterRadius, dmg, '#a0d8ef', 1, false);
+      audio.freezeCrack();
+      this.onToast('react_shatter', 'SHATTER! Frozen enemies explode when killed — Cryo sets them up, splash knocks them down.');
+    }
+    // --- Hellmouth (Phase 4.4): a burning kill's fire leaps to the nearest enemy within
+    // 70px, carrying the dying enemy's own current burn (its remaining duration), so a
+    // held Flame lets one kill light the next. ---
+    if (e.flameSpread && e.burnUntil > this.now && e.burnDps > 0) {
+      let best: Enemy | null = null, bd = 70;
+      for (const o of this.enemies) {
+        if (o === e || o.dead || !o.targetable || o.spec.boss) continue;
+        const dd = dist(o.x, o.y, e.x, e.y);
+        if (dd < bd) { bd = dd; best = o; }
+      }
+      if (best) {
+        best.igniteStack(e.burnDps, Math.max(0.5, e.burnUntil - this.now), this.now);
+        best.flameSpread = true;
+        this.spark(best.x, best.y, '#ff8a5c', 3);
       }
     }
   }
@@ -2552,6 +2682,41 @@ export class Game {
     return true;
   }
 
+  // Overcharge (Phase 4.5): a mid-wave verb — tap a tower during a wave, or hit the panel
+  // button, to double its fire rate (or damage, for rate-0 towers) for a few seconds.
+  // Amp is excluded (the UI hides its button; this is the belt-and-suspenders guard).
+  canOvercharge(t: Tower): boolean {
+    return isUnlocked('overcharge') && this.waveActive && this.overchargeLeft > 0
+      && this.now >= t.overchargedUntil && t.spec.kind !== 'amp';
+  }
+  activateOvercharge(t: Tower): boolean {
+    if (!this.canOvercharge(t)) return false;
+    this.overchargeLeft--;
+    t.overchargedUntil = this.now + TUNING.overcharge.dur;
+    this.buzz([18]);
+    audio.ui('upgrade'); // AUDIO-TWIN: a dedicated overcharge whir (Phase 7)
+    this.floater(t.x, t.y - 30, 'OVERCHARGE!', '#fff3b0');
+    for (let i = 0; i < 10; i++) {
+      const a = Math.random() * Math.PI * 2;
+      this.parts.push({ x: t.x, y: t.y, vx: Math.cos(a) * 110, vy: Math.sin(a) * 110, life: rand(0.3, 0.5), max: 0.5, size: 2.6, color: '#fff3b0', kind: 'spark' });
+    }
+    this.parts.push({ x: t.x, y: t.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 42, color: '#fff3b0', kind: 'ring' });
+    this.onHud();
+    return true;
+  }
+  // Veterancy (Phase 4.6): the one-time, irrevocable perk pick offered at the kill threshold.
+  choosePerk(t: Tower, perk: 'sharp' | 'rapid' | 'scav') {
+    if (!isUnlocked('veterancy') || t.kills < TUNING.veterancy.kills || t.perk) return;
+    t.perk = perk;
+    this.buzz([12, 24]);
+    audio.ui('upgrade'); // AUDIO-TWIN: a dedicated veterancy chime (Phase 7)
+    this.floater(t.x, t.y - 34, `${perk.toUpperCase()} PERK`, '#ffd97a');
+    for (let i = 0; i < 12; i++) {
+      const a = Math.random() * Math.PI * 2;
+      this.parts.push({ x: t.x, y: t.y, vx: Math.cos(a) * 90, vy: Math.sin(a) * 90, life: rand(0.35, 0.55), max: 0.55, size: 2.6, color: '#ffd97a', kind: 'spark' });
+    }
+    this.onHud();
+  }
   armMove(t: Tower) {
     this.selected = null;
     this.moveArmed = t;
@@ -3976,6 +4141,30 @@ export class Game {
       g.font = '700 11px Nunito';
       g.textAlign = 'center';
       g.fillText('zᶻ', 15, -13 + Math.sin(this.now * 2) * 1.5);
+    }
+    if (!ghost && isUnlocked('veterancy') && t.kills >= TUNING.veterancy.kills) {
+      // Veterancy (Phase 4.6): a gold chevron marks an eligible tower — pulsing while the
+      // perk choice is still open, steady once chosen (mirrors the uncovered zᶻ glyph's spot).
+      g.globalAlpha = t.perk ? 0.95 : (this.reduceFlash ? 0.7 : 0.55 + 0.45 * Math.sin(this.now * 4));
+      g.fillStyle = '#ffd97a';
+      g.font = '700 11px Nunito';
+      g.textAlign = 'center';
+      g.fillText('🎖', -15, -13);
+      g.globalAlpha = 1;
+    }
+    if (!ghost && this.now < t.overchargedUntil) {
+      // Overcharge (Phase 4.5): a depleting ring around the pad + a brightened, crackling
+      // muzzle — reduceFlash caps the brightness pop.
+      const frac = clamp((t.overchargedUntil - this.now) / TUNING.overcharge.dur, 0, 1);
+      g.globalAlpha = this.reduceFlash ? 0.5 : 0.85;
+      g.strokeStyle = '#fff3b0';
+      g.lineWidth = 2.4;
+      g.beginPath(); g.arc(0, 0, 19, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * frac); g.stroke();
+      g.globalAlpha = (this.reduceFlash ? 0.22 : 0.35) + (this.reduceFlash ? 0 : 0.15 * Math.sin(this.now * 20));
+      g.fillStyle = '#fff3b0';
+      g.beginPath(); g.arc(0, 0, 13, 0, 7); g.fill();
+      g.globalAlpha = 1;
+      if (Math.random() < 0.15 && !this.reduceMotion) this.spark(t.x + rand(-10, 10) * this.k, t.y + rand(-10, 10) * this.k, '#fff3b0', 1);
     }
     g.restore();
 

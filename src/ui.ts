@@ -131,7 +131,7 @@ export class UI {
 
   notify!: Notifier;
   private hudRefs: Record<string, HTMLElement> = {};
-  private lastHud = { credits: -1, lives: -1, wave: -1 };
+  private lastHud = { credits: -1, lives: -1, wave: -1, overcharge: -1 };
   private sellPanelTower: Tower | null = null;   // live sell/undo label refresh target
   private abilityBtns: Record<string, HTMLElement> = {};
 
@@ -147,6 +147,8 @@ export class UI {
   private longPressFired = false;
   private pinnedEnemyTip: Enemy | null = null;   // long-press-shown tooltip target, persists till lift
   private pinnedCellIdx: number | null = null;   // long-press-shown special-cell tooltip, persists till lift
+  private lastTapTower: Tower | null = null;     // Overcharge (Phase 4.5): double-tap-on-a-tower activation
+  private lastTapAt = 0;
 
   constructor() {
     this.root = document.getElementById('ui-root')!;
@@ -275,6 +277,17 @@ export class UI {
     this.closeBuildMenu();
     const t = g.towerAt(p.x, p.y);
     if (t) {
+      // Overcharge (Phase 4.5): tapping the same tower twice within 350ms activates it,
+      // instead of just re-selecting it — a fast gesture that works on touch and mouse alike.
+      const now = performance.now();
+      const isDoubleTap = this.lastTapTower === t && now - this.lastTapAt < 350;
+      this.lastTapTower = t; this.lastTapAt = now;
+      if (isDoubleTap && g.canOvercharge(t)) {
+        g.activateOvercharge(t);
+        this.lastTapTower = null; // consume, so a third tap doesn't re-trigger immediately
+        this.renderSidePanel();
+        return;
+      }
       g.selected = t;
       audio.ui('click');
       this.renderSidePanel();
@@ -907,6 +920,16 @@ export class UI {
       list.append(row);
     }
     card.append(list);
+    // Synergies (Phase 4.3): cross-tower reactions are discovery-first in play, but the
+    // codex is where a player can look them up once they've noticed one happen.
+    card.append(el('h2', 'codex-syn-h', 'Synergies'));
+    const syn = el('div', 'codex-syn-list');
+    syn.innerHTML = `
+      <div class="codex-syn-row"><b>Shatter</b> — a Frost kill on a frozen alien explodes for ${Math.round(TUNING.reactions.shatterFrac * 100)}% of its max health to nearby foes.</div>
+      <div class="codex-syn-row"><b>Conduction</b> — Tesla chains deal +${Math.round((TUNING.reactions.conductionMul - 1) * 100)}% damage to a target that's already burning.</div>
+      <div class="codex-syn-row"><b>Cold Focus</b> — a Prism's damage ramp usually resets when its target dies; a chilled kill keeps it alive for ${TUNING.reactions.coldFocusGrace}s to carry into the next target.</div>
+    `;
+    card.append(syn);
     const close = el('button', 'btn primary', 'Back');
     close.onclick = () => { audio.ui('click'); dim.remove(); };
     card.append(close);
@@ -1137,7 +1160,7 @@ export class UI {
     this.isEndless = endless;
     this.isDaily = !!daily;
     this.currentDaily = daily;
-    this.lastHud = { credits: -1, lives: -1, wave: -1 };
+    this.lastHud = { credits: -1, lives: -1, wave: -1, overcharge: -1 };
     // once we act on a snapshot (resuming OR starting anything else), it's consumed
     if (this.save.resume) { this.save.resume = undefined; this.persist(); }
     const owned = (id: string) => this.save.meta.includes(id) || this.devMode;
@@ -1246,6 +1269,7 @@ export class UI {
         t.stage = rt.stage; t.branch = rt.branch; t.branchStage = rt.branchStage;
         t.mode = rt.mode as any; t.spent = rt.spent;
         t.dmgDealt = rt.dmgDealt; t.kills = rt.kills; t.creditsEarned = rt.creditsEarned; t.vein = rt.vein;
+        t.perk = (rt.perk === 'sharp' || rt.perk === 'rapid' || rt.perk === 'scav') ? rt.perk : null;
         t.applyCellType(cellInfo.special);   // grid is deterministic given the snapshot's tileSize/meander
         game.recomputeCoverage(t);   // Phase 3B.4 — resume is one of the "grid rebuild" triggers
         game.towers.push(t);
@@ -1412,6 +1436,17 @@ export class UI {
       btn.onclick = () => this.armAbility(key);
       abil.append(btn);
       this.abilityBtns[key] = btn;
+    }
+
+    // Overcharge charge pips (Phase 4.5) — a child of the ability stack itself (not a
+    // separately-positioned overlay), so it stacks cleanly above Orbital/Stasis regardless
+    // of which abilities are owned, and vanishes entirely until the system unlocks.
+    if (isUnlocked('overcharge')) {
+      const ocPips = el('div', 'oc-pips');
+      ocPips.id = 'oc-pips';
+      ocPips.title = 'Overcharge charges — double-tap a tower during a wave to spend one.';
+      abil.append(ocPips);
+      this.hudRefs.ocPips = ocPips;
     }
 
     const hint = el('div', 'build-hint', 'Click any open cell to build · click an alien to focus fire · select a tower to upgrade, sell, or move it');
@@ -1794,6 +1829,13 @@ export class UI {
       this.hudRefs.callBonus.textContent = bonus > 0 ? `+${bonus} ◆ (+${Math.round(frac * 100)}%) if launched now` : '';
       this.hudRefs.callBtn.textContent = `Launch wave (${secs}s)`;
     }
+    // Overcharge pips: filled = charge available, empty = spent this wave.
+    if (this.hudRefs.ocPips && g.overchargeLeft !== L.overcharge) {
+      L.overcharge = g.overchargeLeft;
+      const max = TUNING.overcharge.charges;
+      this.hudRefs.ocPips.innerHTML = Array.from({ length: max },
+        (_, i) => `<span class="oc-pip${i < g.overchargeLeft ? ' full' : ''}"></span>`).join('');
+    }
     this.updateWavePreview();
     for (const key of Object.keys(this.abilityBtns)) {
       const btn = this.abilityBtns[key];
@@ -1918,7 +1960,10 @@ export class UI {
     if (e.maxShield > 0) rows.push(`<div class="et-row"><span>Shield</span><b>${fmt(Math.ceil(e.shield))} / ${fmt(e.maxShield)}</b></div>`);
     const eff = e.effSpeed(g!.now);
     rows.push(`<div class="et-row"><span>Speed</span><b>${Math.round(eff)}${eff < e.spec.speed - 0.5 ? ` <i>(${e.spec.speed})</i>` : ''}</b></div>`);
-    if (g!.now < e.burnUntil && e.burnDps > 0) rows.push(`<div class="et-row"><span>Burning</span><b>${Math.round(e.burnDps)}/s</b></div>`);
+    if (g!.now < e.burnUntil && e.burnDps > 0) {
+      const stackTxt = g!.now < e.flameStackUntil && e.flameStacks > 1 ? ` ×${e.flameStacks}` : '';
+      rows.push(`<div class="et-row"><span>Burning${stackTxt}</span><b>${Math.round(e.burnDps)}/s</b></div>`);
+    }
     if (g!.now < e.frozenUntil) rows.push(`<div class="et-row"><span>Status</span><b>Frozen</b></div>`);
     else if (g!.now < e.slowUntil) rows.push(`<div class="et-row"><span>Slowed</span><b>${Math.round(e.slowPct * 100)}%</b></div>`);
     if (e.phased) rows.push(`<div class="et-row"><span>Status</span><b>Phased</b></div>`);
@@ -2137,6 +2182,50 @@ export class UI {
 
     panel.append(this.buildTechTree(g, t));
 
+    // Overcharge (Phase 4.5): panel button as an alternative to the double-tap gesture.
+    // Amp never gets one — it has no rate/damage to double, the double-tap guard mirrors this.
+    if (isUnlocked('overcharge') && t.spec.kind !== 'amp') {
+      const active = g.now < t.overchargedUntil;
+      const ocRow = el('div', 'oc-row');
+      const oc = el('button', `oc-btn${active ? ' active' : ''}`,
+        active ? '⚡ Overcharged!' : `⚡ Overcharge (${g.overchargeLeft} left)`) as HTMLButtonElement;
+      oc.disabled = !g.canOvercharge(t);
+      oc.title = active ? 'Already overcharged.'
+        : !g.waveActive ? 'Only usable while a wave is active.'
+        : g.overchargeLeft <= 0 ? 'No charges left this wave.'
+        : 'Double this tower\'s fire rate (or damage) for 3 seconds.';
+      oc.onclick = () => { g.activateOvercharge(t); this.renderSidePanel(); };
+      ocRow.append(oc);
+      panel.append(ocRow);
+    }
+
+    // Veterancy (Phase 4.6): a one-time, irrevocable perk choice offered at the kill threshold.
+    if (isUnlocked('veterancy') && t.kills >= TUNING.veterancy.kills) {
+      if (t.perk) {
+        const labels: Record<string, string> = {
+          sharp: `Sharp — +${Math.round(TUNING.veterancy.perks.sharp * 100)}% damage`,
+          rapid: `Rapid — +${Math.round(TUNING.veterancy.perks.rapid * 100)}% rate`,
+          scav: 'Scavenger — bonus credits per kill',
+        };
+        panel.append(el('div', 'perk-badge', `🎖 Veteran perk: ${labels[t.perk]}`));
+      } else {
+        panel.append(el('div', 'perk-prompt', '🎖 Veteran — choose a permanent perk:'));
+        const perkRow = el('div', 'perk-row');
+        const defs: { id: 'sharp' | 'rapid' | 'scav'; label: string; title: string }[] = [
+          { id: 'sharp', label: 'Sharp', title: `+${Math.round(TUNING.veterancy.perks.sharp * 100)}% damage, permanently` },
+          { id: 'rapid', label: 'Rapid', title: `+${Math.round(TUNING.veterancy.perks.rapid * 100)}% fire rate, permanently` },
+          { id: 'scav', label: 'Scavenger', title: 'Bonus credits on every future kill' },
+        ];
+        for (const d of defs) {
+          const btn = el('button', 'perk-btn', d.label);
+          btn.title = d.title;
+          btn.onclick = () => { g.choosePerk(t, d.id); this.renderSidePanel(); };
+          perkRow.append(btn);
+        }
+        panel.append(perkRow);
+      }
+    }
+
     const actionRow = el('div', 'panel-actions');
     const move = el('button', 'move-btn', 'Move');
     move.onclick = () => {
@@ -2145,6 +2234,7 @@ export class UI {
       this.closeSidePanel();
     };
     const sell = el('button', 'sell-btn', this.sellLabel(t));
+    if (t.perk) sell.title = 'Selling forfeits this tower\'s veteran perk — it cannot be recovered.';
     sell.onclick = () => { g.sell(t); this.closeSidePanel(); };
     actionRow.append(move, sell);
     panel.append(actionRow);

@@ -379,6 +379,12 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
   position: absolute; left: calc(14px + env(safe-area-inset-left)); bottom: calc(14px + env(safe-area-inset-bottom));
   display: flex; flex-direction: column; gap: 8px;
 }
+#oc-pips { display: flex; gap: 4px; justify-content: center; padding: 2px 0; }
+.oc-pip {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: rgba(255,243,176,0.12); border: 1px solid rgba(255,243,176,0.4);
+}
+.oc-pip.full { background: #fff3b0; box-shadow: 0 0 6px rgba(255,243,176,0.7); }
 .ability-btn {
   width: 60px; height: 60px; border-radius: 16px; position: relative; overflow: hidden;
   background: var(--space-1); border: 1px solid var(--line);
@@ -422,6 +428,13 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 .codex-traits { font-family: 'Nunito'; font-size: 11px; font-weight: 800; color: var(--sky); margin-left: 6px; }
 .codex-desc { font-size: 12.5px; color: var(--ink-dim); line-height: 1.35; }
 .codex-stats { font-size: 11.5px; font-weight: 700; color: var(--ink-dim); }
+.codex-syn-h { font-size: 16px; margin: 10px 0 6px; }
+.codex-syn-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 4px; }
+.codex-syn-row {
+  font-size: 12.5px; color: var(--ink-dim); line-height: 1.4;
+  background: var(--space-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px;
+}
+.codex-syn-row b { color: var(--ink); }
 
 /* ---- Map guide ---- */
 .gm-swatch {
@@ -681,6 +694,22 @@ body.perf-mode #cell-tip { backdrop-filter: none; -webkit-backdrop-filter: none;
   border-radius: 8px; background: var(--space-2); border: 1px solid var(--line); color: var(--ink-dim);
 }
 .target-chip.on { background: var(--sky); color: #10314a; }
+.oc-row { display: flex; }
+.oc-btn {
+  flex: 1; padding: 8px; border-radius: 10px; font-weight: 800; font-size: 13px;
+  color: var(--sky); background: rgba(160,216,239,0.1); border: 1px solid rgba(160,216,239,0.3);
+}
+.oc-btn:hover:not(:disabled) { background: rgba(160,216,239,0.2); }
+.oc-btn:disabled { opacity: 0.45; }
+.oc-btn.active { color: #fff3b0; background: rgba(255,243,176,0.14); border-color: rgba(255,243,176,0.4); }
+.perk-prompt { font-size: 12px; font-weight: 800; color: #ffd97a; margin-top: 2px; }
+.perk-row { display: flex; gap: 6px; }
+.perk-btn {
+  flex: 1; padding: 7px 4px; border-radius: 10px; font-weight: 800; font-size: 12px;
+  color: #ffd97a; background: rgba(255,217,122,0.1); border: 1px solid rgba(255,217,122,0.35);
+}
+.perk-btn:hover { background: rgba(255,217,122,0.2); }
+.perk-badge { font-size: 12px; font-weight: 700; color: #ffd97a; margin-top: 2px; }
 .panel-actions { display: flex; gap: 8px; }
 .panel-actions > button { flex: 1; }
 .move-btn { color: var(--sky); font-weight: 800; font-size: 13px; padding: 8px; border-radius: 10px; background: rgba(160,216,239,0.1); }

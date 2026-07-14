@@ -3,7 +3,7 @@
 // flight are never serialized. This keeps the format small and simple: resuming always
 // drops the player back into the intermission right before the next wave, exactly as if
 // they'd just cleared the saved one themselves.
-export const RESUME_VERSION = 1;
+export const RESUME_VERSION = 2;
 
 export interface ResumeTower {
   specId: string;
@@ -17,6 +17,7 @@ export interface ResumeTower {
   kills: number;
   creditsEarned: number;
   vein: boolean;
+  perk: string | null;   // Veterancy (Phase 4.6) — added in v2
 }
 
 export interface ResumeSnapshot {
@@ -45,7 +46,7 @@ export function serializeResume(g: {
   level: { id: number }; endless: boolean; tileSize?: number; cell: number; meander: number; diffTier: number;
   ascTier: number; mods: Set<string>; waveIdx: number; credits: number; lives: number; novaCharge: number;
   novaNeed: number; cds: Record<string, number>;
-  towers: { spec: { id: string }; cell: number; stage: number; branch: number; branchStage: number; mode: string; spent: number; dmgDealt: number; kills: number; creditsEarned: number; vein: boolean }[];
+  towers: { spec: { id: string }; cell: number; stage: number; branch: number; branchStage: number; mode: string; spent: number; dmgDealt: number; kills: number; creditsEarned: number; vein: boolean; perk: string | null }[];
 }, daily: ResumeSnapshot['daily']): string | null {
   try {
     const snap: ResumeSnapshot = {
@@ -68,6 +69,7 @@ export function serializeResume(g: {
       towers: g.towers.map(t => ({
         specId: t.spec.id, cell: t.cell, stage: t.stage, branch: t.branch, branchStage: t.branchStage,
         mode: t.mode, spent: t.spent, dmgDealt: t.dmgDealt, kills: t.kills, creditsEarned: t.creditsEarned, vein: t.vein,
+        perk: t.perk,
       })),
       savedAt: Date.now(),
     };

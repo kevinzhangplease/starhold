@@ -9,9 +9,9 @@
 // replaying L1 gets the full sandbox while a first-timer's L1 stays clean.
 // Must stay in sync with SEEN_UNLOCK_LEVELS in save.ts (validate.ts asserts this).
 export const UNLOCKS: Record<string, number> = {
-  combo: 2, challenges: 2, interest: 3, cells: 3, drops: 4, mod_asteroids: 4,
+  combo: 2, challenges: 2, interest: 3, cells: 3, drops: 4, mod_asteroids: 4, overcharge: 4,
   elites: 5, boss_theater: 5, mutators: 6, mod_veins: 6, nova: 7,
-  mod_meteors: 8, mutators_hard: 9, boss_phase2: 10, mod_combo: 10, mod_ionstorms: 12,
+  mod_meteors: 8, veterancy: 8, mutators_hard: 9, boss_phase2: 10, mod_combo: 10, mod_ionstorms: 12,
 };
 
 let _unlockedLevel = 1;
@@ -149,6 +149,27 @@ export const TUNING = {
   portals: {
     chargeLead: 2,             // seconds before a spawn that its portal starts telegraphing
   },
+  // ---- Starhold 3.0 Phase 4: tower depth ----
+  flame: {
+    stackMax: 3,               // igniteStack caps at 3 applications
+    stackStep: 0.5,            // each stack adds +50% burnDps: 1.0x / 1.5x / 2.0x
+  },
+  reactions: {
+    shatterFrac: 0.30,         // frozen-on-kill explosion: fraction of the victim's max hp
+    shatterRadius: 60,         // px
+    shatterCap: 250,           // flat cap before campaign scaling (see currentHpScale())
+    conductionMul: 1.5,        // tesla chain damage vs a burning target
+    coldFocusGrace: 1.0,       // seconds a Prism's ramp survives a chilled kill with no target
+  },
+  overcharge: {
+    charges: 3,                // per wave
+    rateMul: 2,                // fire-rate (or damage, for rate-0 towers) multiplier while active
+    dur: 3,                    // seconds
+  },
+  veterancy: {
+    kills: 45,                 // kill threshold that offers a perk choice
+    perks: { sharp: 0.12, rapid: 0.12, scav: 1 },   // sharp/rapid are multiplier bonuses; scav is a flat credit base (scaled by econScale at payout)
+  },
 } as const;
 
 export interface StageStats {
@@ -181,6 +202,13 @@ export interface StageStats {
   groundOnly?: boolean;
   cluster?: number;      // bomblets on impact
   rayWidth?: number;     // half-width of the piercing laser line (px)
+  // ---- tier-2 verb rewrites (Phase 4) ----
+  pierceRamp?: number;   // Star Lance: each pierced enemy takes (1+pierceRamp)^k more
+  directStun?: number;   // Nova Torpedo: stun seconds on the missile's direct target only
+  farTiles?: number;     // Farlance: Chebyshev tile distance at/beyond which farMul applies
+  farMul?: number;       // Farlance: damage multiplier at farTiles+
+  freshMul?: number;     // Storm Sentinel: damage multiplier vs targets still at full hp/shield
+  burnSpread?: number;   // Hellmouth: on kill, burning jumps to the nearest enemy within this many px
 }
 
 export interface TowerSpec {
@@ -215,7 +243,7 @@ export const TOWERS: TowerSpec[] = [
       ],
       [
         T({ name: 'Lance', desc: 'Fires a piercing shot that passes through 2 enemies. Longer range, higher damage, lower fire rate.', cost: 230, dmg: 85, rate: 0.8, range: 3, pierce: 2 }),
-        T({ name: 'Star Lance', desc: 'Pierces 3 enemies. 25% chance to deal 2.5x critical damage.', cost: 330, dmg: 150, rate: 0.75, range: 4, pierce: 3, crit: 0.25 }),
+        T({ name: 'Star Lance', desc: 'Pierces 3. Each enemy the lance passes through takes 40% more than the last.', cost: 330, dmg: 150, rate: 0.75, range: 4, pierce: 3, pierceRamp: 0.4 }),
       ],
       [
         T({ name: 'Frost Rounds', desc: 'Shots slow the target by 25% for a short time.', cost: 220, dmg: 22, rate: 3.2, range: 2, slow: 0.25, slowDur: 1.2 }),
@@ -284,7 +312,7 @@ export const TOWERS: TowerSpec[] = [
       ],
       [
         T({ name: 'Torpedo', desc: 'Fires a single high-damage missile with a large splash radius, at a slower fire rate.', cost: 280, dmg: 190, rate: 0.38, range: 3, splash: 66, airMul: 1.6 }),
-        T({ name: 'Nova Torpedo', desc: 'Further increases damage and splash radius.', cost: 390, dmg: 330, rate: 0.4, range: 3, splash: 82, airMul: 1.6 }),
+        T({ name: 'Nova Torpedo', desc: 'A massive warhead. The enemy it strikes directly is stunned for half a second.', cost: 390, dmg: 330, rate: 0.4, range: 3, splash: 82, airMul: 1.6, directStun: 0.5 }),
       ],
       [
         T({ name: 'Interceptor', desc: 'Increases damage vs flying enemies to 3.2x and increases fire rate.', cost: 260, dmg: 30, rate: 1.5, range: 3, splash: 20, airMul: 3.2 }),
@@ -380,22 +408,22 @@ export const TOWERS: TowerSpec[] = [
       ],
       [
         T({ name: 'Lancet', desc: 'Increases range significantly, at reduced beam width.', cost: 260, dmg: 62, rate: 0.75, range: 4, rayWidth: 7 }),
-        T({ name: 'Farlance', desc: 'Further increases range and damage.', cost: 370, dmg: 95, rate: 0.8, range: 4, rayWidth: 7 }),
+        T({ name: 'Farlance', desc: 'Extreme range. Enemies 3+ tiles away take +50% — a true artillery beam.', cost: 370, dmg: 95, rate: 0.8, range: 4, rayWidth: 7, farTiles: 3, farMul: 1.5 }),
       ],
     ],
   },
   {
     id: 'flame', name: 'Flame', color: '#c4906a', color2: '#925f3d', kind: 'flame', hotkey: '9', size: 17,
-    blurb: 'Short-range cone that sets aliens on fire.',
+    blurb: 'Flame damage stacks up to three times on the same target — nothing melts a chokepoint like a committed Flame.',
     stages: [
-      T({ name: 'Flame Mk I', desc: 'Fires a short cone of fire that ignites enemies, dealing damage over time.', cost: 120, dmg: 4, rate: 1.4, range: 1, burnDps: 14, burnDur: 2.5 }),
+      T({ name: 'Flame Mk I', desc: 'Fires a short cone of fire that ignites enemies, dealing damage over time.', cost: 110, dmg: 4, rate: 1.4, range: 1, burnDps: 14, burnDur: 2.5 }),
       T({ name: 'Flame Mk II', desc: 'Increases burn damage.', cost: 100, dmg: 6, rate: 1.5, range: 1, burnDps: 24, burnDur: 2.5 }),
       T({ name: 'Flame Mk III', desc: 'Increases range and burn damage.', cost: 155, dmg: 9, rate: 1.6, range: 2, burnDps: 38, burnDur: 3 }),
     ],
     branches: [
       [
         T({ name: 'Inferno', desc: 'Greatly increases burn damage.', cost: 250, dmg: 14, rate: 1.7, range: 2, burnDps: 72, burnDur: 3 }),
-        T({ name: 'Hellmouth', desc: 'Further increases burn damage.', cost: 350, dmg: 20, rate: 1.8, range: 2, burnDps: 125, burnDur: 3.5 }),
+        T({ name: 'Hellmouth', desc: "When a burning enemy dies, its fire leaps to the nearest enemy within 70px.", cost: 350, dmg: 20, rate: 1.8, range: 2, burnDps: 125, burnDur: 3.5, burnSpread: 70 }),
       ],
       [
         T({ name: 'Flarethrower', desc: 'Increases range and cone width.', cost: 260, dmg: 12, rate: 1.6, range: 2, burnDps: 50, burnDur: 3 }),
@@ -408,25 +436,28 @@ export const TOWERS: TowerSpec[] = [
     ],
   },
   {
+    // Range repricing (Phase 4): range solves coverage AND uptime simultaneously (the
+    // Defender's Quest lesson) — it's the strongest lever in the game, so it carries the
+    // price tag. Sentinel ends up the most expensive BASE tower (validate.ts asserts this).
     id: 'sentinel', name: 'Sentinel', color: '#b596cc', color2: '#85689c', kind: 'bullet', hotkey: '0', size: 16,
-    blurb: 'Covers half the map. Light hits, huge reach.',
+    blurb: 'Covers half the map — reach is never cheap.',
     stages: [
-      T({ name: 'Sentinel Mk I', desc: 'Fires at very long range with modest damage.', cost: 110, dmg: 15, rate: 1.0, range: 4 }),
-      T({ name: 'Sentinel Mk II', desc: 'Increases damage.', cost: 95, dmg: 25, rate: 1.05, range: 4 }),
-      T({ name: 'Sentinel Mk III', desc: 'Increases damage and range.', cost: 150, dmg: 38, rate: 1.1, range: 5 }),
+      T({ name: 'Sentinel Mk I', desc: 'Fires at very long range with modest damage.', cost: 170, dmg: 15, rate: 1.0, range: 4 }),
+      T({ name: 'Sentinel Mk II', desc: 'Increases damage.', cost: 105, dmg: 25, rate: 1.05, range: 4 }),
+      T({ name: 'Sentinel Mk III', desc: 'Increases damage and range.', cost: 165, dmg: 38, rate: 1.1, range: 5 }),
     ],
     branches: [
       [
-        T({ name: 'Farsight', desc: 'Increases range and damage. 30% chance to deal 2.5x critical damage.', cost: 260, dmg: 72, rate: 0.85, range: 6, crit: 0.3 }),
-        T({ name: 'Star Sentinel', desc: 'Further increases damage and critical chance to 40%.', cost: 360, dmg: 120, rate: 0.85, range: 6, crit: 0.4 }),
+        T({ name: 'Farsight', desc: 'Increases range and damage. 30% chance to deal 2.5x critical damage.', cost: 280, dmg: 72, rate: 0.85, range: 6, crit: 0.3 }),
+        T({ name: 'Star Sentinel', desc: 'Further increases damage and critical chance to 40%.', cost: 380, dmg: 120, rate: 0.85, range: 6, crit: 0.4 }),
       ],
       [
-        T({ name: 'Rapid Sentinel', desc: 'Trades damage per shot for a much higher fire rate.', cost: 250, dmg: 34, rate: 2.6, range: 5 }),
-        T({ name: 'Storm Sentinel', desc: 'Further increases fire rate and damage.', cost: 340, dmg: 44, rate: 3.6, range: 5 }),
+        T({ name: 'Rapid Sentinel', desc: 'Trades damage per shot for a much higher fire rate.', cost: 265, dmg: 34, rate: 2.6, range: 5 }),
+        T({ name: 'Storm Sentinel', desc: 'Rapid fire that hits undamaged targets 50% harder — the perfect opener.', cost: 360, dmg: 44, rate: 3.6, range: 5, freshMul: 1.5 }),
       ],
       [
-        T({ name: 'Warden', desc: 'Shots slow the target by 30% for a short time.', cost: 250, dmg: 28, rate: 1.0, range: 5, slow: 0.3, slowDur: 1.4 }),
-        T({ name: 'High Warden', desc: 'Increases range and slow to 40%.', cost: 340, dmg: 42, rate: 1.05, range: 6, slow: 0.4, slowDur: 1.6 }),
+        T({ name: 'Warden', desc: 'Shots slow the target by 30% for a short time.', cost: 265, dmg: 28, rate: 1.0, range: 5, slow: 0.3, slowDur: 1.4 }),
+        T({ name: 'High Warden', desc: 'Increases range and slow to 40%.', cost: 360, dmg: 42, rate: 1.05, range: 6, slow: 0.4, slowDur: 1.6 }),
       ],
     ],
   },
