@@ -339,6 +339,115 @@ if (!(TUNING.smoothing.compensationFrom < TUNING.smoothing.compensationFull)) er
   }
 }
 
+// ---- Phase 9.2: economy simulation sweep ----
+// Models total earnable credits vs. the firepower-spend a level actually demands, across
+// L1/L5/L10/L15 x Normal/Hard/Brutal x Ascension 0/III/V. The goal is a sensitivity check,
+// not a precise sim: does the earnable/needed ratio degrade GRACEFULLY as difficulty and
+// ascension push enemy HP (raising "needed") and rewards (raising "earnable") by different
+// factors? Model assumptions are documented inline; the full matrix is captured verbatim in
+// PROGRESS-3.md. This is INFORMATIONAL — a balance ratio is a human-judgment tuning signal,
+// not a correctness invariant, so out-of-band cells print a ⚠ for the reader but never fail
+// the build. Only a genuinely degenerate value (non-finite / non-positive — a real tuning
+// bug, not a balance opinion) is a hard error.
+{
+  const DIFF_HP9 = [0.7, 0.85, 1, 1.25, 1.55];
+  const DIFF_REWARD9 = [0.85, 0.95, 1, 1.15, 1.3];
+  const SM = TUNING.smoothing;
+  const AS = TUNING.ascension;
+  const E = TUNING.economy;
+
+  const progMul = (id: number) => id <= 2 ? SM.earlyLevels
+    : id >= SM.compensationFrom ? 1 + (SM.compensationMax - 1) * Math.min(1, Math.max(0, (id - SM.compensationFrom) / (SM.compensationFull - SM.compensationFrom)))
+    : 1;
+  const effHpMul = (lv: any, diff: number, asc: number) => lv.hpMul * DIFF_HP9[diff] * progMul(lv.id) * (asc >= 1 ? AS.hpMul : 1);
+  // waveRewardMul (campaign, wave-0 baseline): (1 + (hpMul-1)*bountyCoef) * diffReward
+  const rewardMul = (lv: any, diff: number) => (1 + (lv.hpMul - 1) * E.bountyCoef) * DIFF_REWARD9[diff];
+
+  // "Needed" firepower model. Total enemy HP is a poor proxy for required spend — towers deal
+  // damage continuously, so what you must actually field is DPS matched to the HP *arrival
+  // rate*, not the HP total. Required spend therefore tracks (average enemy toughness) x (how
+  // many towers a level makes you field), NOT total HP (which over-weights late-game by ~10x).
+  //   needed = avgEffHp x towerCount x K
+  // avgEffHp = total effective HP / total enemy count (grows ~with hpMul + the tougher late
+  // roster, and responds to difficulty/ascension); towerCount grows 4->8 with the campaign
+  // (more lanes/coverage). K is calibrated ONCE so L15 Normal Asc0 lands at the band midpoint
+  // 1.5; every other cell then reads as how the economy holds relative to that anchor.
+  function totalEffHp(lv: any, diff: number, asc: number): number {
+    const mul = effHpMul(lv, diff, asc);
+    let hp = 0;
+    lv.waves.forEach((wave: any[], wi: number) => {
+      const waveRamp = 1 + wi * 0.03;   // matches the in-game per-wave HP ramp
+      for (const grp of wave) {
+        const spec = ENEMIES[grp.e];
+        hp += grp.n * spec.hp * mul * waveRamp * (1 + (spec.shield || 0));
+        if (spec.splits) hp += grp.n * spec.splits.count * ENEMIES[spec.splits.id].hp * mul * waveRamp;
+      }
+    });
+    return hp;
+  }
+  function totalEnemyCount(lv: any): number {
+    let n = 0;
+    for (const grp of lv.waves.flat()) { n += grp.n; const spec = ENEMIES[grp.e]; if (spec.splits) n += grp.n * spec.splits.count; }
+    return n;
+  }
+  const towerCount = (id: number) => Math.max(4, Math.min(8, Math.round(3 + id / 2.5)));   // L1->4, L5->5, L10->7, L15->8
+  const avgEffHp = (lv: any, diff: number, asc: number) => totalEffHp(lv, diff, asc) / totalEnemyCount(lv);
+  function earnable(lv: any, diff: number, asc: number): number {
+    const rm = rewardMul(lv, diff);
+    const start = Math.round(lv.startCredits * (asc >= 4 ? AS.startCreditMul : 1));
+    let bounties = 0;
+    lv.waves.forEach((wave: any[]) => {
+      for (const grp of wave) {
+        const spec = ENEMIES[grp.e];
+        bounties += Math.round(spec.reward * rm) * grp.n;
+        // split children spawn with rewardMul=1 in-game -> base reward * diffReward only
+        if (spec.splits) bounties += Math.round(ENEMIES[spec.splits.id].reward * DIFF_REWARD9[diff]) * spec.splits.count * grp.n;
+      }
+    });
+    const numWaves = lv.waves.length;
+    let waveClear = 0;
+    for (let wi = 0; wi < numWaves; wi++) waveClear += Math.round((30 + wi * 4) * rm);
+    // interest cap (asc-scaled), assumed banked to ~half the cap on average across payouts
+    const capBase = Math.round((TUNING.interest.cap + lv.id * 3) * (1 + (lv.hpMul - 1) * E.bountyCoef));
+    const cap = asc >= 4 ? Math.round(capBase * (AS.interestCapTier4 / TUNING.interest.cap)) : capBase;
+    const interest = cap * numWaves * 0.5;
+    // supply drops: only the 'credits' kind (45/100 weight) pays directly; rough ~1 credit-drop
+    // per 4 waves at the mid credit roll (65), econ-scaled
+    const drops = numWaves * 0.25 * Math.round(65 * rm);
+    // early-call at 50% uptake, averaging half the 40% cap -> ~10% of total bounty
+    const earlyCall = bounties * E.earlyCallCap * 0.5 * 0.5;
+    // rich-vein levels: a modest per-kill bonus on the ~15% of kills a vein tower lands
+    const totalEnemies = lv.waves.flat().reduce((a: number, g: any) => a + g.n, 0);
+    const veins = (lv.modifiers || []).includes('rich-veins') ? totalEnemies * 0.15 * Math.round(TUNING.richVeins.creditPerKill * rm) : 0;
+    return start + bounties + waveClear + interest + drops + earlyCall + veins;
+  }
+
+  const L15 = LEVELS.find(l => l.id === 15)!;
+  // Anchor K so L15 Normal Asc0 = 1.5:  needed = avgEffHp*towerCount/K,  ratio = earnable/needed
+  const K = (avgEffHp(L15, 2, 0) * towerCount(15)) / (earnable(L15, 2, 0) / 1.5);
+  const needed = (lv: any, diff: number, asc: number) => avgEffHp(lv, diff, asc) * towerCount(lv.id) / K;
+  const ratio = (lv: any, diff: number, asc: number) => earnable(lv, diff, asc) / needed(lv, diff, asc);
+
+  console.log('\n---- Economy sweep: earnable/needed ratio (target band 1.2-1.8) ----');
+  const DIFF_IDX = [2, 3, 4], DIFF_LBL = ['Normal', 'Hard', 'Brutal'];
+  const ASC_IDX = [0, 3, 5];
+  for (const id of [1, 5, 10, 15]) {
+    const lv = LEVELS.find(l => l.id === id)!;
+    console.log(`\nLevel ${id} (${lv.name}):`);
+    for (let di = 0; di < DIFF_IDX.length; di++) {
+      const cells: string[] = [];
+      for (const asc of ASC_IDX) {
+        const r = ratio(lv, DIFF_IDX[di], asc);
+        const flag = r < 1.2 || r > 1.8 ? '⚠' : ' ';
+        cells.push(`A${asc}:${r.toFixed(2)}${flag}`);
+        if (!Number.isFinite(r) || r <= 0) err(`Economy model degenerate: L${id} ${DIFF_LBL[di]} Asc${asc} earnable/needed = ${r} (non-finite or non-positive — a tuning bug, not a balance opinion)`);
+      }
+      console.log(`  ${DIFF_LBL[di].padEnd(7)} ${cells.join('   ')}`);
+    }
+  }
+  console.log('  (K calibrated so L15 Normal Asc0 = 1.50; other cells read relative to that anchor)');
+}
+
 // (d) fmt spot checks
 const fmtCases: [number, string][] = [[950, '950'], [9999, '9999'], [12400, '12.4k'], [150000, '150k'], [3400000, '3.4M']];
 for (const [n, want] of fmtCases) {

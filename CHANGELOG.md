@@ -1,3 +1,105 @@
+# STARHOLD 3.0 — Changelog
+
+Starhold 2.0 was feature-complete but shallow in places: placement was consequence-free,
+maps differed only in path shape, most upgrades were just bigger numbers, and the screen
+buried the one thing you needed to know — am I about to lose? 3.0 fixes all of that. Grouped
+by how it feels, not by build order. See `PROGRESS-3.md` for the technical/decision log and
+`PLAN-3.md` for the spec. (The 2.0 changelog follows below, unchanged.)
+
+---
+
+## Every decision costs something now
+
+- **Placement is a real choice.** Selling a tower now returns 72% of what you spent — except
+  in the first 4 seconds after you place it, which is a full-refund undo window for a misclick.
+  No more shuffling your whole board for free between waves.
+- **Calling waves early pays a real bonus** — a percentage of the incoming wave's bounty, scaled
+  by how much of the timer was left (up to +40%). The call button shows the live number ticking
+  down. Auto-launch earns none of it: the bonus rewards a deliberate risk, so there's a genuine
+  decision to make every intermission.
+- **The whole economy holds its value.** Every credit reward — bounties, combos, crates, veins,
+  wave-clear, interest — now scales with the campaign, so late levels feel as tight (or as
+  generous) as early ones by design, not by accident.
+- **Abilities that scale.** Orbital Strike's damage grows with the invasion instead of fading
+  to a tickle by L15. NOVA now tears a *percentage* of health from everything on screen (30%
+  from normal enemies, 8% from bosses) and stuns the survivors — crowd control that stays
+  meaningful at any scale. Reactor meta upgrades are percentages now too.
+- **Stars measure skill, not luck.** 3★ means losing no more than 2 hull, 2★ no more than 8 —
+  absolute counts, so Hull Plating never makes the top rating easier to earn.
+
+## The board itself speaks
+
+- **Special terrain.** Five cell types now shape *where* things belong: Ridge (more range, less
+  fire rate — for your snipers), Sinkhole (more damage, less range — for your short-range
+  bruisers), Conduit (linked cells whose towers focus the same target), Anchor (an Amp here
+  projects double-strength buffs), and Null Zone (unbuildable, but it drags passing ground
+  enemies to a crawl). Long-press or hover any marked cell to see what it does and what belongs
+  there. Every map has its own hand-picked mix.
+
+## Every map looks — and plays — like itself
+
+- **Persistent skies.** Each level now generates the same nebulae, stars, and hand-placed
+  landmarks (planets, moons, derelicts, stations, comets) every single time — a sky you'll
+  recognize on the bus.
+- **The road reads as a road.** A recessed channel with little chevrons marching toward your
+  base, and portals that visibly charge up — in the color of whatever's about to spawn — a
+  couple seconds before it arrives.
+- **Two levels rebuilt.** Shatterfield is now a fork-and-rejoin, and Void Door is two portals
+  converging on your base from both flanks — real structural variety, not just a wigglier line.
+- **A cleaner-looking battlefield.** Towers went cool and calm, enemies went warm and bright,
+  so they stop blurring together at phone size; big enemies got genuinely bigger so threat
+  reads from silhouette; and hits and deaths feel physical now — a squash, a nudge, bespoke
+  debris when a Brute cracks apart. There's a colorblind-friendly palette in Settings, and the
+  Chroma unlock finally re-themes the actual board, not just the menus.
+
+## Towers you protect, not replace
+
+- **Range costs what it's worth**, cross-tower **reactions** reward mixing (frozen enemies
+  *Shatter* on death, burning enemies take extra from Tesla *Conduction*, a chilled kill won't
+  break a Prism's *Cold Focus* ramp), and Flame now stacks its burn up to 3× on a held target.
+- **Overcharge** — tap a tower mid-wave and hit ⚡ to double its fire rate for a few seconds,
+  three charges a wave. The verb you reach for when a wave breaks through.
+- **Veterancy** — a tower that lands 45 kills becomes a Veteran and earns a permanent perk you
+  choose (more damage, more fire rate, or credits-per-kill). Selling it forfeits the perk — so
+  now you have a reason to defend one proven tower instead of reflexively rebuilding.
+
+## Waves you read, not memorize
+
+- **Wave shapes.** A wave can arrive as a Rush (all at once), a Trickle (one at a time), a
+  Convoy (a tank leading its support), or a Feint (a small opener, then a second group later
+  from somewhere else). Shown in the forecast before you commit.
+- **Flier lanes that change.** Fliers now curve along a per-wave path you can see previewed as
+  a dashed arc during the intermission — anti-air became a real per-wave read instead of a
+  solved formula.
+- **Difficulty changes what you think about.** Hard smuggles an extra enemy type into every
+  wave; Brutal jams your long-range forecast so you only see the wave in front of you.
+
+## You can see — and hear — what's happening
+
+- **A HUD that answers your real questions, in order.** A segmented hull bar that cracks pip by
+  pip as you take hits; a leak ledger showing which enemy is actually costing you hull; and a
+  **threat readout** that reads your coverage against the incoming wave and tells you
+  Comfortable / Tight / Likely leak before you launch. The tower panel is now one tap to the
+  decision that matters, with the full tech tree one tap further.
+- **Audio you can read with your ears.** Each enemy type has its own spawn sound, a mender hums
+  while it's alive so you can hear it without hunting, the music opens up as pressure builds,
+  kills sound heavier the bigger the thing was, leaks groan lower the closer you are to losing,
+  and one unmistakable bell marks every credit you earn. Everything audible has a visual twin,
+  so muted play loses nothing.
+
+## A hundred ways to replay
+
+- **The Briefing screen.** Tap a level and you'll see its identity first — modifiers, terrain,
+  the full enemy roster, its challenges — before you commit.
+- **The draft.** From level 6 on, you choose which towers to bring (the draft grows as the
+  campaign does). "Which 6 of my 10 answer *this* map?" — with a "use full arsenal" toggle any
+  time you'd rather not. The Daily Op hands everyone the same locked draft.
+- **Doctrines.** A new permanent-upgrade layer — Artillery, Precision, or Logistics — one active
+  at a time, switchable for free before any level. Your overall approach for the run, chosen
+  fresh each time.
+
+---
+
 # STARHOLD 2.0 — Changelog
 
 Everything below shipped in this overhaul, grouped by what it's for rather than by build
