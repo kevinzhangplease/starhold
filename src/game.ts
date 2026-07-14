@@ -766,6 +766,11 @@ export class Game {
 
   killCount = 0;
   livesLostTotal = 0;
+  leakLedger: Record<string, number> = {};   // SERIALIZE: enemy id -> hull lost THIS run (Phase 6.3)
+  leakFlashUntil = 0;                        // base-sprite flash + red edge pulse window (Phase 6.2)
+  threatVerdict: { ground: number | null; air: number | null; verdict: 'comfortable' | 'tight' | 'leak' } | null = null;
+  // not serialized — recomputed on the same trigger events every time (build/sell/move/
+  // upgrade/perk/wave-prep), so a resumed run just recomputes it on its first such event.
   // --- challenge tracking (evaluated once at win) ---
   lateCallHappened = false;   // a wave was launched by the countdown hitting 0, not a deliberate early click
   soldAny = false;
@@ -1285,6 +1290,155 @@ export class Game {
     t.pathCellsInRange = n;
   }
 
+  // ---------- Threat readout (Phase 6.4) ----------
+  // A deliberately simple, per-kind DPS approximation — not a combat simulator. Its job is to
+  // move in the right direction as coverage changes, not predict exact outcomes (the UI
+  // tooltip says so explicitly). Always reads live stats(game), so buffs/cells/perks/meta are
+  // automatically folded in; Overcharge is excluded on purpose (a mid-wave burst, not baseline).
+  towerDPS(t: Tower): { ground: number; air: number } {
+    const s = t.stats(this);
+    let base = 0;
+    if (s.aura) {
+      base = s.dmg;
+    } else {
+      switch (t.spec.kind) {
+        case 'bullet':
+        case 'cryo': {
+          base = s.dmg * s.rate * (1 + (s.crit || 0) * 1.5);
+          if (s.pierceRamp) base *= 1.8;
+          else if (s.pierce) base *= 1.6;
+          break;
+        }
+        case 'mortar': {
+          base = s.dmg * s.rate * 1.4;
+          if (s.cluster) base *= 1 + 0.3 * s.cluster;
+          break;
+        }
+        case 'missile': base = s.dmg * s.rate * (1 + (s.shots ? s.shots - 1 : 0)) * 1.2; break;
+        case 'tesla': base = s.dmg * s.rate * (1 + 0.6 * (s.chains || 0)); break;
+        case 'prism': {
+          base = s.dmg * (s.rampMax || 1) * 0.6;
+          if (s.beams && s.beams > 1) base *= 1 + (s.beams - 1) * 0.8;
+          break;
+        }
+        case 'ray': base = s.dmg * s.rate * 1.8; break;
+        // Flame isn't in the plan's explicit kind list (a cone tick, not a projectile) —
+        // approximated as a plain direct hit; its burn already lands via the addition below.
+        case 'flame': base = s.dmg * s.rate; break;
+        case 'amp': base = 0; break; // its value flows through OTHER towers' buffed stats(), never counted twice
+      }
+    }
+    if (s.burnDps) base += s.burnDps * Math.min(1, (s.burnDur || 0) * s.rate);
+    const ground = base;
+    const air = s.groundOnly ? 0 : base * (s.airMul || 1);
+    return { ground, air };
+  }
+  // Ground coverage: reuses the exact Phase 3B.4 helper, never re-implemented.
+  groundCov(t: Tower): number {
+    return Math.min(1, t.pathCellsInRange / TUNING.threat.coveragePathCells);
+  }
+  // Air coverage: sampled against the PENDING wave's flier lane (Phase 5.4) when it carries
+  // one; otherwise falls back to "in range of any base" as a coarse always-available proxy.
+  airCov(t: Tower): number {
+    const s = t.stats(this);
+    if (s.groundOnly) return 0;
+    const R = t.rangeT() * this.cell;
+    const hasFlier = !!this.pendingWave?.some(grp => ENEMIES[grp.e].flying);
+    if (hasFlier) {
+      const lane = this.flierLanePoints(this.waveIdx + 1);
+      if (lane.length) {
+        const inRange = lane.filter(p => dist(t.x, t.y, p.x, p.y) <= R).length;
+        return Math.min(1, inRange / TUNING.threat.coverageLanePts);
+      }
+    }
+    for (const b of this.basePx) if (dist(t.x, t.y, b.x, b.y) <= R) return 1;
+    return 0;
+  }
+  // Wave demand (effHP, ground/air split) + deliverable DPS -> a comfortable/tight/leak
+  // verdict, worst of the two domains. Boss waves are excluded (never shaped/decorated, and
+  // boss theater already telegraphs them loudly) — returns null for them, and for no pending
+  // wave at all, so the UI can hide the chip cleanly.
+  computeThreat(): { ground: number | null; air: number | null; verdict: 'comfortable' | 'tight' | 'leak' } | null {
+    const wave = this.pendingWave;
+    if (!wave || !wave.length || wave.some(grp => ENEMIES[grp.e].boss)) return null;
+    const waveIdx = this.waveIdx + 1;
+    const mutator = this.pendingMutator;
+    const shape = this.level.waveShapes?.[waveIdx];
+    const M = TUNING.mutators;
+    const hpBase = this.endless ? this.endlessHpMul(waveIdx) : this.level.hpMul;
+    const scale = hpBase * (1 + waveIdx * 0.03) * this.diffHp;
+
+    let effHPGround = 0, effHPAir = 0;
+    let groundN = 0, groundSpeedSum = 0, airN = 0, airSpeedSum = 0;
+    for (const grp of wave) {
+      const spec = ENEMIES[grp.e];
+      let n = grp.n, hp = spec.hp;
+      if (mutator === 'horde') { n = Math.round(n * M.hordeCountMul); hp *= M.hordeHpMul; }
+      const shieldFrac = Math.max(spec.shield || 0, mutator === 'armored' ? M.armoredShieldFrac : 0);
+      const eff = n * hp * scale * (1 + shieldFrac);
+      if (spec.flying) { effHPAir += eff; airN += n; airSpeedSum += n * spec.speed; }
+      else { effHPGround += eff; groundN += n; groundSpeedSum += n * spec.speed; }
+    }
+    if (groundN === 0 && airN === 0) return null;
+
+    const speedMul = mutator === 'frenzied' ? M.frenziedSpeed : 1;
+    const avgGroundSpeed = groundN > 0 ? (groundSpeedSum / groundN) * speedMul : 1;
+    const avgAirSpeed = airN > 0 ? (airSpeedSum / airN) * speedMul : 1;
+
+    let pathLenPx = 0, pathWeight = 0;
+    for (const grp of wave) {
+      if (ENEMIES[grp.e].flying) continue;
+      const pi = grp.p || 0;
+      pathLenPx += (this.paths[pi]?.total || this.paths[0].total) * grp.n;
+      pathWeight += grp.n;
+    }
+    const Tground = groundN > 0 ? (pathWeight > 0 ? pathLenPx / pathWeight : this.paths[0].total) / avgGroundSpeed : 0;
+
+    let Tair = 0;
+    if (airN > 0) {
+      let laneLenPx = 0, laneWeight = 0;
+      for (const grp of wave) {
+        if (!ENEMIES[grp.e].flying) continue;
+        const pi = grp.p || 0;
+        const portal = this.portalPx[pi], base = this.basePx[pi];
+        let len = 0;
+        if (portal && base) {
+          const c = this.flierLaneControl(waveIdx, portal, base);
+          len = bezierArcLen(portal.x, portal.y, c.x, c.y, base.x, base.y);
+        }
+        laneLenPx += len * grp.n;
+        laneWeight += grp.n;
+      }
+      Tair = laneWeight > 0 ? (laneLenPx / laneWeight) / avgAirSpeed : 0;
+    }
+
+    // Shaped waves adjust efficiency, not transit — rush compresses arrival (simultaneity
+    // wastes DPS that can only hit one target at a time), trickle spaces it out (sequential
+    // targets waste nothing); convoy/feint are neutral here (their effect is targeting order/
+    // timing, not raw throughput).
+    let eff = TUNING.threat.efficiency;
+    if (shape === 'rush') eff *= 0.8;
+    else if (shape === 'trickle') eff *= 1.15;
+
+    let deliverableGround = 0, deliverableAir = 0;
+    for (const t of this.towers) {
+      const dps = this.towerDPS(t);
+      deliverableGround += dps.ground * this.groundCov(t) * Tground * eff;
+      deliverableAir += dps.air * this.airCov(t) * Tair * eff;
+    }
+
+    const rGround = effHPGround > 0 ? deliverableGround / effHPGround : null;
+    const rAir = effHPAir > 0 ? deliverableAir / effHPAir : null;
+    const ratios = [rGround, rAir].filter((r): r is number => r !== null);
+    const worst = ratios.length ? Math.min(...ratios) : 1;
+    const T = TUNING.threat;
+    const verdict: 'comfortable' | 'tight' | 'leak' = worst >= T.comfortable ? 'comfortable' : worst >= T.tight ? 'tight' : 'leak';
+    return { ground: rGround, air: rAir, verdict };
+  }
+  // Call after any tower/wave state change the readout depends on (build/sell/move/upgrade/
+  // perk/wave-prep) — deliberately NOT per frame, per the plan.
+  recomputeThreat() { this.threatVerdict = this.computeThreat(); }
+
   // ---------- economy ----------
   costOf(spec: TowerSpec) { return this.devFree ? 0 : Math.round(spec.stages[0].cost * this.metaCostMul); }
   upgradeCost(stat: StageStats) { return this.devFree ? 0 : Math.round(stat.cost * this.metaCostMul); }
@@ -1324,6 +1478,7 @@ export class Game {
     t.spent = Math.max(0, t.spent - refund);
     t.rampT = 0; t.cool = Math.min(t.cool, 1);
     this.recomputeCoverage(t);   // a refunded node can shrink range back down (Phase 3B.4)
+    this.recomputeThreat();
     audio.ui('sell');
     this.floater(t.x, t.y - 30, `+${payout} refunded`, '#fff3b0');
     this.parts.push({ x: t.x, y: t.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 40, color: '#ffb3c6', kind: 'ring' });
@@ -1395,6 +1550,7 @@ export class Game {
       this.pending2Wave = this.decorateWave(this.waveIdx + 2);
       this.pending2Mutator = this.pending2Wave ? this.rollMutator(this.waveIdx + 2, this.pendingMutator !== null) : null;
     }
+    this.recomputeThreat(); // wave-prep event (Phase 6.4.5) — the pending wave just (re)filled
   }
 
   // Bounty of the currently pending wave, at the reward scale it would spawn under right
@@ -2705,14 +2861,21 @@ export class Game {
     if (this.devGod) return;
     const dmg = e.spec.leak;
     this.runStats.leaksByEnemy[e.spec.id] = (this.runStats.leaksByEnemy[e.spec.id] || 0) + dmg;
+    // Leak ledger (Phase 6.3): this RUN's tally, separate from the lifetime `runStats` one —
+    // the in-run version is the actionable "who's hurting me right now" readout.
+    this.leakLedger[e.spec.id] = (this.leakLedger[e.spec.id] || 0) + dmg;
     this.lives = Math.max(0, this.lives - dmg);
     this.livesLostTotal += dmg;
-    audio.ui('leak');
-    this.shake(4);
+    audio.ui('leak'); // AUDIO-TWIN: descending-pitch hull groan (Phase 7)
+    // Leak impact (Phase 6.2): louder than a generic hit — bigger shake, a brief hitch, and a
+    // base-sprite flash/red-edge pulse (drawPortalsAndBases / drawOverlays read leakFlashUntil).
+    this.shake(6);
+    this.hitStop(0.03);
+    this.leakFlashUntil = this.now + 0.35;
     this.buzz([25, 30, 25]);
     const end = this.basePx[e.pathIdx] || { x: e.x, y: e.y };
     this.parts.push({ x: end.x, y: end.y, vx: 0, vy: 0, life: 0.4, max: 0.4, size: 56, color: '#ff7d7d', kind: 'ring' });
-    this.floater(end.x, end.y - 40, `-${dmg}`, '#ff7d7d');
+    this.floater(end.x, end.y - 40, `-${dmg} HULL`, '#ff7d7d');
     if (this.lives <= 0 && this.state === 'playing') this.lose();
   }
 
@@ -2840,6 +3003,7 @@ export class Game {
     this.recomputeCoverage(t);
     this.towers.push(t);
     this.occupied[cellIdx] = t;
+    this.recomputeThreat();
     this.runStats.towersBuilt[spec.id] = (this.runStats.towersBuilt[spec.id] || 0) + 1;
     audio.ui('place');
     this.parts.push({ x: c.x, y: c.y, vx: 0, vy: 0, life: 0.35, max: 0.35, size: 40, color: this.palTower(spec.id)[0], kind: 'ring' });
@@ -2874,6 +3038,7 @@ export class Game {
   choosePerk(t: Tower, perk: 'sharp' | 'rapid' | 'scav') {
     if (!isUnlocked('veterancy') || t.kills < TUNING.veterancy.kills || t.perk) return;
     t.perk = perk;
+    this.recomputeThreat();
     this.buzz([12, 24]);
     audio.ui('upgrade'); // AUDIO-TWIN: a dedicated veterancy chime (Phase 7)
     this.floater(t.x, t.y - 34, `${perk.toUpperCase()} PERK`, '#ffd97a');
@@ -2912,6 +3077,7 @@ export class Game {
     t.target = null; t.rampT = 0;
     this.recomputeCoverage(t);
     this.occupied[cellIdx] = t;
+    this.recomputeThreat();
     audio.ui('place');
     this.parts.push({ x: c.x, y: c.y, vx: 0, vy: 0, life: 0.3, max: 0.3, size: 36, color: this.palTower(t.spec.id)[0], kind: 'ring' });
     for (let i = 0; i < 6; i++) this.smoke(c.x + rand(-12, 12), c.y + rand(-8, 8));
@@ -2951,6 +3117,7 @@ export class Game {
     else { t.branch = branchPick; t.branchStage = 0; audio.ui('branch'); }
     if (t.branch < 0 || t.branchStage !== 0) audio.ui('upgrade');
     this.recomputeCoverage(t);   // range may have changed with the new stage/branch (Phase 3B.4)
+    this.recomputeThreat();
     this.parts.push({ x: t.x, y: t.y, vx: 0, vy: 0, life: 0.4, max: 0.4, size: 46, color: this.palTower(t.spec.id)[0], kind: 'ring' });
     for (let i = 0; i < 10; i++) {
       const a = Math.random() * Math.PI * 2;
@@ -2967,6 +3134,7 @@ export class Game {
     if (t.cell >= 0) this.occupied[t.cell] = null;
     this.towers = this.towers.filter(o => o !== t);
     this.selected = null;
+    this.recomputeThreat();
     audio.ui('sell');
     this.floater(t.x, t.y - 20, undo ? `Undone +${refund}` : `+${refund}`, '#fff3b0');
     for (let i = 0; i < 8; i++) this.smoke(t.x + rand(-12, 12), t.y + rand(-8, 8));
@@ -3198,12 +3366,15 @@ export class Game {
       g.fillRect(0, 0, W, H);
       g.globalAlpha = 1;
     }
-    // boss entrance vignette: pulsing red edges
+    // boss entrance vignette: pulsing red edges. A leak (Phase 6.2) gets the same treatment as
+    // a brief, sharper pulse — reusing this exact machinery is the plan's own instruction, since
+    // it's already the established "something's wrong" visual language.
     const bossV = this.state === 'playing' && this.now < this.bossVignetteUntil;
+    const leakV = this.state === 'playing' && this.now < this.leakFlashUntil;
     const lowHull = this.state === 'playing' && this.lives / this.maxLives < 0.25 && this.lives > 0;
-    if (bossV || lowHull) {
-      const pulse = 0.5 + 0.5 * Math.sin(this.now * (bossV ? 9 : 4));
-      const strength = (bossV ? 0.4 : 0.26) * (0.6 + 0.4 * pulse) * (this.reduceFlash ? 0.55 : 1);
+    if (bossV || leakV || lowHull) {
+      const pulse = 0.5 + 0.5 * Math.sin(this.now * (bossV ? 9 : leakV ? 14 : 4));
+      const strength = (bossV ? 0.4 : leakV ? 0.5 : 0.26) * (0.6 + 0.4 * pulse) * (this.reduceFlash ? 0.55 : 1);
       const grad = g.createRadialGradient(W / 2, H / 2, H * 0.44, W / 2, H / 2, H * 0.78);
       grad.addColorStop(0, 'rgba(255,80,90,0)');
       grad.addColorStop(1, `rgba(255,80,90,${strength})`);
@@ -3538,6 +3709,39 @@ export class Game {
       g.globalAlpha = 1;
       g.fillStyle = Math.sin(t * 5) > 0 ? '#ffb3c6' : '#5a5f96';
       g.beginPath(); g.arc(Math.cos(t * 1.4) * 14, Math.sin(t * 1.4) * 14, 2.6, 0, 7); g.fill();
+      // Leak impact — persistent crack overlay (Phase 6.2): 3 damage states off the SAME hull
+      // fraction the pip bar/vignette read, so every hull cue agrees. Static per-frame (no
+      // `t`-driven motion) so the cracks read as damage, not another pulsing effect; the
+      // per-path random offset just keeps multiple bases from looking identically cracked.
+      if (this.maxLives > 0) {
+        const hullFrac = this.lives / this.maxLives;
+        const dmgState = hullFrac > 0.6 ? 0 : hullFrac > 0.3 ? 1 : this.lives > 0 ? 2 : 0;
+        if (dmgState > 0) {
+          const seed = pi * 13.7;
+          const cracks = dmgState === 1 ? 2 : 4;
+          g.strokeStyle = '#1a1c38';
+          g.globalAlpha = 0.85;
+          g.lineWidth = 1.6;
+          for (let i = 0; i < cracks; i++) {
+            const a = seed + i * (Math.PI * 2 / cracks) + Math.sin(seed + i) * 0.4;
+            const len = 10 + (i % 2) * 5;
+            g.beginPath();
+            g.moveTo(Math.cos(a) * 6, Math.sin(a) * 6);
+            g.lineTo(Math.cos(a + 0.3) * len, Math.sin(a + 0.3) * len);
+            g.lineTo(Math.cos(a - 0.15) * (len * 0.7), Math.sin(a - 0.15) * (len * 0.7));
+            g.stroke();
+          }
+          g.globalAlpha = 1;
+        }
+      }
+      // Leak flash (Phase 6.2): a brief bright pop right on the base that took the hit.
+      if (this.now < this.leakFlashUntil) {
+        const flashFrac = clamp((this.leakFlashUntil - this.now) / 0.35, 0, 1);
+        g.globalAlpha = flashFrac * (this.reduceFlash ? 0.4 : 0.75);
+        g.fillStyle = '#ff7d7d';
+        g.beginPath(); g.arc(0, 0, 24, 0, 7); g.fill();
+        g.globalAlpha = 1;
+      }
       g.restore();
     }
   }

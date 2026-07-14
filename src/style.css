@@ -104,7 +104,8 @@ body.perf-mode .overlay-dim { background: rgba(10, 11, 24, 0.94); }
   .toggle { width: 60px; height: 34px; }
   .toggle::after { width: 26px; height: 26px; }
   .toggle.on::after { transform: translateX(26px); }
-  .move-btn, .sell-btn { padding: 13px 8px; font-size: 14px; min-height: 44px; }
+  .move-btn, .sell-btn, .oc-btn { padding: 13px 6px; font-size: 13px; min-height: 44px; }
+  .next-upg-btn, .details-toggle { min-height: 44px; }
   .ability-btn { width: 68px; height: 68px; }
   .nova-btn { width: 86px; height: 66px; }
   .tree-node { padding: 10px 10px; min-height: 44px; }
@@ -112,7 +113,8 @@ body.perf-mode .overlay-dim { background: rgba(10, 11, 24, 0.94); }
   .tree-node .tn-desc { font-size: 11px; }
   .lv-mod, .lv-ch { font-size: 15px; }
   .meta-node { min-height: 44px; }
-  .wp-item, .wp-mut { min-height: 32px; }
+  .wp-item, .wp-mut, .wp-threat { min-height: 32px; }
+  #hud-vitals { top: calc(72px + env(safe-area-inset-top)); }
 
   /* tower panel + build menu become bottom/centered sheets on touch — easier to reach
      one-handed than a popup pinned beside a tower near the screen edge. */
@@ -229,11 +231,14 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 .meta-node.owned .m-cost { color: var(--mint); }
 
 /* ============ In-game HUD ============ */
-#hud-top {
-  position: absolute; top: calc(12px + env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
-  display: flex; gap: 10px; align-items: center;
-  padding: 8px 14px;
+/* Vitals zone (Phase 6.1) — top-left, stacked just below the #hud-left icon-button row so the
+   two never compete for the same pixels. Player-state only: hull, credits, leak ledger, combo. */
+#hud-vitals {
+  position: absolute; top: calc(58px + env(safe-area-inset-top)); left: calc(14px + env(safe-area-inset-left));
+  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+  padding: 8px 12px; max-width: 300px;
 }
+.vitals-row { display: flex; gap: 10px; align-items: center; }
 .hud-stat {
   display: flex; align-items: center; gap: 7px;
   font-family: 'Fredoka'; font-size: 19px; font-weight: 600;
@@ -241,7 +246,6 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 }
 .hud-stat .ico { font-size: 17px; }
 .hud-stat.credits { color: var(--butter); }
-.hud-stat.lives { color: var(--pink); }
 .hud-stat.wave { color: var(--sky); }
 .hud-stat.bump { animation: stat-bump 0.3s ease; }
 @keyframes stat-bump { 30% { transform: scale(1.18); } }
@@ -250,17 +254,47 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 .interest-preview { font-size: 13px; font-weight: 800; color: rgba(255,243,176,0.65); margin-left: 2px; }
 .interest-preview:empty { display: none; }
 
-/* kill combo counter — top-center under the stat pills */
-#combo-hud {
-  position: absolute; top: 64px; left: 50%; transform: translateX(-50%);
-  font-family: 'Fredoka'; font-size: 30px; font-weight: 700; letter-spacing: 1px;
-  color: #ffd97a; text-shadow: 0 3px 0 rgba(5,6,18,0.5), 0 0 18px rgba(255,217,122,0.35);
-  pointer-events: none; opacity: 0; transition: opacity 0.25s;
+/* Hull pip bar (Phase 6.2) — one pip per hull point, wraps to a 2nd row above 24. */
+#hull-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.hull-pips { display: flex; flex-wrap: wrap; gap: 2px; max-width: 224px; }
+.hull-pip {
+  width: 7px; height: 14px; border-radius: 2px;
+  background: rgba(20,21,42,0.75); border: 1px solid rgba(238,240,255,0.12);
+  transition: background 0.15s;
 }
-#combo-hud.on { opacity: 1; }
+.hull-pips .hull-pip.filled { background: #7ee3c3; border-color: transparent; }
+.hull-pips.frac-mid .hull-pip.filled { background: #ffd97a; }
+.hull-pips.frac-low .hull-pip.filled { background: #ff8fa3; }
+.hull-pip.crack { animation: hull-crack 0.22s ease-out both; }
+@keyframes hull-crack {
+  0% { background: #ffffff; transform: scaleY(1); }
+  45% { background: #ffffff; transform: scaleY(1.15) skewX(-8deg); }
+  100% { background: rgba(20,21,42,0.75); transform: scaleY(1); }
+}
+.hull-label { font-family: 'Fredoka'; font-size: 13px; font-weight: 700; color: var(--ink-dim); white-space: nowrap; }
+
+/* Leak ledger (Phase 6.3) — hidden until the first leak this run. */
+.leak-ledger { display: flex; gap: 6px; align-items: center; }
+.leak-ledger:empty { display: none; }
+.ledger-item {
+  display: flex; align-items: center; gap: 3px;
+  background: rgba(20,21,42,0.55); border-radius: 999px; padding: 2px 8px 2px 2px;
+  cursor: help;
+}
+.ledger-item canvas { width: 18px; height: 18px; }
+.ledger-count { font-family: 'Fredoka'; font-size: 12px; font-weight: 700; color: var(--ink-dim); }
+.ledger-overflow { font-family: 'Fredoka'; font-size: 12px; font-weight: 700; color: var(--ink-dim); }
+
+/* kill combo counter — now a plain flow child of the vitals stack (Phase 6.1); no longer
+   needs to dodge the boss bar (the old `.with-boss` collision hack is gone for good). */
+#combo-hud {
+  font-family: 'Fredoka'; font-size: 26px; font-weight: 700; letter-spacing: 1px;
+  color: #ffd97a; text-shadow: 0 3px 0 rgba(5,6,18,0.5), 0 0 18px rgba(255,217,122,0.35);
+  pointer-events: none; height: 0; opacity: 0; overflow: visible; transition: opacity 0.25s;
+}
+#combo-hud.on { opacity: 1; height: auto; }
 #combo-hud.pulse { animation: combo-pulse 0.28s ease; }
-#combo-hud.with-boss { top: 110px; font-size: 24px; }
-@keyframes combo-pulse { 35% { transform: translateX(-50%) scale(1.32); } }
+@keyframes combo-pulse { 35% { transform: scale(1.32); } }
 
 /* boss health bar — top-center under the stat pills */
 #boss-bar {
@@ -365,6 +399,7 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 }
 .bm-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 7px; }
 .bm-item {
+  position: relative;
   display: flex; flex-direction: column; align-items: center; gap: 2px;
   padding: 6px 2px 5px; border-radius: 10px;
   background: var(--space-2); border: 1px solid var(--line);
@@ -381,7 +416,26 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
   0%, 100% { border-color: rgba(160,216,239,0.35); box-shadow: 0 0 0 rgba(160,216,239,0); }
   50% { border-color: rgba(160,216,239,0.9); box-shadow: 0 0 8px rgba(160,216,239,0.5); }
 }
-
+.bm-chips { display: flex; flex-wrap: wrap; gap: 2px; justify-content: center; }
+.bm-chip {
+  font-family: 'Fredoka'; font-size: 7.5px; font-weight: 700; letter-spacing: 0.3px;
+  padding: 1px 4px; border-radius: 5px; background: var(--space-3); color: var(--ink-dim);
+}
+.bm-chip-no-air { background: rgba(255,125,125,0.16); color: var(--danger); }
+.bm-chip-air-bonus { background: rgba(168,230,207,0.18); color: var(--mint); }
+.bm-chip-role { background: rgba(160,216,239,0.14); color: var(--sky); }
+.bm-item.counters {
+  animation: counters-pulse 1.4s ease-in-out infinite;
+}
+@keyframes counters-pulse {
+  0%, 100% { border-color: rgba(255,217,122,0.4); box-shadow: 0 0 0 rgba(255,217,122,0); }
+  50% { border-color: rgba(255,217,122,0.95); box-shadow: 0 0 9px rgba(255,217,122,0.55); }
+}
+.bm-counter-label {
+  position: absolute; left: 0; right: 0; bottom: -16px; text-align: center;
+  font-size: 8.5px; font-weight: 700; color: #ffd97a; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; pointer-events: none;
+}
 /* abilities — bottom-left stack */
 #ability-stack {
   position: absolute; left: calc(14px + env(safe-area-inset-left)); bottom: calc(14px + env(safe-area-inset-bottom));
@@ -574,6 +628,14 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 }
 .wp-shape { color: #a0d8ef; }
 .wp-flier { font-size: 15px; cursor: help; }
+.wp-threat {
+  font-family: 'Fredoka'; font-size: 13px; font-weight: 700; white-space: nowrap;
+  padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor;
+  background: rgba(20,21,42,0.6); cursor: help;
+}
+.wp-threat.threat-ok { color: #7ee3c3; }
+.wp-threat.threat-tight { color: #ffd97a; }
+.wp-threat.threat-leak { color: #ff8fa3; }
 .wp-jammed { gap: 6px; }
 .wp-jam-q {
   font-family: 'Fredoka'; font-size: 15px; font-weight: 700; color: var(--ink-dim);
@@ -681,6 +743,33 @@ body.perf-mode #cell-tip { backdrop-filter: none; -webkit-backdrop-filter: none;
   color: var(--sky); background: rgba(160,216,239,0.12); border: 1px solid rgba(160,216,239,0.3);
   border-radius: 999px; padding: 3px 10px; margin-top: 2px;
 }
+.sp-dps { display: flex; align-items: baseline; gap: 6px; }
+.sp-dps b { font-family: 'Fredoka'; font-size: 22px; color: var(--butter); text-shadow: 0 0 10px rgba(255,243,176,0.3); }
+.sp-dps-unit { font-size: 11px; color: var(--ink-dim); font-weight: 700; }
+.dps-air-chip {
+  margin-left: auto; font-size: 11px; font-weight: 700; color: var(--sky);
+  background: rgba(160,216,239,0.12); border: 1px solid rgba(160,216,239,0.3);
+  border-radius: 999px; padding: 2px 9px;
+}
+.dps-air-chip.no-air { color: var(--ink-dim); background: rgba(255,255,255,0.05); border-color: var(--line); }
+.next-upg-btn {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  padding: 10px 14px; border-radius: 12px; background: var(--mint); color: #123326;
+  font-family: 'Fredoka'; font-weight: 700; font-size: 14px;
+  box-shadow: 0 3px 0 #5fae92;
+}
+.next-upg-btn:hover:not(:disabled) { background: #baf0dc; }
+.next-upg-btn:disabled { opacity: 0.5; box-shadow: none; }
+.next-upg-btn.poor { background: var(--space-2); color: var(--ink); box-shadow: none; border: 1px solid var(--line); }
+.next-upg-btn.specialize { background: var(--lavender); color: #241a3e; box-shadow: 0 3px 0 #7a63b8; }
+.next-upg-btn .nu-cost { color: inherit; opacity: 0.85; white-space: nowrap; }
+.next-upg-btn .nu-sub { font-size: 11px; font-weight: 600; opacity: 0.8; }
+.details-toggle {
+  align-self: center; font-size: 12px; font-weight: 700; color: var(--ink-dim);
+  padding: 4px 10px; border-radius: 8px;
+}
+.details-toggle:hover { color: var(--ink); background: var(--space-2); }
+.details-panel { display: flex; flex-direction: column; gap: 10px; }
 .sp-stats2 { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
 .ss-row { display: flex; gap: 14px; }
 .ss-item { flex: 1; min-width: 0; display: flex; justify-content: space-between; gap: 6px; }

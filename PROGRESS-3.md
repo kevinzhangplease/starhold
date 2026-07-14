@@ -830,3 +830,125 @@ cleanly at both 1280×800 and the 846×390 coarse viewport with the widest real 
 
 ### Next
 Phase 6 — HUD & Information Hierarchy.
+
+## Phase 6 — HUD & Information Hierarchy [COMPLETE]
+Started: 2026-07-14 · Finished: 2026-07-14
+
+### Shipped
+1. **HUD zone system** (`ui.ts` `buildHud`): every top-level HUD element now belongs to exactly
+   one fixed screen zone, documented in a codified comment block above `buildHud()` —
+   `#hud-vitals` (top-left: hull bar, credits+interest, leak ledger, combo), `#boss-bar`
+   (top-center, boss-only), `#hud-right` (top-right: forecast+threat chip, speed, Launch-wave,
+   settings), `#ability-stack` (bottom-left), `.note-toast` (bottom-center), `#side-panel`/
+   `#build-menu` (bottom sheet on mobile). Nothing negotiates position at runtime anymore. The
+   real dead code this replaced was a `#combo-hud.with-boss` CSS rule + matching JS toggle — a
+   collision hack for exactly the old combo-vs-boss-bar overlap this zone system makes
+   structurally impossible (combo is now a flow child of `#hud-vitals`, not independently
+   positioned) — removed cleanly.
+2. **Hull segmented pip bar** (`game.ts`, `ui.ts`, `style.css`): one DOM `<span>` per hull
+   point (caps at 30 = 20 base + 10 Hull Plating meta), group-tinted by remaining fraction
+   (teal > 60%, amber 30–60%, red < 30%), with a sequential ~40ms/pip white-flash-then-empty
+   "crack" animation on multi-hull loss (`reduceFlash`-aware). `onLeak` also bumps `shake`/adds
+   `hitStop`, and the base sprite gets a static 3-state crack overlay (seeded per-path, not
+   animated) plus a brief bright leak-flash — both reuse the existing boss/low-hull vignette
+   gradient code via a third `leakV` case in `drawOverlays`, not a duplicate.
+3. **Leak ledger**: new `Game.leakLedger: Record<string, number>` (SERIALIZE-tagged, resets
+   per run — distinct from the lifetime `runStats.leaksByEnemy`), populated in `onLeak`,
+   rendered as a worst-offender-first icon strip (capped at 4 + overflow count) with a counter
+   tooltip per icon. Round-trips through resume (`RESUME_VERSION` 2 → 3, see Decisions).
+4. **Threat readout** — the phase's highest-value item (`game.ts`): `towerDPS(t)` (kind-aware
+   DPS approximation covering bullet/cryo/mortar/missile/tesla/prism/ray/flame/amp/aura, each
+   per the plan's per-kind formula, built on `Tower.stats(game)` so buffs/cells/perks are
+   already included), `groundCov(t)`/`airCov(t)` (reusing Phase 3B.4's `pathCellsInRange` and
+   Phase 5.4's `flierLanePoints` — no re-implementation), a wave-demand model (`effHP` split
+   ground/air, a transit-budget `T`, shape-adjusted `efficiency` — rush ×0.8, trickle ×1.15),
+   and a worst-of-two-domains `comfortable`/`tight`/`leak` verdict. Recomputed only on real
+   trigger events (`buildAt`, `sell`, `confirmMove`, `buyUpgrade`, `choosePerk`,
+   `refundNode`, and inside `preparePending()` covering wave-prep/`startLevel`) via
+   `Game.recomputeThreat()` — never per frame. Displayed as a colored chip on the wave-preview
+   pill (✅/⚠/☠) with a hedged tooltip ("a rough forecast... not a promise") that includes the
+   raw ground/air coverage-to-threat ratios when available.
+5. **Two-tier tower panel** (`ui.ts` `renderSidePanel`): Tier 1 (always visible) now shows
+   name/level, description+warning, cell chip, a headline DPS line (`g.towerDPS(t)`, with an
+   AIR sub-chip only when the air domain differs from ground — "⛔ no air" or "✈ N"), the
+   Veterancy perk chooser when eligible, ONE resolved best-next-upgrade button (plain stage
+   upgrade while `stage < 2`; once at `stage === 2` with no branch chosen, a "Specialize ▾"
+   button that expands Tier 2 straight to the branch choice, since a single button can't
+   represent 3 branch options; a branch tier-2 upgrade once specialized; nothing once fully
+   maxed), and a merged action row (Move / Overcharge / Sell). Tier 2 lives behind a
+   session-scoped `Details ▾` expander (`private detailsExpanded`, persists across tower
+   selections, not per-tower) holding the full stats grids, amplified note, targeting chips,
+   the existing tech tree, and lifetime stats (dmg/kills/value). Verified scroll-free at
+   846×390 in a real headless-Chromium pass (`side-panel` `scrollHeight === clientHeight`).
+6. **Build menu role chips + counter highlighting** (`data.ts` `roleChips`, `ui.ts`
+   `openBuildMenu`/`updateHud`): each tile gets ≤2 chips — first `NO AIR`/`AIR+` only for the
+   notable cases (derived from the stage-0 spec, extending the existing `airClass` pattern),
+   second a single role tag (`SPLASH`/`SLOW`/`BURN`/`CHAIN`/`SUPPORT`/`PIERCE`) picked by
+   priority when a spec matches several fields (e.g. Missile has both splash and `airMul` →
+   SPLASH wins). Counter highlighting: a throttled (2Hz, `lastCounterCheck`) block in
+   `updateHud()` finds the highest-HP live enemy on screen, and pulses (gold outline +
+   "counters {name}" micro-label) any open build-menu tile whose id appears in that enemy's
+   `counters` list. Grid order unchanged (hotkey muscle memory), per the plan's own note.
+7. **Copy sweep**: Game Guide (`showGameCodex`) gained a new "Hull & leaks" item, and the
+   "Building"/"Upgrading"/"Targeting"/"The forecast bar"/"Per-tower stats" items were rewritten
+   to describe the new pip bar, leak ledger, role chips + counter pulse, the resolved
+   next-upgrade button + Details expander, and the threat verdict chip (with its "rough
+   forecast, not a promise" heuristic disclaimer baked into the copy, matching the in-game
+   tooltip).
+8. **Tests**: new `tests/threat-readout.ts` (pure-formula replication of `towerDPS`/coverage/
+   verdict-threshold/domain-split logic against the real `TUNING`) and `tests/role-chips.ts`
+   (spot-checks every tower's derived chip pair, including the priority-order case). Extended
+   `tests/resume.ts` with a `leakLedger` round-trip assertion.
+
+### Calibration protocol (6.4.6) — results
+Run live in a real headless-Chromium pass against the actual `computeThreat()` implementation
+(not a simulation), using the shipped `TUNING.threat` defaults (`efficiency: 0.65,
+comfortable: 1.5, tight: 1.0`) with no tuning needed — all three anchors passed on the first try:
+- **Empty board, L1 wave 1** → `☠ Likely leak`. ✅
+- **Guided-first-build L1** (one base Pulse tower placed on a path-adjacent cell for wave 1,
+  wave 1 cleared, earned credits spent upgrading that same tower to Mk II/III before wave 2)
+  → `✅ Comfortable` by the wave-2 forecast. ✅ (A single un-upgraded Mk I Pulse alone was
+  still `⚠ Tight`/`☠ Likely leak` against wave 2 — expected, since wave 2 is meaningfully
+  tougher and a guided player is expected to spend wave-1 earnings before committing.)
+- **Air-blind board, L4 wave 6 (the all-wisp wave)**: a single ground-only Mortar (no anti-air
+  coverage at all) → `☠ Likely leak`, tooltip confirms `air 0.0× coverage-to-threat`. ✅
+
+### Decisions / deviations
+- **`RESUME_VERSION` 2 → 3, not 3 → 4**: the plan's 6.8 exit criteria assume the prior version
+  was 3; the actual prior value (set in Phase 4.6) was 2 — same category of plan-vs-reality
+  mismatch as Phase 4's own `RESUME_VERSION` assumption. Bumped to 3 and added `leakLedger` to
+  both the interface and the serialize/deserialize round trip.
+- **6.1's "dead code" target**: the plan's literal text pointed at `repositionPopups()`/
+  `avoidOverlap()`, but tracing those showed they only ever guarded enemy-tip/cell-tip against
+  the side-panel/build-menu/place-confirm — unrelated to HUD zones, so nothing there needed
+  removal. The actual dead code from the old collision-prone layout was a separate
+  `#combo-hud.with-boss` CSS rule and its JS toggle; found and removed instead.
+- **"Specialize" resolution for the next-upgrade button**: once a tower reaches `stage === 2`
+  with no branch chosen yet, there are 3 valid branch picks — too many for one resolved button.
+  Rather than guess or omit the button, it becomes a `Specialize ▾` action that expands Tier 2
+  straight to the branch tech tree, matching the "no scanning required" spirit of 6.5 as
+  closely as a genuinely 3-way choice allows.
+- **Counter highlighting's "worst on-screen threat"**: defined as the live enemy with the
+  highest current HP (bosses dominate naturally via their HP pool, no special-casing needed) —
+  the plan doesn't specify a scoring formula beyond "worst... wins if several," and remaining
+  HP is the simplest legible proxy that doesn't require guessing at a weighting the plan never
+  gave numbers for.
+
+### Known issues
+None. All 5 gates green: `tsc --noEmit`, `validate.ts`, the full 16-file test suite (14 prior +
+new `tests/threat-readout.ts` and `tests/role-chips.ts`, `tests/resume.ts` extended), the
+standard build, and the singlefile build. Manually verified live in a real headless-Chromium
+browser: hull pips crack sequentially and the leak ledger populates correctly when several
+aliens leak through with no towers built; the threat chip visibly upgrades from Likely leak to
+Comfortable as a tower is built and upgraded mid-intermission on L1; the two-tier panel resolves
+correctly through a full Pulse upgrade path (Mk II → Mk III → Specialize → branch tier-1 →
+branch tier-2, each step's headline DPS and resolved-button label updating live) and stays
+scroll-free at 846×390; build-menu role chips render correctly for every tower and the
+counter-highlight pulse (with its "counters {name}" label) appears on the correct tile once an
+enemy is on screen; Brutal's "JAMMED" forecast card and the threat chip coexist on one row at
+846×390 without collision; `#combo-hud` confirmed to be a static flow child of `#hud-vitals`
+(not independently positioned), so the old combo/boss-bar collision is now structurally
+impossible rather than merely avoided.
+
+### Next
+Phase 7 — Audio as a Second Information Channel.

@@ -181,6 +181,13 @@ export const TUNING = {
     kills: 45,                 // kill threshold that offers a perk choice
     perks: { sharp: 0.12, rapid: 0.12, scav: 1 },   // sharp/rapid are multiplier bonuses; scav is a flat credit base (scaled by econScale at payout)
   },
+  threat: {
+    efficiency: 0.65,          // baseline fraction of raw deliverable DPS that actually lands
+    comfortable: 1.5,          // deliverable/effHP ratio at or above this -> "Comfortable"
+    tight: 1.0,                // ratio at or above this (below comfortable) -> "Tight"
+    coveragePathCells: 5,      // pathCellsInRange needed for a tower to read as full ground coverage
+    coverageLanePts: 4,        // flier-lane sample points in range needed for full air coverage
+  },
 } as const;
 
 export interface StageStats {
@@ -656,4 +663,23 @@ export function airClass(spec: TowerSpec): 'no-air' | 'air' | 'air-bonus' | 'sup
   if (s.groundOnly) return 'no-air';
   if ((s.airMul || 1) > 1) return 'air-bonus';
   return 'air';
+}
+
+// Build-menu role chips (Phase 6.6): a compact "what does this tower do" tag pair, derived
+// from the stage-0 spec so it reads the same for every tower regardless of upgrade path.
+// `air` only fires for the notable cases (no air / air-bonus) — plain air coverage is the
+// default and doesn't need a chip. `role` picks ONE tag even when a spec matches several
+// fields (e.g. missile has both splash and airMul) — SPLASH/SLOW/BURN/CHAIN/SUPPORT/PIERCE,
+// in that priority order.
+export function roleChips(spec: TowerSpec): { air: 'no-air' | 'air-bonus' | null; role: 'splash' | 'slow' | 'burn' | 'chain' | 'support' | 'pierce' | null } {
+  const s = spec.stages[0];
+  const air = s.groundOnly ? 'no-air' : (s.airMul || 1) > 1 ? 'air-bonus' : null;
+  let role: ReturnType<typeof roleChips>['role'] = null;
+  if (spec.kind === 'amp') role = 'support';
+  else if (s.splash || s.cluster) role = 'splash';
+  else if (s.slow || s.aura) role = 'slow';
+  else if (s.burnDps) role = 'burn';
+  else if (s.chains) role = 'chain';
+  else if (s.pierce) role = 'pierce';
+  return { air, role };
 }

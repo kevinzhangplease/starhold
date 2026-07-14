@@ -1,5 +1,5 @@
 // ================= UI layer =================
-import { TOWERS, META, ABILITIES, ZONES, ENEMIES, PALETTE, TowerSpec, EnemySpec, airClass, setUnlockedLevel, fmt, isUnlocked, MUTATORS, MODIFIER_INFO, CHALLENGE_POOL, CELL_TYPES, TUNING, WaveShape, WAVE_SHAPES } from './data';
+import { TOWERS, META, ABILITIES, ZONES, ENEMIES, PALETTE, TowerSpec, EnemySpec, airClass, roleChips, setUnlockedLevel, fmt, isUnlocked, MUTATORS, MODIFIER_INFO, CHALLENGE_POOL, CELL_TYPES, TUNING, WaveShape, WAVE_SHAPES } from './data';
 import { LEVELS, ENDLESS_LEVEL, LevelSpec } from './levels';
 import { Game, Tower, Enemy, W, H } from './game';
 import { audio } from './audio';
@@ -131,8 +131,10 @@ export class UI {
 
   notify!: Notifier;
   private hudRefs: Record<string, HTMLElement> = {};
-  private lastHud = { credits: -1, lives: -1, wave: -1, overcharge: -1 };
+  private lastHud = { credits: -1, lives: -1, wave: -1, overcharge: -1, leakLedgerKey: '', threatKey: '' };
   private sellPanelTower: Tower | null = null;   // live sell/undo label refresh target
+  private detailsExpanded = false;   // Tier-2 "Details ▾" expander (Phase 6.5) — session-scoped, not per-tower
+  private lastCounterCheck = 0;   // throttle for build-menu counter highlighting (Phase 6.6) — 2Hz, not per-frame
   private abilityBtns: Record<string, HTMLElement> = {};
 
   // touch/pointer state
@@ -1014,12 +1016,13 @@ export class UI {
 
     section('The basics');
     item('Goal', "Aliens march along a fixed path toward your base. Build towers to kill them before they arrive. Every alien that gets through costs hull integrity (your lives) — run out and the level ends.");
-    item('Building', "Tap an open cell, pick a tower, then confirm — you'll see a ghost preview and its range before you commit. Each tower costs credits, which you earn by killing aliens and clearing waves.");
-    item('Upgrading', "Select a built tower to see its tech tree: two general upgrades (Mk II, Mk III), then a choice of 3 specialization branches, 2 tiers each. Any upgrade can be refunded in full between waves — experiment freely. Refunding mid-wave returns 72% (closes an interest-payout exploit).");
+    item('Hull & leaks', "Your hull is the pip bar top-left, one pip per point — it thins and shifts from teal to amber to red as you take damage, and cracks visibly where you've been hit. The row beneath it is your leak ledger: an icon for each alien type that's gotten through this run, worst offender first, so you can see at a glance what's actually costing you hull.");
+    item('Building', "Tap an open cell, pick a tower, then confirm — you'll see a ghost preview and its range before you commit. Each tower costs credits, which you earn by killing aliens and clearing waves. Build-menu tiles carry small tags for quick scanning — NO AIR or AIR+ for anti-air coverage, and a role tag (SPLASH, SLOW, BURN, CHAIN, SUPPORT, PIERCE) for what the tower does. A tile also pulses gold when it counters the toughest alien currently on screen.");
+    item('Upgrading', "Select a built tower to see its headline DPS and one resolved best-next-upgrade button — no scanning required. Once you've picked a specialization branch, tap Details for the full tech tree: two general upgrades (Mk II, Mk III), then a choice of 3 branches, 2 tiers each. Any upgrade can be refunded in full between waves — experiment freely. Refunding mid-wave returns 72% (closes an interest-payout exploit).");
     item('Moving & selling', "A selected tower's panel has Move (relocate it for free, anytime) and Sell buttons. Selling returns 72% of its cost, or 100% within 4 seconds of placing it — a brief undo window for a misclick, not a free respec.");
-    item('Targeting', "Each tower has a targeting mode — First (furthest along the path), Last, Strong(est), Weak(est), or Close(st) — changeable anytime from its panel. Set a default in Settings for all new towers.");
+    item('Targeting', "Each tower has a targeting mode — First (furthest along the path), Last, Strong(est), Weak(est), or Close(st) — changeable anytime from its panel's Details section. Set a default in Settings for all new towers.");
     item('Launching waves', "Click Launch to send the next wave — calling it early (before the countdown finishes) pays a bonus: a percentage of that wave's total bounty, scaled by how much time was left (capped at 40%). Toggle Auto-launch to skip the wait entirely — it launches immediately but earns no early-call bonus, since there's no longer a decision being rewarded.");
-    item('The forecast bar', "Top-right shows what's coming: the next wave's alien composition and any twist it carries, plus a dimmed preview of the wave after that — always visible before you commit to a layout.");
+    item('The forecast bar', "Top-right shows what's coming: the next wave's alien composition and any twist it carries, plus a dimmed preview of the wave after that — always visible before you commit to a layout. The colored pill next to it is a rough read on your current defenses against that wave — Comfortable, Tight, or Likely leak — based on your towers' coverage and firepower. It's a heuristic nudge, not a guarantee; it can't see clever positioning or a burst ability you're holding in reserve.");
 
     section('Making it interesting');
     item('Kill combos', "Kill aliens within 1.6 seconds of each other to build a combo counter. Milestones (×5, ×10, ×20, ×35, ×50) pay escalating bonus credits with a rising chime. Any alien that leaks through breaks your chain — leaks cost you momentum, not just hull.");
@@ -1041,7 +1044,7 @@ export class UI {
     item('Stars', "Your star total (level completion + challenges + endless milestones) is shown at the top of Sectors and spent in Upgrades.");
     item('Meta upgrades', "Permanent, account-wide upgrades bought with stars: more starting credits, more hull, cheaper towers, stronger towers, and unlocking Orbital Strike / Stasis Field. These apply to every level you play from then on.");
     item('Victory & defeat screens', "Winning punches in your stars, challenge badges, and any new records one at a time — tap to skip. Losing tells you which wave broke you and which alien type did most of the damage, with a counter-tower hint.");
-    item('Per-tower stats', "Any tower that's done something shows its lifetime damage, kills, and a value rating (credits earned back vs. what you spent) right in its panel — useful for judging what's actually pulling its weight.");
+    item('Per-tower stats', "Any tower that's done something shows its lifetime damage, kills, and a value rating (credits earned back vs. what you spent) under its panel's Details section — useful for judging what's actually pulling its weight.");
 
     section('After you beat the campaign');
     item('Ascension', "A 5-tier New Game+, unlocked one tier at a time by beating Level 15 at the current one. Each tier stacks on the last: more HP, more frequent mutators, more (and nastier) elites, a tighter economy, and eventually less breathing room between waves. Pick your tier from Sectors.");
@@ -1164,7 +1167,7 @@ export class UI {
     this.isEndless = endless;
     this.isDaily = !!daily;
     this.currentDaily = daily;
-    this.lastHud = { credits: -1, lives: -1, wave: -1, overcharge: -1 };
+    this.lastHud = { credits: -1, lives: -1, wave: -1, overcharge: -1, leakLedgerKey: '', threatKey: '' };
     // once we act on a snapshot (resuming OR starting anything else), it's consumed
     if (this.save.resume) { this.save.resume = undefined; this.persist(); }
     const owned = (id: string) => this.save.meta.includes(id) || this.devMode;
@@ -1264,6 +1267,7 @@ export class UI {
       game.novaNeed = resumeSnap.novaNeed;
       game.cds.orbital = resumeSnap.cdOrbital;
       game.cds.stasis = resumeSnap.cdStasis;
+      game.leakLedger = { ...(resumeSnap.leakLedger || {}) };
       for (const rt of resumeSnap.towers) {
         const spec = TOWERS.find(t => t.id === rt.specId);
         const cellInfo = game.cells[rt.cell];
@@ -1331,23 +1335,60 @@ export class UI {
     if (this.game) { this.game.destroy(); this.game = null; }
   }
 
+  // ============================================================
+  // HUD ZONE SYSTEM (Phase 6.1) — every top-level HUD element belongs to exactly one fixed
+  // screen zone, and nothing negotiates position at runtime (the old combo-vs-boss-bar
+  // collision this replaced is documented in PROGRESS-3.md). Zones:
+  //   #hud-vitals  (top-left)     — hull bar, credits (+interest), leak ledger, combo. Player-
+  //                                 state only; this is "am I about to die?" at a glance.
+  //   #boss-bar    (top-center)   — boss health/shield. THREAT only — critical banners and
+  //                                 meteor/ion warnings render via the existing .banner/toast
+  //                                 system, which already sits below this row (see Decisions).
+  //   #hud-right   (top-right)    — wave forecast (+threat readout chip), speed, Launch-wave
+  //                                 button, settings gear. Unchanged position (plan's own
+  //                                 "Do NOT move it" instruction).
+  //   #ability-stack (bottom-left)— abilities, NOVA, Overcharge pips. Player verbs only.
+  //   .note-toast  (bottom-center)— low-tier guidance toasts. Unchanged.
+  //   #side-panel / #build-menu   — tower panel / build menu (bottom sheet on mobile). Unchanged.
+  // #hud-left (the ☰⏸ speed ⏩ ⚑ row) is system chrome, not player-state — kept at its existing
+  // muscle-memory spot, with vitals stacking just below it rather than competing for the exact
+  // same pixels.
+  // ============================================================
   buildHud() {
     const g = this.game!;
-    const top = el('div', 'panel');
-    top.id = 'hud-top';
+    const vitals = el('div', 'panel');
+    vitals.id = 'hud-vitals';
+
+    // Hull pip bar (Phase 6.2) — one pip per hull point (maxLives tops out at 30, per the
+    // baseHp(20)+Hull-Plating(10) ceiling), wrapping to a second row above 24.
+    const hullBar = el('div', '');
+    hullBar.id = 'hull-bar';
+    const pips = el('div', 'hull-pips');
+    for (let i = 0; i < g.maxLives; i++) pips.append(el('span', 'hull-pip filled'));
+    const hullLabel = el('span', 'hull-label', `${g.lives}/${g.maxLives}`);
+    hullBar.append(pips, hullLabel);
+    this.hudRefs.hullPips = pips;
+    this.hudRefs.hullLabel = hullLabel;
+
     const credits = el('div', 'hud-stat credits', `<span class="ico">◆</span><span class="v"></span><span class="interest-preview"></span>`);
-    const lives = el('div', 'hud-stat lives', `<span class="ico">♥</span><span class="v"></span>`);
     const wave = el('div', 'hud-stat wave', `<span class="ico">≋</span><span class="v"></span>`);
-    top.append(credits, lives, wave);
+    const statRow = el('div', 'vitals-row');
+    statRow.append(credits, wave);
     this.hudRefs.credits = credits.querySelector('.v') as HTMLElement;
     this.hudRefs.interestPreview = credits.querySelector('.interest-preview') as HTMLElement;
-    this.hudRefs.lives = lives.querySelector('.v') as HTMLElement;
     this.hudRefs.wave = wave.querySelector('.v') as HTMLElement;
-    this.hudRefs.creditsWrap = credits; this.hudRefs.livesWrap = lives;
+    this.hudRefs.creditsWrap = credits;
+
+    // Leak ledger (Phase 6.3) — hidden (via :empty) until the first leak populates it.
+    const ledger = el('div', 'leak-ledger');
+    this.hudRefs.leakLedger = ledger;
+
     const combo = el('div', '');
     combo.id = 'combo-hud';
-    this.root.append(combo);
     this.hudRefs.combo = combo;
+
+    vitals.append(hullBar, statRow, ledger, combo);
+    this.root.append(vitals);
 
     const left = el('div', '');
     left.id = 'hud-left';
@@ -1461,7 +1502,7 @@ export class UI {
     hint.id = 'build-hint';
     setTimeout(() => hint.remove(), 9000);
 
-    this.root.append(top, left, right, abil, hint);
+    this.root.append(left, right, abil, hint);
     this.repositionPopups();
   }
 
@@ -1552,6 +1593,22 @@ export class UI {
       mini.width = 68; mini.height = 68;
       this.drawMiniTower(mini, spec);
       item.append(mini, el('span', 'bm-name', spec.name), el('span', 'bm-cost', `◆ ${cost}`));
+      // Role chips (Phase 6.6): a compact "what does this tower do" tag pair.
+      const rc = roleChips(spec);
+      if (rc.air || rc.role) {
+        const chipRow = el('div', 'bm-chips');
+        if (rc.air) {
+          const airLabel: Record<string, string> = { 'no-air': 'NO AIR', 'air-bonus': 'AIR+' };
+          chipRow.append(el('span', `bm-chip bm-chip-${rc.air}`, airLabel[rc.air]));
+        }
+        if (rc.role) {
+          const roleLabel: Record<string, string> = {
+            splash: 'SPLASH', slow: 'SLOW', burn: 'BURN', chain: 'CHAIN', support: 'SUPPORT', pierce: 'PIERCE',
+          };
+          chipRow.append(el('span', `bm-chip bm-chip-role`, roleLabel[rc.role]));
+        }
+        item.append(chipRow);
+      }
       item.title = spec.blurb;
       item.disabled = poor;
       item.onmouseenter = () => { g.menuHover = spec; };
@@ -1788,6 +1845,40 @@ export class UI {
       const txt = this.sellLabel(this.sellPanelTower);
       if (this.hudRefs.sellBtn.textContent !== txt) this.hudRefs.sellBtn.textContent = txt;
     }
+    // Counter highlighting (Phase 6.6): pulses the build-menu tile(s) that counter the worst
+    // enemy currently on screen (highest remaining HP — bosses dominate naturally). Throttled
+    // to 2Hz — this is advisory chrome riding the same per-frame onHud path, not precision
+    // targeting, so it doesn't need to recompute every frame.
+    {
+      const menu = document.getElementById('build-menu');
+      if (menu && g.now - this.lastCounterCheck > 0.5) {
+        this.lastCounterCheck = g.now;
+        let worst: Enemy | null = null;
+        for (const e of g.enemies) {
+          if (e.dead) continue;
+          if (!worst || e.hp > worst.hp) worst = e;
+        }
+        const counters = worst?.spec.counters || [];
+        const items = menu.querySelectorAll('.bm-item');
+        TOWERS.forEach((spec, i) => {
+          const item = items[i] as HTMLElement;
+          if (!item) return;
+          const hit = counters.includes(spec.id);
+          item.classList.toggle('counters', hit);
+          let label = item.querySelector('.bm-counter-label') as HTMLElement | null;
+          if (hit) {
+            if (!label) {
+              label = document.createElement('span');
+              label.className = 'bm-counter-label';
+              item.append(label);
+            }
+            label.textContent = `counters ${worst!.spec.name}`;
+          } else if (label) {
+            label.remove();
+          }
+        });
+      }
+    }
     // combo counter: appears at ×3, pulses on increment
     {
       const c = this.hudRefs.combo as HTMLElement;
@@ -1818,9 +1909,59 @@ export class UI {
       }
     }
     if (g.lives !== L.lives) {
-      this.hudRefs.lives.textContent = `${g.lives}`;
-      if (L.lives >= 0) { this.hudRefs.livesWrap.classList.remove('bump'); void (this.hudRefs.livesWrap as HTMLElement).offsetWidth; this.hudRefs.livesWrap.classList.add('bump'); }
+      // Hull pip bar (Phase 6.2): a lost pip flashes white then "cracks" to a dark empty slot,
+      // sequential at ~40ms/pip so a multi-hull leak (a boss can take 10-20 at once) reads as
+      // a machine-gun of losses rather than one silent number drop. reduceFlash skips the white
+      // flash but keeps the settle-to-empty. A restored pip (a Hull Patch drop) just re-fills.
+      const prev = L.lives >= 0 ? L.lives : g.lives;
+      const pipsEl = this.hudRefs.hullPips as HTMLElement | undefined;
+      if (pipsEl) {
+        const pipEls = pipsEl.children;
+        if (g.lives < prev) {
+          for (let i = g.lives; i < prev && i < pipEls.length; i++) {
+            const pip = pipEls[i] as HTMLElement;
+            setTimeout(() => {
+              pip.classList.remove('filled');
+              if (!g.reduceFlash) { pip.classList.add('crack'); setTimeout(() => pip.classList.remove('crack'), 220); }
+            }, (i - g.lives) * 40);
+          }
+        } else {
+          for (let i = prev; i < g.lives && i < pipEls.length; i++) (pipEls[i] as HTMLElement).classList.add('filled');
+        }
+        const frac = g.maxLives > 0 ? g.lives / g.maxLives : 1;
+        pipsEl.classList.toggle('frac-mid', frac < 0.6 && frac >= 0.3);
+        pipsEl.classList.toggle('frac-low', frac < 0.3);
+      }
+      const hullLabel = this.hudRefs.hullLabel as HTMLElement | undefined;
+      if (hullLabel) hullLabel.textContent = `${g.lives}/${g.maxLives}`;
       L.lives = g.lives;
+    }
+    // Leak ledger (Phase 6.3): worst offender first, capped at 4 glyphs + "+n" overflow —
+    // the in-run version of the defeat post-mortem, available while it's still actionable.
+    {
+      const entries = Object.entries(g.leakLedger).sort((a, b) => b[1] - a[1]);
+      const key = entries.map(([id, n]) => `${id}:${n}`).join(',');
+      if (key !== L.leakLedgerKey) {
+        L.leakLedgerKey = key;
+        const ledger = this.hudRefs.leakLedger as HTMLElement | undefined;
+        if (ledger) {
+          ledger.innerHTML = '';
+          const shown = entries.slice(0, 4);
+          for (const [id, n] of shown) {
+            const spec = ENEMIES[id];
+            if (!spec) continue;
+            const item = el('span', 'ledger-item');
+            const mini = document.createElement('canvas');
+            mini.width = 64; mini.height = 64;
+            this.drawMiniEnemy(mini, spec);
+            item.append(mini, el('span', 'ledger-count', `×${n}`));
+            const counters = spec.counters?.map(c2 => TOWERS.find(t => t.id === c2)?.name).filter(Boolean).join(', ');
+            item.title = `${spec.name} — took ${n} hull.${counters ? ` Counters: ${counters}` : ''}`;
+            ledger.append(item);
+          }
+          if (entries.length > 4) ledger.append(el('span', 'ledger-overflow', `+${entries.length - 4}`));
+        }
+      }
     }
     const wv = Math.max(0, g.waveIdx + 1);
     if (wv !== L.wave) {
@@ -1862,7 +2003,6 @@ export class UI {
       const bar = this.hudRefs.bossBar as HTMLElement | undefined;
       if (bar) {
         bar.classList.toggle('on', !!boss);
-        (this.hudRefs.combo as HTMLElement)?.classList.toggle('with-boss', !!boss);
         if (boss) {
           const name = this.hudRefs.bossName as HTMLElement;
           const label = `${boss.spec.name}${boss.bossPhase === 2 ? ' — PHASE 2' : ''}`;
@@ -1907,7 +2047,7 @@ export class UI {
     const shape2 = g.level.waveShapes?.[g.waveIdx + 2] || null;
     const jammed = g.diffTier === 4; // Brutal blackout (5.5.3): the second slot is never shown
     const key = [...counts.entries()].map(([k, v]) => `${k}:${v}`).join(',')
-      + `|${g.pendingMutator || ''}|${shape1 || ''}|${jammed ? 'jammed' : counts2 ? [...counts2.keys()].join(',') : ''}|${g.pending2Mutator || ''}|${shape2 || ''}`;
+      + `|${g.pendingMutator || ''}|${shape1 || ''}|${jammed ? 'jammed' : counts2 ? [...counts2.keys()].join(',') : ''}|${g.pending2Mutator || ''}|${shape2 || ''}|${g.threatVerdict?.verdict || ''}`;
     if (key === this.lastPreviewKey) return;
     this.lastPreviewKey = key;
     wrap.innerHTML = '';
@@ -1936,6 +2076,20 @@ export class UI {
       parent.append(b);
     };
     wrap.append(el('span', 'wp-label', 'Next:'));
+    // Threat readout (Phase 6.4) — the highest-value item this phase adds: a rough,
+    // explicitly-hedged forecast of your coverage vs. what's inbound, not a promise.
+    if (g.threatVerdict) {
+      const V = g.threatVerdict;
+      const cfg = { comfortable: { ico: '✅', label: 'Comfortable', cls: 'threat-ok' },
+        tight: { ico: '⚠', label: 'Tight', cls: 'threat-tight' },
+        leak: { ico: '☠', label: 'Likely leak', cls: 'threat-leak' } }[V.verdict];
+      const chip = el('span', `wp-threat ${cfg.cls}`, `${cfg.ico} ${cfg.label}`);
+      const parts: string[] = [];
+      if (V.ground !== null) parts.push(`ground ${V.ground.toFixed(1)}×`);
+      if (V.air !== null) parts.push(`air ${V.air.toFixed(1)}×`);
+      chip.title = `A rough forecast from your coverage vs. what's inbound — not a promise.${parts.length ? ` (${parts.join(', ')} coverage-to-threat)` : ''}`;
+      wrap.append(chip);
+    }
     mkTwistChip(shape1, g.pendingMutator, wrap);
     if (hasFlier(wave)) flierBadge(wrap);
     for (const [id, n] of counts) {
@@ -2131,6 +2285,25 @@ export class UI {
     return undo ? `Undo — full refund ◆ ${t.spent}` : `Sell (72%) ◆ ${Math.round(t.spent * TUNING.economy.sellRefund)}`;
   }
 
+  // Resolves the ONE most useful next upgrade for the panel's headline button — a plain
+  // stage upgrade, a branch tier-2 upgrade once specialized, 'choose' when a branch pick
+  // is needed (too many options for one button — routes to Details instead), or null when
+  // there's nothing left to buy.
+  private nextUpgradeInfo(g: Game, t: Tower): { label: string; cost: number; afford: boolean; onclick: () => void } | 'choose' | null {
+    if (t.branch < 0 && t.stage < 2) {
+      const st = t.spec.stages[t.stage + 1];
+      const cost = g.upgradeCost(st);
+      return { label: st.name, cost, afford: g.credits >= cost, onclick: () => { g.buyUpgrade(t); this.renderSidePanel(); } };
+    }
+    if (t.branch < 0 && t.stage === 2) return 'choose';
+    if (t.branch >= 0 && t.branchStage < 1) {
+      const st = t.spec.branches[t.branch][1];
+      const cost = g.upgradeCost(st);
+      return { label: st.name, cost, afford: g.credits >= cost, onclick: () => { g.buyUpgrade(t); this.renderSidePanel(); } };
+    }
+    return null;
+  }
+
   renderSidePanel() {
     this.closeSidePanel();
     const g = this.game;
@@ -2142,6 +2315,8 @@ export class UI {
     panel.id = 'side-panel';
     const s = t.stats(g);
     const base = t.baseStats(g);
+
+    // ---------- Tier 1: always visible, zero-scroll target ----------
     panel.append(el('h3', '', `<span style="color:${g.palTower(t.spec.id)[0]}">●</span> ${t.displayName}`));
     panel.append(el('div', 'sp-desc', s.desc));
     if (!!t.raw.groundOnly && t.pathCellsInRange === 0) {
@@ -2156,87 +2331,37 @@ export class UI {
         : '';
       panel.append(el('div', 'sp-cell-chip', `On ${info.name} ${info.icon}${detail ? ` (${detail})` : ''}`));
     }
-    if (t.kills > 0 || t.dmgDealt > 0) {
-      const eff = t.spent > 0 ? t.creditsEarned / t.spent : 0;
-      panel.append(el('div', 'sp-perf', `${fmt(Math.round(t.dmgDealt))} dmg · ${t.kills} kill${t.kills === 1 ? '' : 's'} · ${eff.toFixed(1)}× value`));
-    }
 
-    // primary stats — Damage/Rate/Range/Splash/Targets, packed two-per-row to save vertical space
-    const primary = el('div', 'sp-stats2');
-    const items: string[] = [];
-    const pitem = (label: string, baseV: string, ampV: string | null) => {
-      items.push(`<div class="ss-item"><span>${label}</span><b>${ampV !== null
-        ? `<span class="stat-amped">${ampV}</span> <span class="stat-base">(${baseV})</span>`
-        : baseV}</b></div>`);
-    };
-    if (s.dmg || t.spec.kind === 'prism') pitem('Damage', `${Math.round(base.dmg)}`, t.bDmg > 0 ? `${Math.round(s.dmg)}` : null);
-    if (s.rate) pitem('Rate', `${base.rate.toFixed(1)}/s`, t.bRate > 0 ? `${s.rate.toFixed(1)}/s` : null);
-    pitem('Range', `${Math.round(base.range)} tiles`, t.bRange > 0 ? `${Math.round(s.range)} tiles` : null);
-    if (s.splash) pitem('Splash', `${Math.round(s.splash)}`, null);
-    if (t.spec.kind !== 'amp') pitem('Targets', s.groundOnly ? '⛔ Ground only' : (s.airMul || 1) > 1 ? '✈ Air ×2' : '✈ Air + Ground', null);
-    for (let i = 0; i < items.length; i += 2) {
-      primary.innerHTML += `<div class="ss-row">${items[i]}${items[i + 1] || ''}</div>`;
-    }
-    panel.append(primary);
-
-    // remaining, less-common stats — one per row, unchanged layout
-    const grid = el('div', 'sp-stats');
-    const stat = (label: string, baseV: string, ampV: string | null) => {
-      grid.innerHTML += `<span>${label}</span><b>${ampV !== null
-        ? `<span class="stat-amped">${ampV}</span> <span class="stat-base">(${baseV})</span>`
-        : baseV}</b>`;
-    };
-    if (s.slow) stat('Slow', `${Math.round(s.slow * 100)}%`, null);
-    if (s.chains) stat('Chains', `${s.chains}`, null);
-    if (s.burnDps) stat('Burn', `${Math.round(base.burnDps || 0)}/s`, t.bDmg > 0 ? `${Math.round(s.burnDps)}/s` : null);
-    if (s.rayWidth) stat('Beam', 'line', null);
-    if ((base.crit || 0) > 0 || t.bCrit > 0) stat('Crit', `${Math.round((base.crit || 0) * 100)}%`, t.bCrit > 0 ? `${Math.round(s.crit * 100)}%` : null);
-    panel.append(grid);
-    if (t.buffed) {
-      const bits: string[] = [];
-      if (t.bDmg > 0) bits.push(`+${Math.round(t.bDmg * 100)}% dmg`);
-      if (t.bRate > 0) bits.push(`+${Math.round(t.bRate * 100)}% rate`);
-      const tileGain = Math.round(s.range) - Math.round(base.range);
-      if (tileGain > 0) bits.push(`+${tileGain} range`);
-      if (t.bCrit > 0) bits.push(`+${Math.round(t.bCrit * 100)}% crit`);
-      panel.append(el('div', 'amped-note', `⟡ Amplified: ${bits.join(' · ')}`));
-    }
-
-    if (t.spec.kind !== 'amp' && !t.raw.aura) {
-      const tips: Record<string, string> = {
-        first: 'Target the alien furthest along the path (default)',
-        last: 'Target the alien closest to the spawn portal',
-        strong: 'Target the alien with the most health + shield',
-        weak: 'Target the alien with the least health — good for finishing kills',
-        close: 'Target the alien nearest to this tower',
-      };
-      const row = el('div', 'target-row');
-      for (const m of ['first', 'last', 'strong', 'weak', 'close'] as const) {
-        const chip = el('button', `target-chip${t.mode === m ? ' on' : ''}`, m[0].toUpperCase() + m.slice(1));
-        chip.title = tips[m];
-        chip.onclick = () => { t.mode = m; t.target = null; audio.ui('click'); this.renderSidePanel(); };
-        row.append(chip);
+    // Headline DPS (Phase 6.5): the single number that answers "how hard does this hit?" —
+    // amp excluded, since its own DPS is always 0 (its value flows through buffed towers).
+    if (t.spec.kind !== 'amp') {
+      const dps = g.towerDPS(t);
+      const dpsRow = el('div', 'sp-dps');
+      const groundR = Math.round(dps.ground), airR = Math.round(dps.air);
+      let airChip = '';
+      if (airR !== groundR) {
+        airChip = airR === 0
+          ? `<span class="dps-air-chip no-air">⛔ no air</span>`
+          : `<span class="dps-air-chip">✈ ${fmt(airR)}</span>`;
       }
-      panel.append(row);
+      dpsRow.innerHTML = `<b>⚔ ${fmt(groundR)}</b><span class="sp-dps-unit">dps</span>${airChip}`;
+      panel.append(dpsRow);
     }
 
-    panel.append(this.buildTechTree(g, t));
-
-    // Overcharge (Phase 4.5): panel button as an alternative to the double-tap gesture.
-    // Amp never gets one — it has no rate/damage to double, the double-tap guard mirrors this.
-    if (isUnlocked('overcharge') && t.spec.kind !== 'amp') {
-      const active = g.now < t.overchargedUntil;
-      const ocRow = el('div', 'oc-row');
-      const oc = el('button', `oc-btn${active ? ' active' : ''}`,
-        active ? '⚡ Overcharged!' : `⚡ Overcharge (${g.overchargeLeft} left)`) as HTMLButtonElement;
-      oc.disabled = !g.canOvercharge(t);
-      oc.title = active ? 'Already overcharged.'
-        : !g.waveActive ? 'Only usable while a wave is active.'
-        : g.overchargeLeft <= 0 ? 'No charges left this wave.'
-        : 'Double this tower\'s fire rate (or damage) for 3 seconds.';
-      oc.onclick = () => { g.activateOvercharge(t); this.renderSidePanel(); };
-      ocRow.append(oc);
-      panel.append(ocRow);
+    // One resolved best-next-upgrade button — no menu, no scanning the tech tree first.
+    const next = t.spec.kind === 'amp' ? null : this.nextUpgradeInfo(g, t);
+    if (next === 'choose') {
+      const btn = el('button', 'next-upg-btn specialize') as HTMLButtonElement;
+      btn.innerHTML = `<span class="nu-name">Specialize ▾</span><span class="nu-sub">Choose a branch in Details</span>`;
+      btn.onclick = () => { this.detailsExpanded = true; this.renderSidePanel(); };
+      panel.append(btn);
+    } else if (next) {
+      const btn = el('button', `next-upg-btn${next.afford ? '' : ' poor'}`) as HTMLButtonElement;
+      btn.disabled = !next.afford;
+      btn.title = next.afford ? '' : 'Not enough credits yet.';
+      btn.innerHTML = `<span class="nu-name">↑ ${next.label}</span><span class="nu-cost">◆ ${next.cost}</span>`;
+      btn.onclick = next.onclick;
+      panel.append(btn);
     }
 
     // Veterancy (Phase 4.6): a one-time, irrevocable perk choice offered at the kill threshold.
@@ -2266,6 +2391,7 @@ export class UI {
       }
     }
 
+    // Action row: Move / Overcharge / Sell folded into one row (Phase 6.5).
     const actionRow = el('div', 'panel-actions');
     const move = el('button', 'move-btn', 'Move');
     move.onclick = () => {
@@ -2273,13 +2399,106 @@ export class UI {
       g.armMove(t);
       this.closeSidePanel();
     };
+    actionRow.append(move);
+    // Overcharge (Phase 4.5): panel button as an alternative to the double-tap gesture.
+    // Amp never gets one — it has no rate/damage to double, the double-tap guard mirrors this.
+    if (isUnlocked('overcharge') && t.spec.kind !== 'amp') {
+      const active = g.now < t.overchargedUntil;
+      const oc = el('button', `oc-btn${active ? ' active' : ''}`,
+        active ? '⚡ Charged!' : `⚡ Overcharge (${g.overchargeLeft})`) as HTMLButtonElement;
+      oc.disabled = !g.canOvercharge(t);
+      oc.title = active ? 'Already overcharged.'
+        : !g.waveActive ? 'Only usable while a wave is active.'
+        : g.overchargeLeft <= 0 ? 'No charges left this wave.'
+        : 'Double this tower\'s fire rate (or damage) for 3 seconds.';
+      oc.onclick = () => { g.activateOvercharge(t); this.renderSidePanel(); };
+      actionRow.append(oc);
+    }
     const sell = el('button', 'sell-btn', this.sellLabel(t));
     if (t.perk) sell.title = 'Selling forfeits this tower\'s veteran perk — it cannot be recovered.';
     sell.onclick = () => { g.sell(t); this.closeSidePanel(); };
-    actionRow.append(move, sell);
+    actionRow.append(sell);
     panel.append(actionRow);
     this.hudRefs.sellBtn = sell;
     this.sellPanelTower = t;
+
+    // ---------- Tier 2: "Details ▾" — full stats, targeting, tech tree, lifetime stats ----------
+    const detailsToggle = el('button', 'details-toggle', this.detailsExpanded ? 'Details ▴' : 'Details ▾') as HTMLButtonElement;
+    detailsToggle.onclick = () => { this.detailsExpanded = !this.detailsExpanded; this.renderSidePanel(); };
+    panel.append(detailsToggle);
+
+    if (this.detailsExpanded) {
+      const details = el('div', 'details-panel');
+
+      if (t.kills > 0 || t.dmgDealt > 0) {
+        const eff = t.spent > 0 ? t.creditsEarned / t.spent : 0;
+        details.append(el('div', 'sp-perf', `${fmt(Math.round(t.dmgDealt))} dmg · ${t.kills} kill${t.kills === 1 ? '' : 's'} · ${eff.toFixed(1)}× value`));
+      }
+
+      // primary stats — Damage/Rate/Range/Splash/Targets, packed two-per-row to save vertical space
+      const primary = el('div', 'sp-stats2');
+      const items: string[] = [];
+      const pitem = (label: string, baseV: string, ampV: string | null) => {
+        items.push(`<div class="ss-item"><span>${label}</span><b>${ampV !== null
+          ? `<span class="stat-amped">${ampV}</span> <span class="stat-base">(${baseV})</span>`
+          : baseV}</b></div>`);
+      };
+      if (s.dmg || t.spec.kind === 'prism') pitem('Damage', `${Math.round(base.dmg)}`, t.bDmg > 0 ? `${Math.round(s.dmg)}` : null);
+      if (s.rate) pitem('Rate', `${base.rate.toFixed(1)}/s`, t.bRate > 0 ? `${s.rate.toFixed(1)}/s` : null);
+      pitem('Range', `${Math.round(base.range)} tiles`, t.bRange > 0 ? `${Math.round(s.range)} tiles` : null);
+      if (s.splash) pitem('Splash', `${Math.round(s.splash)}`, null);
+      if (t.spec.kind !== 'amp') pitem('Targets', s.groundOnly ? '⛔ Ground only' : (s.airMul || 1) > 1 ? '✈ Air ×2' : '✈ Air + Ground', null);
+      for (let i = 0; i < items.length; i += 2) {
+        primary.innerHTML += `<div class="ss-row">${items[i]}${items[i + 1] || ''}</div>`;
+      }
+      details.append(primary);
+
+      // remaining, less-common stats — one per row, unchanged layout
+      const grid = el('div', 'sp-stats');
+      const stat = (label: string, baseV: string, ampV: string | null) => {
+        grid.innerHTML += `<span>${label}</span><b>${ampV !== null
+          ? `<span class="stat-amped">${ampV}</span> <span class="stat-base">(${baseV})</span>`
+          : baseV}</b>`;
+      };
+      if (s.slow) stat('Slow', `${Math.round(s.slow * 100)}%`, null);
+      if (s.chains) stat('Chains', `${s.chains}`, null);
+      if (s.burnDps) stat('Burn', `${Math.round(base.burnDps || 0)}/s`, t.bDmg > 0 ? `${Math.round(s.burnDps)}/s` : null);
+      if (s.rayWidth) stat('Beam', 'line', null);
+      if ((base.crit || 0) > 0 || t.bCrit > 0) stat('Crit', `${Math.round((base.crit || 0) * 100)}%`, t.bCrit > 0 ? `${Math.round(s.crit * 100)}%` : null);
+      details.append(grid);
+      if (t.buffed) {
+        const bits: string[] = [];
+        if (t.bDmg > 0) bits.push(`+${Math.round(t.bDmg * 100)}% dmg`);
+        if (t.bRate > 0) bits.push(`+${Math.round(t.bRate * 100)}% rate`);
+        const tileGain = Math.round(s.range) - Math.round(base.range);
+        if (tileGain > 0) bits.push(`+${tileGain} range`);
+        if (t.bCrit > 0) bits.push(`+${Math.round(t.bCrit * 100)}% crit`);
+        details.append(el('div', 'amped-note', `⟡ Amplified: ${bits.join(' · ')}`));
+      }
+
+      if (t.spec.kind !== 'amp' && !t.raw.aura) {
+        const tips: Record<string, string> = {
+          first: 'Target the alien furthest along the path (default)',
+          last: 'Target the alien closest to the spawn portal',
+          strong: 'Target the alien with the most health + shield',
+          weak: 'Target the alien with the least health — good for finishing kills',
+          close: 'Target the alien nearest to this tower',
+        };
+        const row = el('div', 'target-row');
+        for (const m of ['first', 'last', 'strong', 'weak', 'close'] as const) {
+          const chip = el('button', `target-chip${t.mode === m ? ' on' : ''}`, m[0].toUpperCase() + m.slice(1));
+          chip.title = tips[m];
+          chip.onclick = () => { t.mode = m; t.target = null; audio.ui('click'); this.renderSidePanel(); };
+          row.append(chip);
+        }
+        details.append(row);
+      }
+
+      details.append(this.buildTechTree(g, t));
+      panel.append(details);
+    } else {
+      this.treeRefs = [];
+    }
 
     // position adjacent to the tower, clamped
     this.root.append(panel);
