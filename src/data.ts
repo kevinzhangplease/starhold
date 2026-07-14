@@ -11,7 +11,7 @@
 export const UNLOCKS: Record<string, number> = {
   combo: 2, challenges: 2, interest: 3, cells: 3, drops: 4, mod_asteroids: 4, overcharge: 4,
   elites: 5, boss_theater: 5, mutators: 6, mod_veins: 6, draft: 6, nova: 7,
-  mod_meteors: 8, veterancy: 8, mutators_hard: 9, boss_phase2: 10, mod_combo: 10, doctrines: 10, mod_ionstorms: 12,
+  mod_meteors: 8, veterancy: 1, mutators_hard: 9, boss_phase2: 10, mod_combo: 10, doctrines: 10, mod_ionstorms: 12,
 };
 
 let _unlockedLevel = 1;
