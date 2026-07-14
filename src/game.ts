@@ -538,17 +538,28 @@ export class Tower {
     const V = TUNING.veterancy.perks;
     const perkDmgMul = this.perk === 'sharp' ? 1 + V.sharp : 1;
     const perkRateMul = this.perk === 'rapid' ? 1 + V.rapid : 1;
-    const dmgMul = (1 + this.bDmg) * game.metaDmgMul * this.cellDmgMul * perkDmgMul * (overcharged && r.rate === 0 ? OC.rateMul : 1);
+    // Artillery doctrine (Phase 8.3): splash-carrying towers (mortar/missile — cluster
+    // bomblets inherit their parent shell's splash at the projectile level, so no separate
+    // handling is needed) hit harder and wider.
+    const artillery = game.doctrine === 'artillery' && (this.spec.kind === 'mortar' || this.spec.kind === 'missile');
+    const A = TUNING.doctrines.artillery;
+    const dmgMul = (1 + this.bDmg) * game.metaDmgMul * this.cellDmgMul * perkDmgMul
+      * (overcharged && r.rate === 0 ? OC.rateMul : 1) * (artillery ? A.splashDmgMul : 1);
     const rateMul = (1 + this.bRate) * (game.now < game.overclockUntil ? 1 + TUNING.drops.overclockRate : 1)
       * (game.stormRow0 >= 0 && game.now > game.stormWarnUntil && this.row >= game.stormRow0 && this.row < game.stormRow0 + TUNING.ionStorms.bandRows ? 1 - TUNING.ionStorms.ratePenalty : 1)
       * this.cellRateMul * perkRateMul * (overcharged && r.rate > 0 ? OC.rateMul : 1);
+    // Precision doctrine (Phase 8.3): +10% crit chance on every tower EXCEPT Prism and Amp —
+    // Prism's ramp-up is its own damage identity and Amp deals no damage of its own to crit.
+    const precisionCrit = game.doctrine === 'precision' && this.spec.kind !== 'prism' && this.spec.kind !== 'amp'
+      ? TUNING.doctrines.precision.critAdd : 0;
     return {
       ...r,
       dmg: r.dmg * dmgMul,
       burnDps: r.burnDps ? r.burnDps * dmgMul : r.burnDps,
       rate: r.rate * rateMul,
       range: this.rangeT(),
-      crit: (r.crit || 0) + this.bCrit,
+      splash: r.splash && artillery ? r.splash * A.splashRadiusMul : r.splash,
+      crit: (r.crit || 0) + this.bCrit + precisionCrit,
     };
   }
   // Set/clear the cached numeric cell modifiers from CELL_TYPES + TUNING.cells whenever
@@ -767,6 +778,11 @@ export class Game {
   metaDmgMul = 1; metaCostMul = 1; hasOrbital = false; hasStasis = false;
   dev = false; devGod = false; devFree = false;
   shakeOn = true;
+  // --- Replayability (Phase 8) --- draft/doctrine are chosen on the pre-level Briefing
+  // screen, before this Game exists, then threaded straight through. `dev` bypasses the
+  // draft restriction (openBuildMenu in ui.ts checks `!game.dev`).
+  draft: string[] | null = null;   // SERIALIZE: draft — null means full-arsenal
+  doctrine: string | null = null;  // SERIALIZE: doctrine — active doctrine id, or null
 
   killCount = 0;
   livesLostTotal = 0;
@@ -791,9 +807,9 @@ export class Game {
   destroyed = false;
 
   constructor(cv: HTMLCanvasElement, level: LevelSpec, endless: boolean,
-              meta: { creditMul: number; hp: number; costMul: number; dmgMul: number; orbital: boolean; stasis: boolean },
+              meta: { creditMul: number; hp: number; costMul: number; dmgMul: number; orbital: boolean; stasis: boolean; doctrine?: string | null },
               cellSize = 48,
-              opts: { hpMul?: number; rewardMul?: number; waveFactor?: number; meander?: number; diffTier?: number; ascTier?: number; mirror?: boolean; forceMods?: string[]; mutatorBonus?: number; perfMode?: boolean } = {}) {
+              opts: { hpMul?: number; rewardMul?: number; waveFactor?: number; meander?: number; diffTier?: number; ascTier?: number; mirror?: boolean; forceMods?: string[]; mutatorBonus?: number; perfMode?: boolean; draft?: string[] | null } = {}) {
     this.cv = cv;
     this.g = cv.getContext('2d')!;
     this.level = level;
@@ -801,7 +817,12 @@ export class Game {
     this.cell = cellSize;
     this.k = cellSize / 48;
     this.zone = ZONES[level.zone];
-    this.credits = Math.round(level.startCredits * meta.creditMul * ((opts.ascTier ?? 0) >= 4 ? TUNING.ascension.startCreditMul : 1));
+    this.doctrine = meta.doctrine ?? null;
+    this.draft = opts.draft ?? null;
+    // Logistics doctrine (Phase 8.3): +10% starting credits, folded into the same chain as
+    // the Reactor meta nodes and the Ascension IV scarcity cut.
+    const logisticsCreditMul = this.doctrine === 'logistics' ? TUNING.doctrines.logistics.startCreditMul : 1;
+    this.credits = Math.round(level.startCredits * meta.creditMul * logisticsCreditMul * ((opts.ascTier ?? 0) >= 4 ? TUNING.ascension.startCreditMul : 1));
     this.maxLives = this.lives = level.baseHp + meta.hp;
     this.metaCostMul = meta.costMul;
     this.metaDmgMul = meta.dmgMul;
@@ -2004,11 +2025,14 @@ export class Game {
     // ---------- supply drops ----------
     if (this.state === 'playing' && dt > 0 && isUnlocked('drops')) {
       const D = TUNING.drops;
-      if (this.nextDropAt === 0) this.nextDropAt = now + rand(D.intervalMin, D.intervalMax);
+      // Logistics doctrine (Phase 8.3): drops arrive 20% more often (shorter interval roll).
+      const dropIntervalMul = this.doctrine === 'logistics' ? TUNING.doctrines.logistics.dropIntervalMul : 1;
+      const rollDropInterval = () => rand(D.intervalMin, D.intervalMax) * dropIntervalMul;
+      if (this.nextDropAt === 0) this.nextDropAt = now + rollDropInterval();
       if (this.waveActive && now >= this.nextDropAt) {
         const spawn = this.forceNextDrop || Math.random() < D.chance;
         this.forceNextDrop = false;
-        this.nextDropAt = now + rand(D.intervalMin, D.intervalMax);
+        this.nextDropAt = now + rollDropInterval();
         if (spawn) this.spawnDrop();
       }
       for (let i = this.drops.length - 1; i >= 0; i--) {

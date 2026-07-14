@@ -10,8 +10,8 @@
 // Must stay in sync with SEEN_UNLOCK_LEVELS in save.ts (validate.ts asserts this).
 export const UNLOCKS: Record<string, number> = {
   combo: 2, challenges: 2, interest: 3, cells: 3, drops: 4, mod_asteroids: 4, overcharge: 4,
-  elites: 5, boss_theater: 5, mutators: 6, mod_veins: 6, nova: 7,
-  mod_meteors: 8, veterancy: 8, mutators_hard: 9, boss_phase2: 10, mod_combo: 10, mod_ionstorms: 12,
+  elites: 5, boss_theater: 5, mutators: 6, mod_veins: 6, draft: 6, nova: 7,
+  mod_meteors: 8, veterancy: 8, mutators_hard: 9, boss_phase2: 10, mod_combo: 10, doctrines: 10, mod_ionstorms: 12,
 };
 
 let _unlockedLevel = 1;
@@ -187,6 +187,17 @@ export const TUNING = {
     tight: 1.0,                // ratio at or above this (below comfortable) -> "Tight"
     coveragePathCells: 5,      // pathCellsInRange needed for a tower to read as full ground coverage
     coverageLanePts: 4,        // flier-lane sample points in range needed for full air coverage
+  },
+  // ---- Starhold 3.0 Phase 8: replayability — draft & doctrines ----
+  draft: {
+    // interpreted as "levels <= threshold -> size": [4,5] means levels 1-4 draft 5 towers.
+    sizeByLevel: [[4, 5], [8, 6], [12, 7], [15, 8]] as [number, number][],
+    endless: 8,
+  },
+  doctrines: {
+    artillery: { splashRadiusMul: 1.25, splashDmgMul: 1.15 },
+    precision: { critAdd: 0.10 },
+    logistics: { startCreditMul: 1.10, dropIntervalMul: 0.8 },
   },
 } as const;
 
@@ -616,6 +627,23 @@ export const META: MetaNode[] = [
   { id: 'orbital', name: 'Orbital Strike', desc: 'Unlock ability: aimed strike, heavy area damage that scales with the invasion. 30s cooldown.', cost: 2 },
   { id: 'stasis', name: 'Stasis Field', desc: 'Unlock ability: aimed field that slows everything 70% for 4s. 25s cooldown.', cost: 2 },
 ];
+
+// ---------- Doctrines (Starhold 3.0 Phase 8) ----------
+// A mutually-exclusive layer on top of the 8 META nodes: exactly one doctrine can be
+// active at a time (or none), and switching the active one — once owned — is free and can
+// happen on the pre-level Briefing screen. Buying is permanent, same currency as META (stars).
+export interface DoctrineSpec { id: string; name: string; icon: string; cost: number; desc: string; }
+export const DOCTRINES: DoctrineSpec[] = [
+  { id: 'artillery', name: 'Artillery Doctrine', icon: '💥', cost: 3, desc: 'Splash radius +25%, splash damage +15%.' },
+  { id: 'precision', name: 'Precision Doctrine', icon: '🎯', cost: 3, desc: 'All towers gain +10% critical chance (2.5× damage). Prism and Amp are excluded.' },
+  { id: 'logistics', name: 'Logistics Doctrine', icon: '📦', cost: 3, desc: 'Start with +10% credits; supply drops arrive 20% more often.' },
+];
+
+// Draft size for a given level id, per TUNING.draft.sizeByLevel's ascending threshold table.
+export function draftSizeForLevel(levelId: number): number {
+  for (const [maxLevel, size] of TUNING.draft.sizeByLevel) if (levelId <= maxLevel) return size;
+  return TUNING.draft.sizeByLevel[TUNING.draft.sizeByLevel.length - 1][1];
+}
 
 export const ABILITIES = {
   orbital: { id: 'orbital', name: 'Orbital', ico: '☄', cd: 30, radius: 95, dmg: 320 },

@@ -1,11 +1,12 @@
 // ================= UI layer =================
-import { TOWERS, META, ABILITIES, ZONES, ENEMIES, PALETTE, TowerSpec, EnemySpec, airClass, roleChips, setUnlockedLevel, fmt, isUnlocked, MUTATORS, MODIFIER_INFO, CHALLENGE_POOL, CELL_TYPES, TUNING, WaveShape, WAVE_SHAPES } from './data';
+import { TOWERS, META, ABILITIES, ZONES, ENEMIES, PALETTE, TowerSpec, EnemySpec, airClass, roleChips, setUnlockedLevel, fmt, isUnlocked, MUTATORS, MODIFIER_INFO, CHALLENGE_POOL, CELL_TYPES, TUNING, WaveShape, WAVE_SHAPES, DOCTRINES, draftSizeForLevel } from './data';
 import { LEVELS, ENDLESS_LEVEL, LevelSpec } from './levels';
 import { Game, Tower, Enemy, W, H } from './game';
 import { audio } from './audio';
 import { SaveData, loadSave, writeSave, starsEarned, starsSpent } from './save';
 import { computeDailyOp, todayStr, daysBetween, DailyOp } from './daily';
 import { serializeResume, deserializeResume, ResumeSnapshot } from './resume';
+import { mulberry32, hashString } from './rng';
 
 const el = (tag: string, cls = '', html = ''): HTMLElement => {
   const e = document.createElement(tag);
@@ -114,6 +115,69 @@ class Notifier {
       if (this.lowEl === card) { card.remove(); this.lowEl = null; this.pumpLow(); }
     }, 8000);
   }
+}
+
+// ================= Draft (Phase 8.2) =================
+// Pure helpers — no DOM, no Game instance — so the Briefing screen can compute a draft
+// before a level (and its Game) exists, and so tests can replicate them exactly.
+
+// Every enemy id that appears anywhere in a level's waves (incl. its own newEnemy and any
+// boss), used by the "must-include" rules below.
+function levelEnemyIds(level: LevelSpec): Set<string> {
+  const ids = new Set<string>();
+  for (const wave of level.waves) for (const grp of wave) ids.add(grp.e);
+  return ids;
+}
+
+// The Suggested draft (also the initial preselection): must-includes first, then filled by
+// the player's lifetime comfort picks. Deterministic — no rng.
+export function suggestedDraft(level: LevelSpec, size: number, towersBuilt: Record<string, number>): string[] {
+  const picks: string[] = [];
+  const add = (id: string) => { if (!picks.includes(id) && picks.length < size) picks.push(id); };
+  const enemyIds = levelEnemyIds(level);
+  const anyFlying = [...enemyIds].some(id => ENEMIES[id]?.flying);
+  const swarmCount = level.waves.flat().filter(g => g.e === 'swarmling' || g.e === 'splitter').reduce((a, g) => a + g.n, 0);
+
+  if (anyFlying) {
+    const air = TOWERS.find(t => airClass(t) === 'air-bonus') || TOWERS.find(t => airClass(t) !== 'no-air');
+    if (air) add(air.id);
+  }
+  if (swarmCount >= 15) {
+    const splash = TOWERS.find(t => { const rc = roleChips(t); return rc.role === 'splash' || rc.role === 'chain'; });
+    if (splash) add(splash.id);
+  }
+  if (level.newEnemy) {
+    for (const cid of ENEMIES[level.newEnemy.id]?.counters || []) add(cid);
+  }
+  if (picks.length < size) {
+    const byComfort = [...TOWERS].sort((a, b) => (towersBuilt[b.id] || 0) - (towersBuilt[a.id] || 0));
+    for (const t of byComfort) { if (picks.length >= size) break; add(t.id); }
+  }
+  return picks.slice(0, size);
+}
+
+// Daily Op (Phase 8.2.7): the draft is seeded and FORCED — same date, same arsenal for
+// everyone. A seeded shuffle of all tower ids, then a deterministic re-roll swap if the
+// straight cut happened to miss an air-capable or a splash/chain pick.
+export function dailyDraft(dateStr: string, size: number): string[] {
+  const rng = mulberry32(hashString(`${dateStr}-draft`));
+  const pool = TOWERS.map(t => t.id);
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  const picks = pool.slice(0, size);
+  const hasAir = picks.some(id => airClass(TOWERS.find(t => t.id === id)!) !== 'no-air');
+  if (!hasAir) {
+    const air = TOWERS.find(t => airClass(t) !== 'no-air' && !picks.includes(t.id));
+    if (air) picks[picks.length - 1] = air.id;
+  }
+  const hasSplash = picks.some(id => { const rc = roleChips(TOWERS.find(t => t.id === id)!); return rc.role === 'splash' || rc.role === 'chain'; });
+  if (!hasSplash) {
+    const splash = TOWERS.find(t => { const rc = roleChips(t); return (rc.role === 'splash' || rc.role === 'chain') && !picks.includes(t.id); });
+    if (splash) picks[picks.length - 2 >= 0 ? picks.length - 2 : 0] = splash.id;
+  }
+  return picks;
 }
 
 export class UI {
@@ -373,7 +437,12 @@ export class UI {
 
   clearUI() { this.root.innerHTML = ''; this.hudRefs = {}; this.abilityBtns = {}; this.notify.clearAll(); }
   persist() { if (!this.selfTestMode) writeSave(this.save); }
-  starsAvail() { return starsEarned(this.save) - starsSpent(this.save, Object.fromEntries(META.map(m => [m.id, m.cost]))); }
+  // Doctrines (Phase 8.3) spend from the same star pool as META — accounted for here so
+  // starsAvail() never lets a player go negative buying both.
+  starsAvail() {
+    const doctrineCost = this.save.doctrines.owned.reduce((a, id) => a + (DOCTRINES.find(d => d.id === id)?.cost || 0), 0);
+    return starsEarned(this.save) - starsSpent(this.save, Object.fromEntries(META.map(m => [m.id, m.cost]))) - doctrineCost;
+  }
 
   cancelAll() {
     if (!this.game) return;
@@ -539,6 +608,16 @@ export class UI {
         );
         if (chBadges) card.append(el('div', 'lv-challenges', chBadges));
         if (cellLine) card.append(el('div', 'lv-cells', cellLine));
+        // "Bring: ✈ + splash" (Phase 8.4) — a cheap bus-thinking hint, derived from the same
+        // must-include rules the Suggested draft uses, so it's never inconsistent with it.
+        if (isUnlocked('draft')) {
+          const enemyIds = new Set(lv.waves.flat().map(g => g.e));
+          const swarmCount = lv.waves.flat().filter(g => g.e === 'swarmling' || g.e === 'splitter').reduce((a, g) => a + g.n, 0);
+          const bringBits: string[] = [];
+          if ([...enemyIds].some(id => ENEMIES[id]?.flying)) bringBits.push('✈');
+          if (swarmCount >= 15) bringBits.push('💥');
+          if (bringBits.length) card.append(el('div', 'lv-bring', `Bring: ${bringBits.join(' + ')}`));
+        }
         if (lv.tagline) card.append(el('div', 'lv-tagline', lv.tagline));
         if (bothEarned) card.classList.add('all-challenges');
         const bestAsc = this.save.ascension.bestPerLevel[lv.id] || 0;
@@ -548,7 +627,7 @@ export class UI {
           card.append(crown);
         }
         (card.querySelector('.lv-num') as HTMLElement).style.color = ZONES[z].accent;
-        if (!locked) card.onclick = () => { audio.ui('click'); this.startLevel(lv, false); };
+        if (!locked) card.onclick = () => { audio.ui('click'); this.showBriefing(lv, false); };
         col.append(card);
       }
       row.append(col);
@@ -562,7 +641,7 @@ export class UI {
       el('div', 'lv-name', endlessOpen ? `Endless Drift — survive as long as you can. Best: wave ${this.save.endlessBest[this.save.settings.difficulty ?? 2] || 0}` : 'Endless Drift — clear level 5 to unlock'),
     );
     (eCard.querySelector('.lv-num') as HTMLElement).style.color = '#c5b3f6';
-    if (endlessOpen) eCard.onclick = () => { audio.ui('click'); this.startLevel(ENDLESS_LEVEL, true); };
+    if (endlessOpen) eCard.onclick = () => { audio.ui('click'); this.showBriefing(ENDLESS_LEVEL, true); };
 
     const beatenIds = Object.keys(this.save.stars).map(Number).filter(id => (this.save.stars[id] || 0) > 0);
     const today = todayStr();
@@ -621,7 +700,50 @@ export class UI {
       };
       grid.append(node);
     }
-    sc.append(head, grid, el('div', 'top-note', 'Earn stars by finishing levels with your hull intact.'));
+    sc.append(head, grid);
+
+    // ---- Doctrines (Phase 8.3): a mutually-exclusive layer on top of the 8 nodes above.
+    // Buying is permanent; switching the active one (once owned) is free, here or on the
+    // Briefing screen — that's what turns it into a per-level loadout instead of a checklist.
+    if (isUnlocked('doctrines')) {
+      this.toastOnce('doctrines', 'DOCTRINES — a new loadout layer beneath the upgrades: buy one to try it, then switch which is active anytime (here or before a level) for free.');
+      sc.append(el('div', 'set-section doctrine-section-h', 'DOCTRINES — choose one to fly under'));
+      const docGrid = el('div', 'meta-grid');
+      for (const d of DOCTRINES) {
+        const owned = this.save.doctrines.owned.includes(d.id);
+        const active = this.save.doctrines.active === d.id;
+        const afford = this.starsAvail() >= d.cost;
+        const cant = !owned && !afford;
+        const node = el('div', `meta-node doctrine-node${owned ? ' owned' : cant ? ' cant' : ''}${active ? ' active' : ''}`);
+        node.append(
+          el('div', 'm-name', `${d.icon} ${d.name}`),
+          el('div', 'm-desc', d.desc),
+          el('div', 'm-cost', owned ? (active ? '✓ Active' : 'Owned — tap to fly') : `★ ${d.cost}`),
+        );
+        if (!owned && !cant) node.onclick = () => {
+          this.save.doctrines.owned.push(d.id);
+          this.save.doctrines.active = d.id;
+          this.persist();
+          audio.ui('branch');
+          this.showMeta();
+        };
+        else if (owned && !active) node.onclick = () => {
+          this.save.doctrines.active = d.id;
+          this.persist();
+          audio.ui('click');
+          this.showMeta();
+        };
+        docGrid.append(node);
+      }
+      sc.append(docGrid);
+      if (this.save.doctrines.active) {
+        const clear = el('button', 'btn subtle', 'Fly no doctrine');
+        clear.onclick = () => { audio.ui('click'); this.save.doctrines.active = null; this.persist(); this.showMeta(); };
+        sc.append(clear);
+      }
+    }
+
+    sc.append(el('div', 'top-note', 'Earn stars by finishing levels with your hull intact.'));
     this.root.append(sc);
   }
 
@@ -1055,6 +1177,11 @@ export class UI {
     item('Service Record', "A lifetime stats screen — total kills, waves cleared, favorite tower, best combo, daily streak, and more — reachable from Sectors.");
     item('Resume', "The game saves your exact progress at every wave clear. Close the tab or lose your connection mid-level, and you'll be offered a Resume prompt next time you open the game.");
 
+    section('Replayability');
+    item('The Briefing screen', "Tapping a level (or Endless, or the Daily Op) opens a Briefing first: the level's identity — modifiers, special terrain, its full alien roster, and its two challenges — plus your loadout choices, all in one place before you commit. A returning player's flow is still just two taps: level, then Launch.");
+    item('Drafting', "From level 6 on, you don't bring every tower — you draft a subset (the draft grows as the campaign gets harder) on the Briefing screen. Suggested picks something sensible for the map; Last used repeats your previous pick; Clear starts over. Prefer your full toolkit every time? Flip on \"Use full arsenal\" — it's a playstyle choice, not a difficulty setting, so nothing about your stars or credits changes either way. The Daily Op always uses its own locked, shared draft.");
+    item('Doctrines', "From level 10 on, a second permanent-upgrade layer sits below the 8 Station upgrades: Artillery, Precision, and Logistics doctrines, bought with stars like any other node. Only one can be active at a time, but switching which one — once you own it — is free, any time, including right on the Briefing screen before a level. Think of it as choosing today's overall approach, not another checklist item to complete.");
+
     section('Settings worth knowing about');
     item('Difficulty & game length', "Both restart the current level if changed mid-play (you'll be asked to confirm) — they scale enemy toughness/rewards and how many waves a level has.");
     item('Meander', "Controls how winding the alien path is — Low is closer to a straight line, High adds more turns and switchbacks, guaranteed to never cross itself.");
@@ -1159,9 +1286,230 @@ export class UI {
   }
 
   // =========================================================
+  // BRIEFING SCREEN (Phase 8.1) — sits between a level-select tap and game start. Gives
+  // Phases 2-5's per-level identity (cells, modifiers, roster, structure) a place to be
+  // read before committing, and hosts the draft picker + doctrine selector.
+  // =========================================================
+  private briefingSelection: string[] | null = null;   // ephemeral in-progress draft pick, reset per level opened
+  private briefingLevelKey: string | null = null;
+
+  showBriefing(level: LevelSpec, endless: boolean, daily: DailyOp | null = null) {
+    this.killGame();
+    this.clearUI();
+    const key = `${level.id}-${endless ? 'e' : ''}${daily ? 'd' : ''}`;
+    if (this.briefingLevelKey !== key) { this.briefingSelection = null; this.briefingLevelKey = key; }
+
+    const draftUnlocked = isUnlocked('draft');
+    const size = endless ? TUNING.draft.endless : draftSizeForLevel(level.id);
+    const forcedDaily = daily ? dailyDraft(daily.dateStr, size) : null;
+    if (draftUnlocked && !this.briefingSelection) {
+      this.briefingSelection = forcedDaily
+        ? forcedDaily
+        : (this.save.lastDraft.length ? this.save.lastDraft.filter(id => TOWERS.some(t => t.id === id)).slice(0, size) : suggestedDraft(level, size, this.save.stats.towersBuilt));
+      if (this.briefingSelection.length < size) {
+        // pad a short/stale lastDraft back up to size with Suggested picks, no duplicates
+        for (const id of suggestedDraft(level, size, this.save.stats.towersBuilt)) {
+          if (this.briefingSelection.length >= size) break;
+          if (!this.briefingSelection.includes(id)) this.briefingSelection.push(id);
+        }
+      }
+    }
+
+    const sc = el('div', 'screen briefing-screen');
+    const head = el('div', 'screen-head');
+    const back = el('button', 'btn subtle', '← Sectors');
+    back.onclick = () => { audio.ui('click'); this.showLevelSelect(); };
+    const title = endless ? 'Endless Drift' : daily ? `Daily Op — ${level.name}` : `${level.id}. ${level.name}`;
+    head.append(back, el('h2', '', title));
+    sc.append(head);
+    sc.append(el('div', 'briefing-tagline', daily ? '☀ Mirrored layout, Hard difficulty' : ZONES[level.zone].tagline));
+
+    const body = el('div', 'briefing-body');
+
+    // ---- identity row: modifiers, cell inventory, structural note ----
+    const identity = el('div', 'briefing-identity');
+    if (endless) {
+      identity.append(el('div', 'briefing-note', 'Modifiers roll fresh, seeded per run, when you launch.'));
+    } else {
+      const mods = daily ? daily.modifiers : (level.modifiers || []);
+      if (mods.length) {
+        const modRow = el('div', 'briefing-mods');
+        for (const m of mods) {
+          const info = MODIFIER_INFO[m];
+          if (!info) continue;
+          modRow.append(el('div', 'briefing-chip', `${info.icon} ${info.name} — ${info.blurb}`));
+        }
+        identity.append(modRow);
+      }
+      if (isUnlocked('cells') && level.cellPlan) {
+        const cellRow = el('div', 'briefing-mods');
+        for (const [id, n] of [['ridge', level.cellPlan.ridge], ['sinkhole', level.cellPlan.sinkhole], ['conduit', level.cellPlan.conduitPairs], ['anchor', level.cellPlan.anchor], ['nullcell', level.cellPlan.nullcell]] as [string, number | undefined][]) {
+          if (!n) continue;
+          const c = CELL_TYPES[id];
+          cellRow.append(el('div', 'briefing-chip', `${c.icon} ${c.name} ×${n} — ${c.blurb}`));
+        }
+        if (cellRow.children.length) identity.append(cellRow);
+      }
+    }
+    if (level.tagline && !endless) identity.append(el('div', 'briefing-structural', level.tagline));
+    body.append(identity);
+
+    // ---- roster strip ----
+    if (!endless) {
+      const enemyIds = [...levelEnemyIds(level)].filter(id => ENEMIES[id]);
+      if (enemyIds.length) {
+        const rosterWrap = el('div', 'briefing-section');
+        rosterWrap.append(el('div', 'briefing-h', 'Roster'));
+        const roster = el('div', 'briefing-roster');
+        for (const id of enemyIds) {
+          const spec = ENEMIES[id];
+          const tile = el('div', `briefing-enemy${level.newEnemy?.id === id ? ' new' : ''}`);
+          const mini = document.createElement('canvas');
+          mini.width = 48; mini.height = 48;
+          this.drawMiniEnemy(mini, spec);
+          tile.append(mini);
+          tile.title = level.newEnemy?.id === id ? `${spec.name} — ${level.newEnemy.hint}` : spec.name;
+          roster.append(tile);
+        }
+        rosterWrap.append(roster);
+        if ((this.save.settings.difficulty ?? 2) >= 3 && !daily) rosterWrap.append(el('div', 'briefing-note', '+? extra enemy type on Hard and above.'));
+        body.append(rosterWrap);
+      }
+    }
+
+    // ---- challenges ----
+    if (!endless && !daily && isUnlocked('challenges') && level.challenges?.length) {
+      const chWrap = el('div', 'briefing-section');
+      chWrap.append(el('div', 'briefing-h', 'Challenges'));
+      const chDone = this.save.challenges[level.id] || [];
+      const chRow = el('div', 'briefing-challenges');
+      level.challenges.forEach((c, i) => {
+        const def = CHALLENGE_POOL[c.id];
+        const earned = !!chDone[i];
+        const card = el('div', `briefing-ch${earned ? ' earned' : ''}`);
+        card.append(el('div', 'briefing-ch-name', `${def.icon} ${def.name}${earned ? ' ✓' : ''}`), el('div', 'briefing-ch-desc', def.desc(c.param)));
+        chRow.append(card);
+      });
+      chWrap.append(chRow);
+      body.append(chWrap);
+    }
+
+    // ---- draft picker ----
+    if (draftUnlocked) {
+      const draftWrap = el('div', 'briefing-section');
+      draftWrap.append(el('div', 'briefing-h', daily ? "Today's arsenal" : 'Draft'));
+      if (!daily) {
+        const toggleRow = el('div', 'briefing-toggle-row');
+        const label = el('span', '', 'Use full arsenal');
+        const tg = el('button', `toggle${this.save.settings.draftMode === 'all' ? ' on' : ''}`);
+        tg.onclick = () => {
+          audio.ui('click');
+          this.save.settings.draftMode = this.save.settings.draftMode === 'all' ? 'draft' : 'all';
+          this.persist();
+          this.showBriefing(level, endless, daily);
+        };
+        toggleRow.append(label, tg);
+        draftWrap.append(toggleRow);
+      }
+      const usingDraft = daily ? true : this.save.settings.draftMode !== 'all';
+      if (usingDraft) {
+        if (!daily && !this.save.seen['draft']) this.toastOnce('draft', 'DRAFT — from here on you choose which towers to bring. Fewer tools, sharper plans. (Prefer everything? Flip on "Use full arsenal.")');
+        const sel = daily ? forcedDaily! : this.briefingSelection!;
+        const counter = el('div', 'briefing-draft-counter', daily ? `Locked — ${sel.length} towers` : `${sel.length} of ${size} chosen`);
+        draftWrap.append(counter);
+        const grid = el('div', 'bm-grid briefing-draft-grid');
+        for (const spec of TOWERS) {
+          const chosen = sel.includes(spec.id);
+          const item = el('button', `bm-item${chosen ? ' chosen' : ''}${daily ? ' locked' : ''}`) as HTMLButtonElement;
+          const mini = document.createElement('canvas');
+          mini.width = 68; mini.height = 68;
+          this.drawMiniTower(mini, spec);
+          item.append(mini, el('span', 'bm-name', spec.name));
+          const rc = roleChips(spec);
+          if (rc.air || rc.role) {
+            const chipRow = el('div', 'bm-chips');
+            if (rc.air) chipRow.append(el('span', `bm-chip bm-chip-${rc.air}`, rc.air === 'no-air' ? 'NO AIR' : 'AIR+'));
+            if (rc.role) chipRow.append(el('span', 'bm-chip bm-chip-role', rc.role.toUpperCase()));
+            item.append(chipRow);
+          }
+          item.title = spec.blurb;
+          if (!daily) {
+            item.onclick = () => {
+              audio.ui('click');
+              const arr = this.briefingSelection!;
+              const idx = arr.indexOf(spec.id);
+              if (idx >= 0) arr.splice(idx, 1);
+              else if (arr.length < size) arr.push(spec.id);
+              else { audio.ui('deny'); return; }
+              this.showBriefing(level, endless, daily);
+            };
+          } else item.disabled = true;
+          grid.append(item);
+        }
+        draftWrap.append(grid);
+        if (!daily) {
+          const btnRow = el('div', 'result-row');
+          const suggBtn = el('button', 'btn subtle', 'Suggested');
+          suggBtn.onclick = () => { audio.ui('click'); this.briefingSelection = suggestedDraft(level, size, this.save.stats.towersBuilt); this.showBriefing(level, endless, daily); };
+          const lastBtn = el('button', 'btn subtle', 'Last used') as HTMLButtonElement;
+          lastBtn.disabled = !this.save.lastDraft.length;
+          lastBtn.onclick = () => { audio.ui('click'); this.briefingSelection = this.save.lastDraft.slice(0, size); this.showBriefing(level, endless, daily); };
+          const clearBtn = el('button', 'btn subtle', 'Clear');
+          clearBtn.onclick = () => { audio.ui('click'); this.briefingSelection = []; this.showBriefing(level, endless, daily); };
+          btnRow.append(suggBtn, lastBtn, clearBtn);
+          draftWrap.append(btnRow);
+        } else {
+          draftWrap.append(el('div', 'briefing-note', "Today's arsenal is shared by every player — the full-arsenal toggle doesn't apply here."));
+        }
+      }
+      body.append(draftWrap);
+    }
+
+    // ---- doctrine selector ----
+    if (isUnlocked('doctrines') && this.save.doctrines.owned.length) {
+      const docWrap = el('div', 'briefing-section');
+      docWrap.append(el('div', 'briefing-h', 'Doctrine'));
+      const row = el('div', 'briefing-doctrine-row');
+      const noneBtn = el('button', `seg-chip${!this.save.doctrines.active ? ' on' : ''}`, 'None');
+      noneBtn.onclick = () => { audio.ui('click'); this.save.doctrines.active = null; this.persist(); this.showBriefing(level, endless, daily); };
+      row.append(noneBtn);
+      for (const id of this.save.doctrines.owned) {
+        const d = DOCTRINES.find(x => x.id === id)!;
+        const b = el('button', `seg-chip${this.save.doctrines.active === id ? ' on' : ''}`, `${d.icon} ${d.name}`);
+        b.title = d.desc;
+        b.onclick = () => { audio.ui('click'); this.save.doctrines.active = id; this.persist(); this.showBriefing(level, endless, daily); };
+        row.append(b);
+      }
+      docWrap.append(row);
+      const active = this.save.doctrines.owned.find(id => id === this.save.doctrines.active);
+      if (active) docWrap.append(el('div', 'briefing-note', DOCTRINES.find(d => d.id === active)!.desc));
+      body.append(docWrap);
+    }
+
+    sc.append(body);
+
+    const launchRow = el('div', 'briefing-launch-row');
+    const launch = el('button', 'btn primary briefing-launch', endless ? 'Launch' : daily ? 'Launch Daily Op' : 'LAUNCH');
+    launch.onclick = () => {
+      audio.ui('click');
+      const finalDraft = !draftUnlocked ? null : daily ? forcedDaily! : (this.save.settings.draftMode === 'all' ? null : (this.briefingSelection || []));
+      if (finalDraft && !daily) { this.save.lastDraft = [...finalDraft]; this.persist(); }
+      this.startLevel(level, endless, daily, null, finalDraft);
+    };
+    launchRow.append(launch);
+    sc.append(launchRow);
+
+    this.root.append(sc);
+  }
+
+  // =========================================================
   // GAME
   // =========================================================
-  startLevel(level: LevelSpec, endless: boolean, daily: DailyOp | null = null, resumeSnap: ResumeSnapshot | null = null) {
+  // `explicitDraft` (Phase 8.2): the draft chosen on the Briefing screen (undefined for
+  // direct calls that aren't coming from it — e.g. a live settings restart — which instead
+  // inherit whatever the currently-running game's draft already was).
+  startLevel(level: LevelSpec, endless: boolean, daily: DailyOp | null = null, resumeSnap: ResumeSnapshot | null = null, explicitDraft?: string[] | null) {
+    const inheritedDraft = this.game ? this.game.draft : null;
     this.killGame();
     this.clearUI();
     this.current = level;
@@ -1179,6 +1527,9 @@ export class UI {
       dmgMul: owned('munitions') ? 1.1 : 1,
       orbital: owned('orbital'),
       stasis: owned('stasis'),
+      // Doctrines (Phase 8.3): account-wide, same mechanism as META bonuses — always active
+      // if owned+selected, in every mode (campaign/endless/daily), just like META nodes.
+      doctrine: this.save.doctrines.active,
     };
     const st = this.save.settings;
     const DIFF_HP = [0.7, 0.85, 1, 1.25, 1.55];
@@ -1190,6 +1541,11 @@ export class UI {
     const meander = resumeSnap ? resumeSnap.meander : (st.meander ?? 0);
     const diffTier = resumeSnap ? resumeSnap.diffTier : daily ? daily.difficulty : (st.difficulty ?? 2);
     const ascTier = resumeSnap ? resumeSnap.ascTier : (endless || daily) ? 0 : this.save.ascension.current;
+    // Draft (Phase 8.2): resume restores whatever the snapshot carried; a Briefing-screen
+    // launch passes its choice explicitly; anything else (settings restart mid-game, dev
+    // jump before the unlock, etc.) inherits the previous run's draft, defaulting to null
+    // (full arsenal) when there is none.
+    const draft = resumeSnap ? (resumeSnap.draft ?? null) : explicitDraft !== undefined ? explicitDraft : inheritedDraft;
     const game = new Game(this.canvas, level, endless, meta, tileSize, {
       hpMul: DIFF_HP[diffTier],
       rewardMul: DIFF_REWARD[diffTier],
@@ -1201,6 +1557,7 @@ export class UI {
       forceMods: daily?.modifiers,
       mutatorBonus: daily?.mutatorBonus,
       perfMode: this.effectivePerfMode(),
+      draft,
     });
     this.game = game;
     this.orientationPausedGame = false;
@@ -1239,11 +1596,8 @@ export class UI {
       if (isUnlocked('cells') && game.cells.some(c => c.special)) {
         this.toastOnce('cells', 'Special terrain! Long-press (or hover) a marked cell to see what it does — the right tower in the right place hits harder.');
       }
-      // pre-level challenge briefing (not endless, not daily, not L1 — challenges gate at L2)
-      if (!endless && !daily && isUnlocked('challenges') && level.challenges?.length) {
-        const names = level.challenges.map(c => `${CHALLENGE_POOL[c.id].icon} ${CHALLENGE_POOL[c.id].name}`).join('  ·  ');
-        this.banner(`Challenges: ${names}`, '#fff3b0', 'medium');
-      }
+      // Challenges are now shown on the pre-level Briefing screen (Phase 8.1.4) instead of
+      // an in-game banner — the Briefing screen is the new home for that information.
       if (daily) {
         this.banner('☀ DAILY OP — mirrored layout, Hard difficulty', '#ffd97a', 'medium');
       }
@@ -1261,6 +1615,7 @@ export class UI {
       // the snapshot's own tileSize/meander/diffTier/ascTier/forceMods above) — this just
       // repopulates the mutable run state on top of that freshly-built, matching grid.
       game.mods = new Set(resumeSnap.mods);
+      game.doctrine = resumeSnap.doctrine;   // the doctrine active when the snapshot was taken, not necessarily today's
       game.credits = resumeSnap.credits;
       game.lives = Math.min(game.maxLives, resumeSnap.lives);
       game.waveIdx = resumeSnap.waveIdx;
@@ -1311,7 +1666,7 @@ export class UI {
   startDailyOp(op: DailyOp) {
     const lv = LEVELS.find(l => l.id === op.levelId);
     if (!lv) return;
-    this.startLevel(lv, false, op);
+    this.showBriefing(lv, false, op);
   }
 
   // Fold the finished run's stat deltas into the save, then zero them so any
@@ -1586,6 +1941,9 @@ export class UI {
     if (cellInfo) menu.append(el('div', 'bm-cell-chip', `${cellInfo.icon} ${cellInfo.name}`));
     const grid = el('div', 'bm-grid');
     for (const spec of TOWERS) {
+      // Draft (Phase 8.2): hidden, not greyed — a drafted-out tower simply isn't an option
+      // this run. Dev mode ignores the draft entirely (it's a playstyle toggle, not a lock).
+      if (g.draft && !g.dev && !g.draft.includes(spec.id)) continue;
       const cost = g.costOf(spec);
       const poor = g.credits < cost;
       const favored = cellInfo?.bestFor.includes(spec.id);
@@ -2831,11 +3189,11 @@ export class UI {
 
     const row = el('div', 'result-row');
     const again = el('button', `btn${won ? '' : ' primary'}`, won ? 'Replay' : 'Retry');
-    again.onclick = () => { audio.ui('click'); this.startLevel(this.current!, this.isEndless, this.currentDaily); };
+    again.onclick = () => { audio.ui('click'); this.showBriefing(this.current!, this.isEndless, this.currentDaily); };
     row.append(again);
     if (won && !this.isEndless && !this.isDaily && this.current && this.current.id < LEVELS.length) {
       const next = el('button', 'btn primary', 'Next sector →');
-      next.onclick = () => { audio.ui('click'); this.startLevel(LEVELS[this.current!.id], false); };
+      next.onclick = () => { audio.ui('click'); this.showBriefing(LEVELS[this.current!.id], false); };
       row.append(next);
     }
     const sel = el('button', 'btn subtle', won ? 'Sectors' : 'Change Loadout');

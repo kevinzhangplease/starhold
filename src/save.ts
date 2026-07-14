@@ -30,12 +30,15 @@ export interface SaveData {
   lastSpeed: number;                // 1 | 2 | 3, restored on level start
   defaultTargeting: string;         // 'first' | 'last' | 'strong' | 'weak' | 'close'
   resume?: string;                  // serialized mid-level snapshot (Phase 6), version-stamped
+  lastDraft: string[];              // Phase 8: last-used draft (global, not per-level)
+  doctrines: { owned: string[]; active: string | null };   // Phase 8
   settings: AudioSettings & {
     shake: boolean; tileSize: number; difficulty: number; length: number;
     pauseOnBuild: boolean; meander: number; haptics: boolean;
     damageNumbers: boolean; reduceFlash: boolean; reduceMotion: boolean;
     perfMode: 'auto' | 'on' | 'off';
     accessiblePalette: boolean;      // colorblind-accessible tower/enemy board palette (Phase 3B)
+    draftMode: 'draft' | 'all';      // Phase 8: persistent "use full arsenal" escape hatch
   };
 }
 
@@ -47,8 +50,8 @@ const KEY = 'starhold-save-v1';
 // here to avoid an import cycle; validate.ts asserts the two stay in sync).
 export const SEEN_UNLOCK_LEVELS: Record<string, number> = {
   combo: 2, challenges: 2, interest: 3, cells: 3, drops: 4, mod_asteroids: 4, overcharge: 4,
-  elites: 5, boss_theater: 5, mutators: 6, mod_veins: 6, nova: 7,
-  mod_meteors: 8, veterancy: 8, boss_phase2: 10, mod_ionstorms: 12,
+  elites: 5, boss_theater: 5, mutators: 6, mod_veins: 6, draft: 6, nova: 7,
+  mod_meteors: 8, veterancy: 8, boss_phase2: 10, doctrines: 10, mod_ionstorms: 12,
   guide_build: 1, guide_confirm: 1, guide_launch: 1,
   zone_1: 1, zone_2: 6, zone_3: 11,
 };
@@ -74,7 +77,9 @@ export const defaultSave = (): SaveData => ({
   chromaOn: false,
   lastSpeed: 1,
   defaultTargeting: 'first',
-  settings: { master: 0.8, music: true, weapons: true, explosions: true, ui: true, alerts: true, shake: true, tileSize: 48, difficulty: 2, length: 2, pauseOnBuild: true, meander: 0, haptics: true, damageNumbers: true, reduceFlash: false, reduceMotion: false, perfMode: 'auto', accessiblePalette: false },
+  lastDraft: [],
+  doctrines: { owned: [], active: null },
+  settings: { master: 0.8, music: true, weapons: true, explosions: true, ui: true, alerts: true, shake: true, tileSize: 48, difficulty: 2, length: 2, pauseOnBuild: true, meander: 0, haptics: true, damageNumbers: true, reduceFlash: false, reduceMotion: false, perfMode: 'auto', accessiblePalette: false, draftMode: 'draft' },
 });
 
 // Idempotent: running on an already-migrated save changes nothing.
@@ -90,6 +95,7 @@ export function migrateSave(d: any): SaveData {
     seen: { ...(d?.seen || {}) },
     challenges: { ...(d?.challenges || {}) },
     endlessMilestones: { ...(d?.endlessMilestones || {}) },
+    doctrines: { ...base.doctrines, ...(d?.doctrines || {}) },
   };
   // Guard every top-level primitive/array field individually: the blanket `...d` spread above
   // only protects fields that are genuinely ABSENT from a save. A field that's PRESENT but
@@ -103,6 +109,12 @@ export function migrateSave(d: any): SaveData {
   if (![1, 2, 3].includes(out.lastSpeed)) out.lastSpeed = base.lastSpeed;
   if (typeof out.defaultTargeting !== 'string') out.defaultTargeting = base.defaultTargeting;
   if (out.resume !== undefined && typeof out.resume !== 'string') out.resume = undefined;
+  if (!Array.isArray(out.lastDraft)) out.lastDraft = base.lastDraft;
+  if (typeof out.doctrines !== 'object' || out.doctrines === null) out.doctrines = { ...base.doctrines };
+  if (!Array.isArray(out.doctrines.owned)) out.doctrines.owned = [];
+  if (out.doctrines.active !== null && typeof out.doctrines.active !== 'string') out.doctrines.active = null;
+  if (out.doctrines.active && !out.doctrines.owned.includes(out.doctrines.active)) out.doctrines.active = null;
+  if (out.settings.draftMode !== 'draft' && out.settings.draftMode !== 'all') out.settings.draftMode = base.settings.draftMode;
   // v1 -> v2: endlessBest was a single number; move it to the Normal (tier 2) slot.
   if (typeof d?.endlessBest === 'number') {
     out.endlessBest = d.endlessBest > 0 ? { 2: d.endlessBest } : {};
