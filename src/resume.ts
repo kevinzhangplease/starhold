@@ -3,7 +3,7 @@
 // flight are never serialized. This keeps the format small and simple: resuming always
 // drops the player back into the intermission right before the next wave, exactly as if
 // they'd just cleared the saved one themselves.
-export const RESUME_VERSION = 3;
+export const RESUME_VERSION = 4;
 
 export interface ResumeTower {
   specId: string;
@@ -39,6 +39,8 @@ export interface ResumeSnapshot {
   cdStasis: number;
   towers: ResumeTower[];
   leakLedger: Record<string, number>;   // Leak ledger (Phase 6.3) — added in v3
+  draft: string[] | null;      // Drafted tower ids, or null for full-arsenal (Phase 8) — added in v4
+  doctrine: string | null;     // Active doctrine at construction time (Phase 8) — added in v4
   savedAt: number;        // Date.now(), for display ("saved 2 hours ago") and as a tiebreaker
 }
 
@@ -47,6 +49,7 @@ export function serializeResume(g: {
   level: { id: number }; endless: boolean; tileSize?: number; cell: number; meander: number; diffTier: number;
   ascTier: number; mods: Set<string>; waveIdx: number; credits: number; lives: number; novaCharge: number;
   novaNeed: number; cds: Record<string, number>; leakLedger: Record<string, number>;
+  draft: string[] | null; doctrine: string | null;
   towers: { spec: { id: string }; cell: number; stage: number; branch: number; branchStage: number; mode: string; spent: number; dmgDealt: number; kills: number; creditsEarned: number; vein: boolean; perk: string | null }[];
 }, daily: ResumeSnapshot['daily']): string | null {
   try {
@@ -68,6 +71,8 @@ export function serializeResume(g: {
       cdOrbital: g.cds.orbital || 0,
       cdStasis: g.cds.stasis || 0,
       leakLedger: { ...g.leakLedger },
+      draft: g.draft ? [...g.draft] : null,
+      doctrine: g.doctrine,
       towers: g.towers.map(t => ({
         specId: t.spec.id, cell: t.cell, stage: t.stage, branch: t.branch, branchStage: t.branchStage,
         mode: t.mode, spent: t.spent, dmgDealt: t.dmgDealt, kills: t.kills, creditsEarned: t.creditsEarned, vein: t.vein,

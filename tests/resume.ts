@@ -12,6 +12,8 @@ const fakeGame = {
   mods: new Set(['meteors', 'rich-veins']), waveIdx: 4, credits: 733, lives: 17,
   novaCharge: 42, novaNeed: 90, cds: { orbital: 3.2, stasis: 0 },
   leakLedger: { brute: 6, dart: 2 },
+  draft: ['pulse', 'mortar', 'cryo', 'missile', 'tesla', 'amp'],
+  doctrine: 'artillery',
   towers: [
     { spec: { id: 'pulse' }, cell: 55, stage: 2, branch: 1, branchStage: 1, mode: 'strong', spent: 480, dmgDealt: 12034.5, kills: 61, creditsEarned: 610, vein: true, perk: 'sharp' },
     { spec: { id: 'mortar' }, cell: 88, stage: 0, branch: -1, branchStage: 0, mode: 'first', spent: 120, dmgDealt: 340, kills: 4, creditsEarned: 40, vein: false, perk: null },
@@ -38,6 +40,16 @@ check(snap!.towers[0].perk === 'sharp', 'veteran perk round-trips (Phase 4.6)');
 check(snap!.towers[1].perk === null, 'null perk round-trips as null, not dropped');
 check(snap!.leakLedger.brute === 6 && snap!.leakLedger.dart === 2, 'leak ledger round-trips (Phase 6.3)');
 check(snap!.daily !== null && snap!.daily.dateStr === '2026-07-08', 'daily context round-trips');
+check(JSON.stringify(snap!.draft) === JSON.stringify(fakeGame.draft), 'draft round-trips (Phase 8.2)');
+check(snap!.doctrine === 'artillery', 'active doctrine round-trips (Phase 8.3)');
+{
+  // full-arsenal (null draft) must round-trip as null, not [] or undefined
+  const fullArsenalGame = { ...fakeGame, draft: null, doctrine: null };
+  const rawFull = serializeResume(fullArsenalGame as any, daily);
+  const snapFull = deserializeResume(rawFull!);
+  check(snapFull!.draft === null, 'full-arsenal draft (null) round-trips as null');
+  check(snapFull!.doctrine === null, 'no active doctrine round-trips as null');
+}
 
 // --- graceful discard on version mismatch ---
 const oldFormat = JSON.stringify({ v: 999, levelId: 3, towers: [] });

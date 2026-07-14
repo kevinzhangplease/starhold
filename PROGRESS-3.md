@@ -1076,3 +1076,122 @@ on Level 8 with zero errors and the new pulse-ring visual twin confirmed renderi
 
 ### Next
 Phase 8 — Replayability: Draft & Doctrines.
+
+---
+
+## Phase 8 — Replayability: Draft & Doctrines [COMPLETE]
+Started: 2026-07-14 · Finished: 2026-07-14
+
+### Shipped
+1. **Briefing screen** (`ui.showBriefing`): a new screen between a level-select/Endless/Daily
+   tap and game start — header (level/zone tagline), an identity row (modifiers, cell
+   inventory, structural tagline), a roster strip of every enemy the level's waves contain
+   (mini-glyphs, `newEnemy` highlighted), the two challenge badges+descs, the draft picker,
+   the doctrine selector, and a big LAUNCH button. Every entry point that used to call
+   `startLevel` directly now routes through it: level cards, the Endless card, the Daily Op
+   card, and the result screen's Replay/Retry/Next-sector buttons. Resume is the one
+   documented exception (bypasses briefing entirely — the snapshot already encodes every
+   choice), matching the plan exactly.
+2. **The draft** (`TUNING.draft`, `UNLOCKS.draft = 6`): `sizeByLevel` grows `[[4,5],[8,6],
+   [12,7],[15,8]]` (endless fixed at 8), read via `draftSizeForLevel(id)` (data.ts, pure/
+   exported so both the Briefing screen and `validate.ts`/tests share one source of truth).
+   Below the gate: no picker anywhere, `Game.draft` stays `null`, zero UI noise — verified via
+   a fresh-save dev-reset sim. `Game` gains a `draft: string[] | null` field; `openBuildMenu`
+   (ui.ts) hides (not greys) any tower not in it, except in dev mode which always shows every
+   tower regardless of draft — a deliberate escape hatch for testing, not a plan requirement,
+   but consistent with dev mode's existing "ignore normal constraints" role elsewhere (free
+   build, god mode).
+3. **Suggested / Last used / Clear / Use full arsenal**: `suggestedDraft(level, size,
+   towersBuilt)` (ui.ts, pure — no DOM, no Game — so it can run before a Game exists) applies
+   the plan's exact must-include order: an air-capable tower if the level's waves contain any
+   flyer, a splash/chain tower if swarmling+splitter spawns total ≥15, every tower in the
+   level's `newEnemy.counters`, then fills remaining slots by the account's lifetime
+   `stats.towersBuilt` descending. `save.settings.draftMode: 'draft' | 'all'` is the persistent
+   global toggle (default `'draft'` once unlocked); flipping it hides the picker grid but keeps
+   the toggle itself visible so it's always reachable. `save.lastDraft` persists across
+   sessions; an ephemeral `UI.briefingSelection` field holds the in-progress pick while a
+   Briefing screen is open (reset when a *different* level's briefing is opened, so navigating
+   away and back to the same level doesn't lose an unfinished edit).
+4. **Daily Op forced draft**: `dailyDraft(dateStr, size)` (ui.ts) — a seeded Fisher-Yates shuffle
+   of all 10 tower ids via `mulberry32(hashString(dateStr + '-draft'))`, sliced to size, with a
+   deterministic re-roll swap if the straight cut missed an air-capable or splash/chain pick
+   (guaranteeing both, every day). Rendered as a locked, unselectable grid labeled "Today's
+   arsenal"; the full-arsenal toggle is hidden entirely for dailies, per plan 8.2.7.
+5. **Doctrines** (`DOCTRINES`, `TUNING.doctrines`, `UNLOCKS.doctrines = 10`): Artillery (+25%
+   splash radius, +15% splash damage on mortar/missile only), Precision (+10% crit chance on
+   every tower except Prism and Amp), Logistics (+10% starting credits, drops 20% more often).
+   A new "DOCTRINES — choose one to fly under" section renders below the 8 existing META nodes
+   on the Upgrades screen (buy = permanent, spends the same star pool — `starsAvail()` now
+   subtracts owned-doctrine costs too, so buying both a META node and a doctrine can never go
+   negative); switching the *active* one, once owned, is free and available both there and on
+   the Briefing screen, exactly matching the plan's "checklist → per-level loadout" framing.
+   `save.doctrines = { owned: string[], active: string | null }`.
+6. **Doctrine effects wired exactly like META bonuses** — through the `meta` object passed to
+   `new Game`, applied in the constructor/`Tower.stats()`: Logistics folds into the same
+   start-credit chain as the Reactor nodes and the Ascension IV scarcity cut, and multiplies
+   the supply-drop interval roll; Artillery multiplies `splash` and `dmg` inside `Tower.stats()`
+   for mortar/missile kinds only (cluster bomblets inherit their parent shell's already-scaled
+   values — no separate handling needed); Precision adds to the `crit` field `stats()` already
+   returns, gated off for `prism`/`amp` kinds.
+7. **Resume**: `RESUME_VERSION` 3 → 4. `ResumeSnapshot` gains `draft: string[] | null` and
+   `doctrine: string | null` — the doctrine active *when the snapshot was taken*, restored
+   verbatim on resume regardless of whatever the player's account-wide active doctrine is by
+   the time they come back (so switching doctrines mid-campaign never silently reaches into an
+   in-progress resume). `startLevel` threads the resolved draft through a small priority chain:
+   a resumed snapshot's own `draft` wins; an explicit Briefing-screen choice wins next; anything
+   else (a live settings-triggered restart mid-game, a dev level-jump) inherits whatever the
+   previously-running `Game.draft` already was, defaulting to full-arsenal if there wasn't one.
+8. **Level-card "Bring: ✈ + splash" hint** (8.4): a cheap addition derived from the exact same
+   must-include predicates `suggestedDraft` uses (flying-enemy presence, swarm/splitter count),
+   so it can never drift out of sync with what Suggested actually picks.
+9. **Game Guide**: new "Replayability" section — the Briefing screen, Drafting, Doctrines.
+
+### Deviations / judgment calls (recorded per A.2.3)
+- **Ray's crit roll already existed generically** — the plan's 8.3.4 instruction to "ADD a crit
+  roll to ray hits (they lack one)" turned out to be stale: `fire()`'s `ray` case already reads
+  `Math.random() < (s.crit || 0)` (added by an earlier phase's generic crit-field plumbing), so
+  Precision's `+critAdd` on `stats().crit` reaches Ray for free. No extra implementation needed;
+  `tests/draft-doctrines.ts` asserts this explicitly rather than silently assuming it.
+- **The `hotkey` field on `TowerSpec` (data.ts) is dead data** — grepped the whole `src/`
+  tree and it's read nowhere; there is no number-key tower-selection binding in this codebase
+  for the plan's "number hotkeys skip hidden entries" instruction to apply to. Nothing to change;
+  noting it so a future phase doesn't assume the feature exists.
+- **Endless's Briefing screen shows a static note ("Modifiers roll fresh, seeded per run, when
+  you launch") instead of the plan's literal "shows its seeded modifiers."** Endless currently
+  rolls its 0-2 modifiers from unseeded `Math.random()` *inside* `Game`'s constructor — genuinely
+  previewing them on the Briefing screen (which necessarily renders before a `Game` exists)
+  would require pre-generating and threading an endless run-seed through to the constructor, a
+  materially larger refactor than this phase's actual deliverable (draft & doctrines). Scoped
+  out and documented rather than silently expanded; a good candidate for Phase 9's integration
+  pass if Kevin wants it.
+- **Doctrine ownership isn't cross-validated against `DOCTRINES` ids in `migrateSave`** — mirrors
+  the exact precedent already set by `meta: string[]` (owned META ids are never validated
+  against the `META` table either); only shape/type guards are applied, consistent with the
+  rest of the file.
+- **Cluster-mortar bomblets keep their existing fixed 26px mini-splash**, unscaled by Artillery.
+  It was already a flat, non-`s.splash`-derived value before this phase (pre-existing design),
+  and the plan's "shell/missile/cluster paths" phrasing is satisfied by the parent shell's own
+  `dmg`/`splash` already carrying the multiplier — scaling the secondary bomblets too would be
+  a new balance decision this phase doesn't need to make.
+
+### Verification
+All 5 gates green: `tsc --noEmit`, `validate.ts` (new Phase 8 section: `DOCTRINES` ↔
+`TUNING.doctrines` sync, `sizeByLevel` monotonicity/coverage/sane-range, `draftSizeForLevel`
+sanity for all 15 levels), the 18-file test suite (17 prior + new `tests/draft-doctrines.ts`;
+`tests/resume.ts` extended with draft/doctrine round-trip + null/full-arsenal cases), the
+standard build, and the singlefile build. Live-verified end-to-end in a real headless-Chromium
+browser: dev-unlocked all levels, bought and activated a doctrine from the Upgrades screen
+(confirmed "Active" state), opened Level 10's Briefing screen (confirmed Draft/Doctrine/
+Roster/Challenges sections all render, counter reads "7 of 7 chosen" matching
+`draftSizeForLevel(10) = 7`), toggled "Use full arsenal" and confirmed the picker grid
+disappears and reappears, deselected a tower and watched the counter update live, then
+launched into a real game and confirmed the in-game build menu shows exactly as many towers as
+were drafted (7, not the full roster of 10) — the full pipeline from Briefing choice through
+`Game` construction to build-menu enforcement, exercised live, zero console errors.
+
+### Known issues
+None blocking. The Endless seeded-modifier-preview scope-cut above is the one open item, left
+for a future phase.
+
+### Next
+Phase 9 — Integration Balance, Tests & Ship.

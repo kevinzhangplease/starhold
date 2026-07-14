@@ -1,6 +1,6 @@
 // Run with: node --experimental-strip-types validate.ts
 import { LEVELS } from './src/levels.ts';
-import { ENEMIES, TOWERS, META, UNLOCKS, TUNING, fmt, MUTATORS, MODIFIER_INFO, CELL_TYPES, ZONES, CHALLENGE_POOL, LANDMARKS, PALETTE, ENEMY_INTRO, WAVE_SHAPES } from './src/data.ts';
+import { ENEMIES, TOWERS, META, UNLOCKS, TUNING, fmt, MUTATORS, MODIFIER_INFO, CELL_TYPES, ZONES, CHALLENGE_POOL, LANDMARKS, PALETTE, ENEMY_INTRO, WAVE_SHAPES, DOCTRINES, draftSizeForLevel } from './src/data.ts';
 import { RESUME_VERSION } from './src/resume.ts';
 import { mulberry32, hashString, seededInt, seededPick } from './src/rng.ts';
 // computeDailyOp itself lives in daily.ts, but daily.ts internally imports from './rng' and
@@ -826,6 +826,31 @@ if (!(RESUME_VERSION >= 1 && Number.isInteger(RESUME_VERSION))) err('RESUME_VERS
         }
       }
     }
+  }
+}
+
+// ---- Phase 8: draft & doctrines ----
+{
+  // DOCTRINES ids must match TUNING.doctrines keys exactly (both directions).
+  const specIds = new Set(DOCTRINES.map(d => d.id));
+  const tuningIds = new Set(Object.keys(TUNING.doctrines));
+  for (const id of specIds) if (!tuningIds.has(id)) err(`DOCTRINES['${id}'] missing a TUNING.doctrines entry`);
+  for (const id of tuningIds) if (!specIds.has(id)) err(`TUNING.doctrines['${id}'] has no matching DOCTRINES spec`);
+  for (const d of DOCTRINES) if (!(d.cost > 0)) err(`Doctrine '${d.id}' cost must be > 0`);
+
+  // sizeByLevel: ascending thresholds, ascending (or flat) sizes, covers every campaign level,
+  // and every size is a sane count (less than the full 10-tower roster, at least a few picks).
+  const sbl = TUNING.draft.sizeByLevel;
+  for (let i = 1; i < sbl.length; i++) {
+    if (sbl[i][0] <= sbl[i - 1][0]) err(`TUNING.draft.sizeByLevel thresholds must strictly increase (index ${i})`);
+    if (sbl[i][1] < sbl[i - 1][1]) err(`TUNING.draft.sizeByLevel sizes must not shrink as levels advance (index ${i})`);
+  }
+  if (sbl[sbl.length - 1][0] < 15) err('TUNING.draft.sizeByLevel must cover up to level 15');
+  for (const [, size] of sbl) if (!(size >= 3 && size < TOWERS.length)) err(`TUNING.draft size ${size} outside sane [3, ${TOWERS.length}) range`);
+  if (!(TUNING.draft.endless >= 3 && TUNING.draft.endless <= TOWERS.length)) err('TUNING.draft.endless outside sane range');
+  for (const lv of LEVELS) {
+    const size = draftSizeForLevel(lv.id);
+    if (!(size >= 3 && size <= TOWERS.length)) err(`Level ${lv.id}: draftSizeForLevel returned ${size}, outside sane range`);
   }
 }
 
