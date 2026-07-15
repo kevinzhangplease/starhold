@@ -768,6 +768,10 @@ export class Game {
   moveArmed: Tower | null = null;
   pendingMove: { tower: Tower; cellIdx: number } | null = null;
   pendingBuild: { spec: TowerSpec; cellIdx: number } | null = null;
+  // Duplicate tower (UI polish): a "stamp" tool, like the ability-cast flow (arm, ghost
+  // follows the cursor, one click places it) rather than the build/move flow's separate
+  // confirm step — the confirm already happened as the "Duplicate" button press itself.
+  dupArmed: { spec: TowerSpec; stage: number; branch: number; branchStage: number; cost: number } | null = null;
   menuCell = -1;
   menuHover: TowerSpec | null = null;
 
@@ -3174,7 +3178,43 @@ export class Game {
     this.moveArmed = null;
     this.pendingMove = null;
     this.pendingBuild = null;
+    this.dupArmed = null;
     this.onSelect(); this.onHud();
+  }
+
+  // Duplicate tower (UI polish): arms a "stamp" of the given tower's current spec + upgrade
+  // state, priced at its full current investment (t.spent — base cost plus every upgrade
+  // still active, already net of any refunds). One click on a free cell places the copy;
+  // see tryDuplicateAt().
+  armDuplicate(t: Tower) {
+    this.selected = null;
+    this.moveArmed = null; this.pendingMove = null; this.pendingBuild = null;
+    this.dupArmed = { spec: t.spec, stage: t.stage, branch: t.branch, branchStage: t.branchStage, cost: t.spent };
+    this.onSelect();
+  }
+  cancelDuplicate() { this.dupArmed = null; }
+  tryDuplicateAt(cellIdx: number): boolean {
+    const d = this.dupArmed;
+    if (!d || this.state !== 'playing' || !this.cellFree(cellIdx) || this.credits < d.cost) {
+      audio.ui('deny');
+      return false;
+    }
+    // buildAt() charges its own base cost (costOf(spec)); the difference between that and
+    // the duplicate's full priced-in cost (its upgrades) is charged here first so the two
+    // deductions net out to exactly d.cost.
+    const bonus = Math.max(0, d.cost - this.costOf(d.spec));
+    this.credits -= bonus;
+    if (!this.buildAt(cellIdx, d.spec)) { this.credits += bonus; return false; }
+    const t = this.towers[this.towers.length - 1];
+    t.stage = d.stage; t.branch = d.branch; t.branchStage = d.branchStage;
+    t.spent = d.cost;
+    this.recomputeCoverage(t);
+    this.recomputeThreat();
+    this.dupArmed = null;
+    this.selected = t;
+    this.onSelect();
+    this.onHud();
+    return true;
   }
 
   buyUpgrade(t: Tower, branchPick = -1) {
@@ -3420,6 +3460,11 @@ export class Game {
 
     this.drawBeams(g);
     for (const t of this.towers) this.drawTower(g, t, false, 'body');
+    // Special-terrain cells (ridge/sinkhole/conduit/anchor) get their emblem drawn in
+    // drawTiles(), but a tower's opaque pad (drawn on top, see 'pad' above) otherwise erases
+    // it entirely once built. This ring — drawn last, just outside the pad's own footprint —
+    // keeps the cell type identifiable for the life of the tower, not just while it's empty.
+    this.drawCellModRing(g);
     for (const e of this.enemies) this.drawEnemy(g, e);
     this.drawDrops(g);
 
@@ -3483,7 +3528,7 @@ export class Game {
     const gap = Math.max(5, cs * 0.13);
     const s = cs - gap;
     const rad = Math.max(6, cs * 0.16);
-    const active = this.menuCell >= 0 || this.moveArmed !== null || this.pendingMove !== null || this.pendingBuild !== null;
+    const active = this.menuCell >= 0 || this.moveArmed !== null || this.pendingMove !== null || this.pendingBuild !== null || this.dupArmed !== null;
     const base = active ? 0.32 : 0.16;
     const hoverIdx = this.cellAt(this.mx, this.my);
 
@@ -3534,37 +3579,39 @@ export class Game {
         g.globalAlpha = 1;
       }
       // ---- Special terrain (Phase 2). Value/elevation-based, palette-neutral — never a new
-      // hue. Drawn before the buildable-cell outline below so occupied special cells keep
-      // their treatment visible around the tower pad. ----
+      // hue. Boosted contrast (UI polish pass) so each type reads clearly at a glance even
+      // before you've learned the shapes; a tower built on top still erases most of this —
+      // drawCellModRing() (called after tower bodies) is what keeps the type identifiable
+      // for the life of the tower. ----
       if (c.special === 'ridge') {
         // lifted face: 2px up-shift, lighter top edge, dark drop shadow along the bottom.
         g.fillStyle = 'rgba(4,5,14,0.28)';
         (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2 - 2 + 3, s, s, rad); g.fill();
-        g.fillStyle = 'rgba(238,240,255,0.14)';
+        g.fillStyle = 'rgba(238,240,255,0.26)';
         (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2 - 2, s, s, rad); g.fill();
-        g.strokeStyle = 'rgba(255,255,255,0.22)';
-        g.lineWidth = 1.5;
+        g.strokeStyle = 'rgba(255,255,255,0.45)';
+        g.lineWidth = 2.2;
         g.beginPath(); g.moveTo(c.x - s / 2 + rad, c.y - s / 2 - 2); g.lineTo(c.x + s / 2 - rad, c.y - s / 2 - 2); g.stroke();
       } else if (c.special === 'sinkhole') {
         // inset face: darker fill, inner shadow on the top edge, faint downward-triangle glyph.
-        g.fillStyle = 'rgba(4,5,14,0.22)';
+        g.fillStyle = 'rgba(4,5,14,0.34)';
         (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2, s, s, rad); g.fill();
-        g.strokeStyle = 'rgba(0,0,0,0.35)';
-        g.lineWidth = 2;
+        g.strokeStyle = 'rgba(0,0,0,0.55)';
+        g.lineWidth = 2.4;
         g.beginPath(); g.moveTo(c.x - s / 2 + rad, c.y - s / 2 + 1); g.lineTo(c.x + s / 2 - rad, c.y - s / 2 + 1); g.stroke();
-        g.globalAlpha = 0.18;
+        g.globalAlpha = 0.4;
         g.fillStyle = '#dfe3ff';
         g.beginPath();
-        g.moveTo(c.x - s * 0.14, c.y - s * 0.08); g.lineTo(c.x + s * 0.14, c.y - s * 0.08); g.lineTo(c.x, c.y + s * 0.14);
+        g.moveTo(c.x - s * 0.18, c.y - s * 0.1); g.lineTo(c.x + s * 0.18, c.y - s * 0.1); g.lineTo(c.x, c.y + s * 0.18);
         g.closePath(); g.fill();
         g.globalAlpha = 1;
       } else if (c.special === 'conduit') {
         // emissive border on every conduit cell, plus a marching dashed link line drawn
         // once from the lower-index cell of each pair (avoids drawing it twice).
-        const pulse = this.reduceMotion ? 0.45 : 0.3 + 0.3 * (0.5 + 0.5 * Math.sin(this.now * (Math.PI * 2 / 1.2)));
+        const pulse = this.reduceMotion ? 0.6 : 0.45 + 0.35 * (0.5 + 0.5 * Math.sin(this.now * (Math.PI * 2 / 1.2)));
         g.globalAlpha = pulse;
         g.strokeStyle = '#bfe3ff';
-        g.lineWidth = 2;
+        g.lineWidth = 2.4;
         (g as any).beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2, s, s, rad); g.stroke();
         g.globalAlpha = 1;
         if (c.conduitPartner !== undefined && i < c.conduitPartner) {
@@ -3580,16 +3627,16 @@ export class Game {
         }
       } else if (c.special === 'anchor') {
         const spin = this.reduceMotion ? 0 : this.now * 0.6;
-        g.strokeStyle = 'rgba(197,179,246,0.5)';
-        g.lineWidth = 1.5;
+        g.strokeStyle = 'rgba(197,179,246,0.8)';
+        g.lineWidth = 2.2;
         for (const rr of [s * 0.32, s * 0.22]) { g.beginPath(); g.arc(c.x, c.y, rr, spin, spin + Math.PI * 1.5); g.stroke(); }
       } else if (c.special === 'nullcell') {
         // diagonal hatch always visible; the dashed slow-radius ring only while an enemy
         // is actually inside it — keeps the board quiet when nothing's happening.
         g.save();
         g.beginPath(); (g as any).roundRect(c.x - s / 2, c.y - s / 2, s, s, rad); g.clip();
-        g.strokeStyle = 'rgba(160,216,239,0.18)';
-        g.lineWidth = 2;
+        g.strokeStyle = 'rgba(160,216,239,0.34)';
+        g.lineWidth = 2.2;
         for (let off = -s; off <= s; off += 7) {
           g.beginPath(); g.moveTo(c.x - s / 2 + off, c.y - s / 2); g.lineTo(c.x - s / 2 + off + s, c.y + s / 2); g.stroke();
         }
@@ -3629,31 +3676,52 @@ export class Game {
     }
     g.globalAlpha = 1;
 
-    // Directional flow (Phase 3): small chevrons marching toward the base on every second
-    // path cell — supersedes the old plain dashed line, which read as "a road" but not as
-    // "which way." `perfMode` thins to every third cell; `reduceMotion` freezes the march.
-    const chevStep = this.perfMode ? 3 : 2;
-    const chevAlpha = this.reduceMotion ? 0.3 : 0.35;
+    // Directional flow: a subtle sliding dotted line along the path. Replaces the old
+    // marching-chevron arrows — distinct triangular arrows sliding down every lane read as
+    // distracting rather than merely directional; a quiet moving dot pattern still reads as
+    // "this road is live" without fighting for attention with towers/aliens on top of it.
+    const dotGap = this.perfMode ? 15 : 11;
+    g.save();
+    g.strokeStyle = 'rgba(238,240,255,0.32)';
+    g.lineWidth = 2.6;
+    g.lineCap = 'round';
+    g.setLineDash([0.1, dotGap]);
+    g.lineDashOffset = this.reduceMotion ? 0 : -(this.now * 16) % dotGap;
     for (const ordered of this.pathOrderedCells) {
-      for (let ci = 0; ci < ordered.length; ci += chevStep) {
-        const cur = ordered[ci];
-        const nxt = ordered[Math.min(ci + 1, ordered.length - 1)];
-        let dx = nxt.c - cur.c, dy = nxt.r - cur.r;
-        if (dx === 0 && dy === 0) continue; // corner tiles can repeat in travel order — skip, direction undefined here
-        const len = Math.hypot(dx, dy); dx /= len; dy /= len;
-        const cx = this.cx(cur.c), cy = this.cy(cur.r);
-        const march = this.reduceMotion ? 0 : (this.now * 28) % this.cell;
-        const ox = cx + dx * march, oy = cy + dy * march;
-        g.save();
-        g.translate(ox, oy);
-        g.rotate(Math.atan2(dy, dx));
-        g.globalAlpha = chevAlpha;
-        g.fillStyle = '#eef0ff';
-        g.beginPath(); g.moveTo(-5, -6); g.lineTo(5, 0); g.lineTo(-5, 6); g.closePath(); g.fill();
-        g.restore();
+      if (!ordered.length) continue;
+      g.beginPath();
+      for (let ci = 0; ci < ordered.length; ci++) {
+        const cx = this.cx(ordered[ci].c), cy = this.cy(ordered[ci].r);
+        if (ci === 0) g.moveTo(cx, cy); else g.lineTo(cx, cy);
       }
+      g.stroke();
     }
-    g.globalAlpha = 1;
+    g.setLineDash([]);
+    g.restore();
+  }
+
+  // Ridge/sinkhole/conduit/anchor cells draw their emblem in drawTiles(), but a built tower's
+  // opaque pad (drawn afterward) otherwise covers it completely. Called after tower bodies,
+  // this redraws a slim ring just outside the pad's own footprint so the cell type stays
+  // identifiable — "some design along the border" — for as long as the tower stands there.
+  drawCellModRing(g: CanvasRenderingContext2D) {
+    const ringColor: Record<string, string> = {
+      ridge: 'rgba(255,255,255,0.55)',
+      sinkhole: 'rgba(0,0,0,0.55)',
+      conduit: 'rgba(191,227,255,0.65)',
+      anchor: 'rgba(197,179,246,0.75)',
+    };
+    for (const t of this.towers) {
+      const color = t.cellType && ringColor[t.cellType];
+      if (!color) continue;
+      g.save();
+      g.translate(t.x, t.y);
+      g.scale(this.k, this.k);
+      g.strokeStyle = color;
+      g.lineWidth = 2;
+      (g as any).beginPath(); (g as any).roundRect(-22, -22, 44, 44, 9); g.stroke();
+      g.restore();
+    }
   }
 
   // tile-accurate Chebyshev range indicator
@@ -4971,6 +5039,30 @@ export class Game {
         this.drawTower(g, t, true);
         t.x = saved.x; t.y = saved.y;
         g.globalAlpha = 1;
+      } else {
+        g.strokeStyle = '#ff7d7d'; g.lineWidth = 3.4;
+        g.beginPath();
+        g.moveTo(c.x - 12, c.y - 12); g.lineTo(c.x + 12, c.y + 12);
+        g.moveTo(c.x + 12, c.y - 12); g.lineTo(c.x - 12, c.y + 12);
+        g.stroke();
+      }
+      return;
+    }
+    // duplicate armed: a "stamp" of the source tower (with its current upgrades) follows
+    // the cursor — ghost + range preview, exactly like an about-to-be-built tower.
+    if (this.dupArmed) {
+      const d = this.dupArmed;
+      const idx = this.cellAt(this.mx, this.my);
+      if (idx < 0) return;
+      const ok = this.cellFree(idx) && this.credits >= d.cost;
+      const c = this.cells[idx];
+      const ghost = new Tower(d.spec, c.x, c.y);
+      ghost.col = c.col; ghost.row = c.row;
+      ghost.stage = d.stage; ghost.branch = d.branch; ghost.branchStage = d.branchStage;
+      this.drawRangeTiles(g, c.col, c.row, ghost.rangeT(), ok ? this.palTower(d.spec.id)[0] : '#ff7d7d', 0.14);
+      if (ok) {
+        this.shadow(g, c.x, c.y, (d.spec.size + 6) * this.k);
+        this.drawTower(g, ghost, true);
       } else {
         g.strokeStyle = '#ff7d7d'; g.lineWidth = 3.4;
         g.beginPath();

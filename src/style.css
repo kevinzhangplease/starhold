@@ -114,7 +114,9 @@ body.perf-mode .overlay-dim { background: rgba(10, 11, 24, 0.94); }
   .lv-mod, .lv-ch { font-size: 15px; }
   .meta-node { min-height: 44px; }
   .wp-item, .wp-mut, .wp-threat { min-height: 32px; }
-  #hud-vitals { top: calc(72px + env(safe-area-inset-top)); }
+  /* row 1 is taller on touch (56px icon buttons) — row 2 and the boss bar shift down to clear it */
+  #wave-row { top: calc(74px + env(safe-area-inset-top)); }
+  #boss-bar { top: calc(128px + env(safe-area-inset-top)); }
 
   /* tower panel + build menu become bottom/centered sheets on touch — easier to reach
      one-handed than a popup pinned beside a tower near the screen edge. */
@@ -140,6 +142,14 @@ h1, h2, h3, .display { font-family: 'Fredoka', 'Nunito', sans-serif; }
 button { font-family: inherit; color: inherit; border: none; background: none; cursor: pointer; }
 button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter); outline-offset: 2px; }
 
+/* Keyboard-shortcut badge — tiny "[X]" text, used everywhere a button has a key binding. */
+.hk { font-size: 9px; font-weight: 800; opacity: 0.55; letter-spacing: 0.2px; white-space: nowrap; }
+.icon-btn { position: relative; }
+.icon-btn .hk {
+  position: absolute; right: 3px; bottom: 2px;
+  font-size: 8px; opacity: 0.6; pointer-events: none;
+}
+
 /* ============ Generic panel & button ============ */
 .panel {
   background: var(--space-1);
@@ -147,6 +157,19 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
   border-radius: var(--radius);
   box-shadow: var(--shadow-soft);
 }
+
+/* Uniform top-right close button for every popup/panel window (build menu, tower details,
+   settings, dev panel, codex screens, ...). The panel it sits in must be position:relative
+   or position:absolute for the absolute placement below to anchor correctly. */
+.popup-close {
+  position: absolute; top: 8px; right: 8px; z-index: 6;
+  width: 26px; height: 26px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--space-2); border: 1px solid var(--line);
+  color: var(--ink-dim); font-size: 13px; font-weight: 700;
+  transition: background 0.12s, color 0.12s, transform 0.12s;
+}
+.popup-close:hover { background: var(--danger); color: #3a0d0d; transform: scale(1.08); }
 .btn {
   font-family: 'Fredoka', sans-serif;
   font-weight: 600; font-size: 16px;
@@ -174,9 +197,13 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 14px;
   padding: 12px 0;
-  overflow: hidden;
+  overflow-y: auto; overflow-x: hidden;
   animation: screen-in 0.35s ease both;
 }
+/* As a whole-game rule, nothing (incl. screens with more content than fits at once) should
+   be clipped away and unreachable — scroll rather than hide. */
+.screen::-webkit-scrollbar { width: 8px; }
+.screen::-webkit-scrollbar-thumb { background: var(--space-3); border-radius: 4px; }
 @keyframes screen-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
 
 .title-logo { text-align: center; }
@@ -188,7 +215,20 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 }
 .title-logo .tag { color: var(--ink-dim); font-size: 17px; margin-top: 10px; letter-spacing: 0.5px; }
 
-.zone-row { display: flex; gap: 16px; }
+/* Level select: header stays put, everything below it is one scroll region (Phase UI
+   polish) — the level list no longer reliably fits in a fixed screen height as the
+   campaign grows, and content must scroll into view rather than clip off-screen. */
+.screen.level-select-screen { justify-content: flex-start; }
+.level-select-body {
+  width: 100%; flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  overflow-y: auto; overflow-x: hidden;
+  padding: 4px 8px 16px;
+}
+.level-select-body::-webkit-scrollbar { width: 8px; }
+.level-select-body::-webkit-scrollbar-thumb { background: var(--space-3); border-radius: 4px; }
+
+.zone-row { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; }
 .zone-col { display: flex; flex-direction: column; gap: 7px; align-items: stretch; }
 .zone-name { font-family: 'Fredoka'; font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; text-align: center; padding-bottom: 1px; }
 
@@ -231,18 +271,25 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 .meta-node.owned .m-cost { color: var(--mint); }
 
 /* ============ In-game HUD ============ */
-/* Vitals zone (Phase 6.1) — top-left, stacked just below the #hud-left icon-button row so the
-   two never compete for the same pixels. Player-state only: hull, credits, leak ledger, combo. */
-#hud-vitals {
-  position: absolute; top: calc(58px + env(safe-area-inset-top)); left: calc(14px + env(safe-area-inset-left));
-  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
-  padding: 8px 12px; max-width: 300px;
+/* Row 1: #hud-top-row spans the full width above the playing field — #hud-left (sector menu,
+   play/pause, speed, autolaunch, dev, settings) on the left, #hud-vitals (hull pips + hull
+   number + money + wave, all one line) on the right. Row 2 (#wave-row, below) is the
+   next-wave forecast, centered. Nothing here overlaps the playing field or the early-launch
+   button, which now lives at the bottom-middle of the screen (#wave-call-bottom). */
+#hud-top-row {
+  position: absolute; top: calc(12px + env(safe-area-inset-top));
+  left: calc(14px + env(safe-area-inset-left)); right: calc(14px + env(safe-area-inset-right));
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
 }
-.vitals-row { display: flex; gap: 10px; align-items: center; }
+#hud-vitals {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 12px; max-width: 640px; flex-wrap: nowrap; overflow-x: auto;
+}
 .hud-stat {
   display: flex; align-items: center; gap: 7px;
   font-family: 'Fredoka'; font-size: 19px; font-weight: 600;
   padding: 4px 12px; border-radius: 999px; background: rgba(20,21,42,0.65);
+  white-space: nowrap;
 }
 .hud-stat .ico { font-size: 17px; }
 .hud-stat.credits { color: var(--butter); }
@@ -254,9 +301,11 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 .interest-preview { font-size: 13px; font-weight: 800; color: rgba(255,243,176,0.65); margin-left: 2px; }
 .interest-preview:empty { display: none; }
 
-/* Hull pip bar (Phase 6.2) — one pip per hull point, wraps to a 2nd row above 24. */
-#hull-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.hull-pips { display: flex; flex-wrap: wrap; gap: 2px; max-width: 224px; }
+/* Hull pip bar (Phase 6.2) — one pip per hull point; inline in row 1, doesn't wrap (row 1 is
+   the "one line" the whole game HUD hangs off of), scrolls with the rest of #hud-vitals on
+   the rare build with a huge hull pool instead of pushing a 2nd row. */
+#hull-bar { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.hull-pips { display: flex; flex-wrap: nowrap; gap: 2px; }
 .hull-pip {
   width: 7px; height: 14px; border-radius: 2px;
   background: rgba(20,21,42,0.75); border: 1px solid rgba(238,240,255,0.12);
@@ -273,7 +322,13 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 }
 .hull-label { font-family: 'Fredoka'; font-size: 13px; font-weight: 700; color: var(--ink-dim); white-space: nowrap; }
 
-/* Leak ledger (Phase 6.3) — hidden until the first leak this run. */
+/* Secondary read-outs (leak ledger, kill combo) — non-essential chrome, so they hang just
+   under row 1's right edge rather than crowding its single line. */
+#hud-subvitals {
+  position: absolute; top: calc(56px + env(safe-area-inset-top)); right: calc(14px + env(safe-area-inset-right));
+  display: flex; flex-direction: column; align-items: flex-end; gap: 4px;
+  z-index: 3;
+}
 .leak-ledger { display: flex; gap: 6px; align-items: center; }
 .leak-ledger:empty { display: none; }
 .ledger-item {
@@ -296,9 +351,9 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 #combo-hud.pulse { animation: combo-pulse 0.28s ease; }
 @keyframes combo-pulse { 35% { transform: scale(1.32); } }
 
-/* boss health bar — top-center under the stat pills */
+/* boss health bar — top-center, below both HUD rows */
 #boss-bar {
-  position: absolute; top: 58px; left: 50%; transform: translateX(-50%);
+  position: absolute; top: calc(112px + env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
   width: 430px; display: none; flex-direction: column; gap: 3px; align-items: center;
   pointer-events: none;
 }
@@ -362,16 +417,7 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
   50% { box-shadow: 0 4px 0 rgba(5,6,18,0.5), 0 0 20px rgba(255,243,176,0.8); }
 }
 
-/* Phase 5.6: the forecast pill's content width grew (shape/mutator chip + flier badge +
-   possibly an injected 4th enemy type + the Brutal "SIGNAL JAMMED" placeholder), which could
-   already overlap the centered credits/lives/wave cluster during an intermission (when the
-   Launch-wave button also shares this row) even before this phase, just less often — wrapping
-   the forecast onto its own line fixes both. */
-#hud-right {
-  position: absolute; top: calc(12px + env(safe-area-inset-top)); right: calc(14px + env(safe-area-inset-right));
-  display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 8px; max-width: 680px;
-}
-#hud-left { position: absolute; top: calc(12px + env(safe-area-inset-top)); left: calc(14px + env(safe-area-inset-left)); display: flex; gap: 8px; }
+#hud-left { display: flex; gap: 8px; flex-shrink: 0; }
 .icon-btn {
   width: 42px; height: 42px; border-radius: 12px;
   background: var(--space-1); border: 1px solid var(--line);
@@ -390,6 +436,7 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
   animation: panel-in 0.16s ease both;
+  max-height: 600px; overflow-y: auto; overflow-x: hidden;
 }
 .bm-title { font-family: 'Fredoka'; font-size: 15px; font-weight: 600; margin-bottom: 8px; letter-spacing: 0.5px; }
 .bm-cell-chip {
@@ -410,6 +457,10 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 .bm-item canvas { width: 34px; height: 34px; }
 .bm-item .bm-name { font-size: 10px; font-weight: 800; }
 .bm-item .bm-cost { font-family: 'Fredoka'; font-size: 11px; color: var(--butter); }
+.bm-item .bm-hotkey {
+  position: absolute; top: 3px; left: 4px;
+  color: var(--ink-dim); opacity: 0.75;
+}
 .bm-item.poor, .bm-item:disabled { opacity: 0.38; cursor: default; }
 .bm-item.cell-favored { animation: cell-favored-pulse 1.6s ease-in-out infinite; }
 @keyframes cell-favored-pulse {
@@ -600,13 +651,17 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 .seg-chip:hover { background: var(--space-3); }
 .seg-chip.on { background: var(--mint); color: #123326; }
 
+/* Row 2 of the HUD: the upcoming-wave forecast, centered below row 1 */
+#wave-row {
+  position: absolute; top: calc(58px + env(safe-area-inset-top)); left: 14px; right: 14px;
+  display: flex; justify-content: center; pointer-events: none;
+}
 /* upcoming-wave preview — matches the credits/lives/wave stat pills in size, shape, and font */
 #wave-preview {
   display: flex; align-items: center; gap: 8px; flex-wrap: nowrap;
   max-width: 660px; overflow-x: auto; overflow-y: hidden;
   font-family: 'Fredoka'; font-size: 19px; font-weight: 600;
   padding: 4px 12px; border-radius: 999px;
-  margin-top: 8px;
   background: rgba(20,21,42,0.65);
   pointer-events: none;
 }
@@ -646,14 +701,18 @@ button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--butter
 .lv-mod { font-size: 13px; margin-right: 1px; cursor: help; }
 
 /* upgrade tech tree */
-.tech-tree { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+/* 6 columns so the two general upgrades (Mk II/III, "wide") can sit side by side at 3
+   columns each, while the 3 branch nodes per row keep their existing 1/3-width look at
+   2 columns each — instead of every stage stacking one on top of the other. */
+.tech-tree { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
+.tree-node.branch { grid-column: span 2; }
 .tree-node {
   display: flex; flex-direction: column; gap: 3px; text-align: left;
   padding: 7px 8px; border-radius: 10px;
   background: var(--space-2); border: 1px solid var(--line); color: var(--ink);
   transition: background 0.12s, transform 0.12s;
 }
-.tree-node.wide { grid-column: span 3; }
+.tree-node.wide { grid-column: span 3; } /* Mk II / Mk III — side by side, half-width each */
 .tree-node .tn-head { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; }
 .tree-node .tn-name { font-family: 'Fredoka'; font-size: 11.5px; font-weight: 600; line-height: 1.15; }
 .tree-node .tn-cost { font-family: 'Fredoka'; font-size: 11.5px; color: var(--butter); white-space: nowrap; }
@@ -734,7 +793,19 @@ body.perf-mode #cell-tip { backdrop-filter: none; -webkit-backdrop-filter: none;
   max-height: 620px; overflow-y: auto; overflow-x: hidden;
 }
 @keyframes panel-in { from { opacity: 0; transform: scale(0.94); } to { opacity: 1; transform: none; } }
-#side-panel h3 { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+#side-panel h3 { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 8px; margin-top: 28px; }
+/* Duplicate button — top-right, left of the close X */
+.dup-btn {
+  position: absolute; top: 8px; right: 40px; z-index: 6;
+  display: flex; align-items: center; gap: 4px;
+  font-family: 'Fredoka'; font-size: 11px; font-weight: 700;
+  padding: 5px 10px; border-radius: 8px;
+  background: var(--space-2); border: 1px solid var(--line); color: var(--ink-dim);
+  transition: background 0.12s, color 0.12s;
+}
+.dup-btn b { color: var(--butter); font-weight: 800; }
+.dup-btn:hover:not(:disabled) { background: var(--space-3); color: var(--ink); }
+.dup-btn:disabled { opacity: 0.4; cursor: default; }
 #side-panel .sp-lvl { font-size: 12px; color: var(--ink-dim); font-weight: 700; }
 #side-panel .sp-desc { font-size: 13px; color: var(--ink-dim); line-height: 1.4; }
 #side-panel .sp-warn { font-size: 12px; font-weight: 700; color: var(--danger); margin-top: 2px; }
@@ -834,13 +905,19 @@ body.perf-mode #cell-tip { backdrop-filter: none; -webkit-backdrop-filter: none;
 .place-confirm .result-row { display: flex; gap: 8px; width: 100%; }
 .place-confirm .result-row > button { flex: 1; }
 
-/* wave call button — inline in the top-right bar */
-#wave-call {
-  display: flex; align-items: center; gap: 8px;
+/* Early-launch reward + button — bottom-middle of the screen (moved off the top HUD, where
+   it used to collide with the next-wave forecast pill). Sits above the transient bottom-
+   center toast/hint row so the two never stack on top of each other. */
+#wave-call-bottom {
+  position: absolute; bottom: calc(78px + env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 16px 8px 18px; border-radius: 999px;
+  background: rgba(20,21,42,0.78); border: 1px solid var(--line); box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
 }
-#wave-call .bonus { font-size: 12px; color: var(--butter); font-weight: 800; white-space: nowrap; }
-#wave-call:empty { display: none; }
-#wave-call .btn { padding: 8px 18px; font-size: 14px; }
+#wave-call-bottom .bonus { font-size: 12px; color: var(--butter); font-weight: 800; white-space: nowrap; }
+#wave-call-bottom:empty { display: none; }
+#wave-call-bottom .btn { padding: 8px 18px; font-size: 14px; }
 
 /* banners */
 .banner {
@@ -975,7 +1052,7 @@ body.perf-mode #cell-tip { backdrop-filter: none; -webkit-backdrop-filter: none;
 .screen .warmaster-tag { text-align: center; margin-top: 4px; }
 
 /* settings + pause */
-.modal-card { width: 380px; padding: 24px; display: flex; flex-direction: column; gap: 14px; max-height: 660px; overflow-y: auto; overflow-x: hidden; }
+.modal-card { position: relative; width: 380px; padding: 24px; display: flex; flex-direction: column; gap: 14px; max-height: 660px; overflow-y: auto; overflow-x: hidden; }
 .modal-card h2 { font-size: 28px; font-weight: 600; text-align: center; }
 .set-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 15px; font-weight: 700; }
 .set-row input[type="range"] { width: 150px; accent-color: var(--mint); }
@@ -1024,8 +1101,10 @@ body.perf-mode #cell-tip { backdrop-filter: none; -webkit-backdrop-filter: none;
   font-family: 'Fredoka'; font-size: 13px; font-weight: 600; letter-spacing: 1px;
   text-transform: uppercase; color: var(--ink-dim); border-bottom: 1px solid var(--line); padding-bottom: 3px;
 }
-.briefing-roster { display: flex; flex-wrap: wrap; gap: 8px; }
-.briefing-enemy { width: 48px; height: 48px; border-radius: 10px; background: var(--space-1); border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; }
+/* Alien Roster — same row layout as the alien codex (see .codex-row/.codex-mini/.codex-info) */
+.briefing-roster { display: flex; flex-direction: column; gap: 8px; max-height: 260px; overflow-y: auto; padding-right: 4px; }
+.briefing-roster::-webkit-scrollbar { width: 8px; }
+.briefing-roster::-webkit-scrollbar-thumb { background: var(--space-3); border-radius: 4px; }
 .briefing-enemy.new { border-color: var(--butter); box-shadow: 0 0 0 1px var(--butter); }
 .briefing-note { font-size: 12.5px; color: var(--ink-dim); }
 .briefing-challenges { display: flex; flex-wrap: wrap; gap: 10px; }

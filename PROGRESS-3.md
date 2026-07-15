@@ -1405,3 +1405,98 @@ serialized state).
 ### Ship
 This is the final phase of the Starhold 3.0 plan. Per the repo deploy override (CLAUDE.md), all
 9 phases are merged to `main` and pushed live to `https://starhold.vercel.app/` as they complete.
+
+---
+
+## Post-3.0 — UI/UX polish pass [COMPLETE]
+Started: 2026-07-15 · Finished: 2026-07-15
+
+An ad-hoc pass fixing a punch list of 15 UI issues reported after 3.0 shipped, not tied to
+`PLAN-3.md`. No new systems, no tuning changes — layout, input, and legibility fixes only.
+
+### Shipped
+1. **Level select overflows the screen** — the level list no longer reliably fits one fixed
+   screen height (15 levels + Endless + Daily). Header stays put; everything below it
+   (`.level-select-body`) is now its own scroll region.
+2. **Global "nothing extends beyond the screen" rule** — `.screen` (every full-page screen:
+   level select, meta upgrades, service record, briefing, codex) now scrolls (`overflow-y:
+   auto`) instead of clipping. `.build-menu` got a `max-height`/`overflow-y` safety net to
+   match `.modal-card`/`#side-panel`, which already had one.
+3. **Cell modifier emblems hard to see** — boosted alpha/line-width on ridge/sinkhole/conduit/
+   anchor/nullcell terrain in `drawTiles()`. New `Game.drawCellModRing()`, called after tower
+   bodies, redraws a slim colored ring just outside a built tower's opaque pad — previously the
+   pad (drawn on top) erased the emblem entirely once a tower was built there.
+4. **Close (X) buttons** on every popup/panel window: settings, sound settings, all 4 codex
+   screens, dev modal, build menu, tower details/upgrade panel, plus the nested restart-confirm
+   dialog. Shared `closeBtn()` helper in ui.ts, `.popup-close` CSS. (Decision dialogs with no
+   neutral "just close" action — confirm-quit, win/lose results, build/move confirm, the title
+   resume prompt — intentionally excluded.)
+5. **Click-outside on build-menu/side-panel was also activating the cell underneath** —
+   `handleMapTap()` now checks whether either popup is open first; a tap that doesn't land on a
+   tower/alien just closes them, full stop, instead of falling through into cell/tower logic.
+6. **Early-launch button overlapping the next-wave forecast** — moved off the top HUD entirely
+   to a new `#wave-call-bottom`, bottom-middle of the screen, positioned above the transient
+   toast/hint row so the two never stack.
+7. **Tower upgrade tree stacked vertically** — `.tech-tree` grid widened to 6 columns; Mk II/
+   Mk III (`.wide`) now span 3 columns each (side by side) instead of the full row each;
+   branch nodes span 2 columns each (unchanged 3-per-row look).
+8. **Amp description didn't reflect the Anchor-cell buff-doubling** — new `ampAwareDesc()`
+   rewrites every percentage an Amp's stage/branch desc quotes (damage/rate/crit — buffRange is
+   always phrased as a flat "+N tile", never touched) to `effective% (base%)` when built on an
+   Anchor cell, e.g. "Increases damage bonus to 50% (25%)." Off Anchor, the text is untouched.
+9. **Marching chevron arrows on the path felt distracting** — replaced with a single subtle
+   sliding round-dot dashed line (`setLineDash([0.1, gap])` + animated `lineDashOffset`) drawn
+   once per path instead of per-cell triangles.
+10. **Rich Vein cells had no hover text** — they're tracked via `Cell.vein` (a level-modifier
+    flag), not `Cell.special`, so `updateCellTip()`/the long-press pin only ever checked
+    `.special`. Now synthesizes the same `{icon,name,blurb}` shape from `MODIFIER_INFO['rich-
+    veins']` when `.special` is null but `.vein` is set.
+11. **Duplicate-tower button** — top-right of the tower details panel, priced at `t.spent`
+    (current total investment: base cost + every upgrade still active, already net of
+    refunds). Click closes the panel and arms `Game.dupArmed` — a one-click "stamp" placement
+    mode (like the ability-cast flow, not the build/move flow's separate confirm step) showing
+    a ghost + range preview following the cursor; `tryDuplicateAt()` builds a copy with the
+    same stage/branch/branchStage and charges the displayed price.
+12. **Keyboard shortcuts** added throughout, all visible as tiny `[X]` badges (`.hk` CSS
+    class) rather than hover-only: tower hotkeys 1-0 (already present as `TowerSpec.hotkey`,
+    just never wired up — now drives both the build-menu badges and the keydown handler),
+    Space = confirm Build/Move, Escape = cancel/close-topmost-modal, P = pause (Space's old
+    role), plus M/T/A/O for the sector-menu/speed/autolaunch/settings icons, L = Launch wave,
+    N = NOVA, Q/W = Orbital/Stasis (pre-existing, now labeled), and D/G/C/X/I/U for
+    Duplicate/Move/Overcharge/Sell/Details/next-upgrade on the tower panel. A settings/dev/
+    codex overlay being open now inerts every one of these (checked via `.overlay-dim`
+    presence) so a hotkey never reaches back through a modal to the game underneath it.
+13. **Sector-screen roster** — retitled "Alien Roster"; fixed a real image bug (`drawMiniEnemy`
+    hardcodes a scale/translate assuming a 96×96 canvas backing buffer, but the roster tile
+    used 48×48 — the mismatch pushed almost the entire drawing off-canvas, leaving only a
+    corner visible). Roster rows now reuse the alien codex's exact layout (`.codex-row`/
+    `.codex-mini`/`.codex-info`) — 96×96 canvas, description always inline, no hover needed.
+14. **HUD overlapping the playing field** — restructured into two explicit rows above the
+    field: row 1 is `#hud-left` (sector menu, play/pause, speed, autolaunch, dev, settings) on
+    the left and `#hud-vitals` (hull pips + hull number + money + wave, one line) on the right;
+    row 2 (`#wave-row`) is the next-wave forecast, centered. `#boss-bar` shifted down to clear
+    both rows.
+15. **Double-clicking a tower to overcharge opened its panel and could auto-pause** — the
+    existing double-tap-within-350ms overcharge gesture always let the *first* tap's normal
+    select/open-panel logic run before the second tap resolved as overcharge. `handleMapTap()`
+    now defers the select/open-panel action behind a 350ms timer *only* when
+    `g.canOvercharge(t)` is true for that tap (i.e. only when a following double-tap could
+    plausibly mean something) — a resolving double-tap cancels that timer outright, so the
+    panel never flashes open and `syncBuildPause()` never sees it and auto-pauses.
+
+### Verification
+All 5 gates green: `tsc --noEmit`, `validate.ts`, the full 19-file test suite, the standard
+build, and the singlefile build. Headless smoke (real Chromium): level select, briefing/roster,
+in-game HUD, build menu + hotkeys, build confirm, tower details + upgrade tree, duplicate
+placement, click-outside-closes-only, double-click-doesn't-open-panel, and the settings modal
+open/Escape-close — all zero console errors. The Amp anchor-bonus description rewrite was also
+checked directly against the exact example in the request ("Increases damage bonus to 50%
+(25%).") and against multi-percentage branch descriptions (Hyperclock, Oracle Array).
+
+### Known issues
+None blocking. No `RESUME_VERSION` change (no new serialized state — `dupArmed` is transient
+UI-only state, never persisted).
+
+### Ship
+Per the repo deploy override (CLAUDE.md), merged to `main` and pushed live to
+`https://starhold.vercel.app/`.

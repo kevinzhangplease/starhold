@@ -15,6 +15,15 @@ const el = (tag: string, cls = '', html = ''): HTMLElement => {
   return e;
 };
 
+// Every popup/panel window gets the same top-right close affordance — one place to keep
+// the click behavior (and the [Esc] hint) consistent across build/upgrade/settings/dev/codex.
+const closeBtn = (onClose: () => void): HTMLButtonElement => {
+  const b = el('button', 'popup-close', '✕') as HTMLButtonElement;
+  b.title = 'Close [Esc]';
+  b.onclick = (ev) => { ev.stopPropagation(); audio.ui('click'); onClose(); };
+  return b;
+};
+
 // ================= Notification choreographer =================
 // Single funnel for ALL transient on-screen text so popups never fight each other.
 // Tiers: critical (boss/meteor warnings) interrupt and preempt; medium (wave/mutator/zone
@@ -215,6 +224,7 @@ export class UI {
   private pinnedCellIdx: number | null = null;   // long-press-shown special-cell tooltip, persists till lift
   private lastTapTower: Tower | null = null;     // Overcharge (Phase 4.5): double-tap-on-a-tower activation
   private lastTapAt = 0;
+  private pendingSelectTimer: number | null = null;   // deferred tower-select, cancelled by a resolving double-tap
 
   constructor() {
     this.root = document.getElementById('ui-root')!;
@@ -275,15 +285,60 @@ export class UI {
     this.canvas.addEventListener('contextmenu', ev => ev.preventDefault());
 
     window.addEventListener('keydown', ev => {
+      // never hijack typing in an actual form control (e.g. the volume slider)
+      const tag = (ev.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+
       if (ev.ctrlKey && ev.shiftKey && ev.code === 'KeyD') {
         this.showDevModal();
         return;
       }
+      if (ev.code === 'Escape') {
+        if (this.closeTopModal()) return;
+        if (this.game) this.cancelAll();
+        return;
+      }
+      // A settings/dev/codex overlay is open — every other shortcut below acts on the game
+      // underneath it, so none of them should fire until that overlay is closed.
+      if (this.anyModalOpen()) return;
       if (!this.game || this.game.state !== 'playing') return;
-      if (ev.code === 'Escape') this.cancelAll();
-      if (ev.code === 'Space') { ev.preventDefault(); this.togglePause(); }
-      if (ev.code === 'KeyQ') this.armAbility('orbital');
-      if (ev.code === 'KeyW') this.armAbility('stasis');
+      const g = this.game;
+
+      // build-menu tower hotkeys: 1-0, matching each TowerSpec's own `hotkey` field
+      const menu = document.getElementById('build-menu');
+      if (menu && /^[0-9]$/.test(ev.key)) {
+        const item = menu.querySelector(`[data-hotkey="${ev.key}"]`) as HTMLButtonElement | null;
+        if (item && !item.disabled) { ev.preventDefault(); item.click(); }
+        return;
+      }
+      // Build/Move confirm — Space confirms whichever is showing
+      const confirm = document.getElementById('place-confirm');
+      if (confirm) {
+        if (ev.code === 'Space') {
+          ev.preventDefault();
+          (confirm.querySelector('.btn.primary') as HTMLButtonElement | null)?.click();
+        }
+        return;
+      }
+      if (ev.code === 'KeyP') { ev.preventDefault(); this.togglePause(); return; }
+      if (ev.code === 'KeyQ') { this.armAbility('orbital'); return; }
+      if (ev.code === 'KeyW') { this.armAbility('stasis'); return; }
+      if (ev.code === 'KeyN') { (this.hudRefs.nova as HTMLButtonElement | undefined)?.click(); return; }
+      if (ev.code === 'KeyM') { (this.hudRefs.menuBtn as HTMLButtonElement | undefined)?.click(); return; }
+      if (ev.code === 'KeyT') { (this.hudRefs.speedBtn as HTMLButtonElement | undefined)?.click(); return; }
+      if (ev.code === 'KeyA') { (this.hudRefs.autoBtn as HTMLButtonElement | undefined)?.click(); return; }
+      if (ev.code === 'KeyO') { (this.hudRefs.settingsBtn as HTMLButtonElement | undefined)?.click(); return; }
+      if (ev.code === 'KeyL') { (this.hudRefs.callBtn as HTMLButtonElement | undefined)?.click(); return; }
+      // side panel (tower selected): Duplicate/Move/Overcharge/Sell/Details/next-upgrade
+      const panel = document.getElementById('side-panel');
+      if (panel) {
+        if (ev.code === 'KeyD') { (panel.querySelector('.dup-btn') as HTMLButtonElement | null)?.click(); return; }
+        if (ev.code === 'KeyG') { (panel.querySelector('.move-btn') as HTMLButtonElement | null)?.click(); return; }
+        if (ev.code === 'KeyC') { (panel.querySelector('.oc-btn') as HTMLButtonElement | null)?.click(); return; }
+        if (ev.code === 'KeyX') { (panel.querySelector('.sell-btn') as HTMLButtonElement | null)?.click(); return; }
+        if (ev.code === 'KeyI') { (panel.querySelector('.details-toggle') as HTMLButtonElement | null)?.click(); return; }
+        if (ev.code === 'KeyU') { (panel.querySelector('.next-upg-btn') as HTMLButtonElement | null)?.click(); return; }
+      }
     });
 
     document.addEventListener('pointerdown', () => audio.ensure(), { once: true });
@@ -329,6 +384,13 @@ export class UI {
     if (g.pendingBuild || g.pendingMove) return;
     if (g.armed) { g.castAt(p.x, p.y); this.refreshAbilities(); return; }
 
+    // duplicate tower armed: this tap places the stamped copy (or denies on an invalid cell)
+    if (g.dupArmed) {
+      const idx = g.cellAt(p.x, p.y);
+      if (g.tryDuplicateAt(idx)) { audio.ui('click'); this.renderSidePanel(); }
+      return;
+    }
+
     // supply crates are transient — tapping one always wins
     if (g.tryCollectDrop(p.x, p.y)) return;
 
@@ -340,6 +402,20 @@ export class UI {
       return;
     }
 
+    // If the build-tower or tower-details popup is open, a tap that doesn't land directly on
+    // a tower or alien is a dismiss gesture — it should only close the popup, never *also*
+    // build on / focus whatever empty cell happened to be underneath the dismiss click.
+    if (document.getElementById('build-menu') || document.getElementById('side-panel')) {
+      const hitTower = g.towerAt(p.x, p.y);
+      const hitEnemy = hitTower ? null : g.enemyAt(p.x, p.y);
+      if (!hitTower && !hitEnemy) {
+        this.closeBuildMenu();
+        g.selected = null;
+        this.closeSidePanel();
+        return;
+      }
+    }
+
     this.closeBuildMenu();
     const t = g.towerAt(p.x, p.y);
     if (t) {
@@ -348,10 +424,26 @@ export class UI {
       const now = performance.now();
       const isDoubleTap = this.lastTapTower === t && now - this.lastTapAt < 350;
       this.lastTapTower = t; this.lastTapAt = now;
-      if (isDoubleTap && g.canOvercharge(t)) {
-        g.activateOvercharge(t);
+      if (this.pendingSelectTimer !== null) { clearTimeout(this.pendingSelectTimer); this.pendingSelectTimer = null; }
+      if (isDoubleTap) {
         this.lastTapTower = null; // consume, so a third tap doesn't re-trigger immediately
-        this.renderSidePanel();
+        if (g.canOvercharge(t)) {
+          g.activateOvercharge(t);
+          if (g.selected === t) this.renderSidePanel(); // refresh an already-open panel; never open a new one
+        } else audio.ui('deny');
+        return;
+      }
+      if (g.canOvercharge(t)) {
+        // Defer selecting/opening the tower panel briefly — if a second tap follows inside
+        // the window above, it resolves as Overcharge instead, so the panel never flashes
+        // open (and never auto-pauses via syncBuildPause) for a gesture that was really a
+        // double-click.
+        this.pendingSelectTimer = window.setTimeout(() => {
+          this.pendingSelectTimer = null;
+          g.selected = t;
+          this.renderSidePanel();
+        }, 350);
+        audio.ui('click');
         return;
       }
       g.selected = t;
@@ -387,7 +479,7 @@ export class UI {
     // long-press on a special cell (empty or occupied) pins its tooltip — a tap still
     // builds normally on an empty one, since tap is a wholly separate gesture from long-press.
     const idx = g.cellAt(p.x, p.y);
-    if (idx >= 0 && g.cells[idx].special) { this.pinnedCellIdx = idx; g.buzz([12]); return; }
+    if (idx >= 0 && (g.cells[idx].special || g.cells[idx].vein)) { this.pinnedCellIdx = idx; g.buzz([12]); return; }
   }
 
   private clearLongPressTimer() {
@@ -444,8 +536,30 @@ export class UI {
     return starsEarned(this.save) - starsSpent(this.save, Object.fromEntries(META.map(m => [m.id, m.cost]))) - doctrineCost;
   }
 
+  // Keyboard shortcuts (Escape especially) need to know whether a full-screen overlay
+  // (settings/dev/codex/confirm-quit/...) is currently on top, so game hotkeys underneath
+  // it stay inert until it's closed.
+  private anyModalOpen(): boolean { return !!this.root.querySelector('.overlay-dim'); }
+  // Closes the topmost (last-appended, i.e. innermost-nested) overlay by clicking its own
+  // close-X — reusing that button's existing cleanup (restoring pause state, etc.) rather
+  // than just ripping the dim out of the DOM. Returns whether anything was closed.
+  private closeTopModal(): boolean {
+    const dims = this.root.querySelectorAll('.overlay-dim');
+    if (!dims.length) return false;
+    const top = dims[dims.length - 1] as HTMLElement;
+    // Only overlays with their own close-X (settings/dev/codex/restart-confirm/...) respond
+    // to Escape here — confirmQuit and the win/lose results screen are decision dialogs with
+    // no neutral "just close" action, so Escape falls through to cancelAll() instead, which
+    // is harmless while one of those is showing.
+    const btn = top.querySelector('.popup-close') as HTMLButtonElement | null;
+    if (!btn) return false;
+    btn.click();
+    return true;
+  }
+
   cancelAll() {
     if (!this.game) return;
+    if (this.pendingSelectTimer !== null) { clearTimeout(this.pendingSelectTimer); this.pendingSelectTimer = null; }
     this.game.cancel();
     this.closeBuildMenu();
     this.closeSidePanel();
@@ -533,7 +647,7 @@ export class UI {
   showLevelSelect() {
     this.killGame();
     this.clearUI();
-    const sc = el('div', 'screen');
+    const sc = el('div', 'screen level-select-screen');
     const head = el('div', 'screen-head');
     const back = el('button', 'btn subtle', '← Title');
     back.onclick = () => { audio.ui('click'); this.showTitle(); };
@@ -551,6 +665,10 @@ export class UI {
     guideB.onclick = () => { audio.ui('click'); this.showGameCodex(); };
     head.append(back, h, bank, metaBtn, guideB, setBtn, recB, devB);
     sc.append(head);
+    // Everything below the header scrolls as one region — with the campaign now spanning
+    // 15 levels + Endless + Daily Op, the full list no longer reliably fits in one fixed
+    // screen height, so it must scroll rather than clip.
+    const body = el('div', 'level-select-body');
 
     if (this.save.ascension.unlocked > 0) {
       const ascRow = el('div', 'asc-row');
@@ -572,7 +690,7 @@ export class UI {
         };
         ascRow.append(b);
       }
-      sc.append(ascRow);
+      body.append(ascRow);
     }
 
     const row = el('div', 'zone-row');
@@ -665,7 +783,8 @@ export class UI {
       dCard.append(el('div', 'lv-num', '☀'), el('div', 'lv-name', 'Daily Op — beat any level to unlock'));
     }
 
-    sc.append(row, eCard, dCard);
+    body.append(row, eCard, dCard);
+    sc.append(body);
     this.root.append(sc);
     this.renderDevPanel();
   }
@@ -755,6 +874,8 @@ export class UI {
   showSettings(inGame = false) {
     const dim = el('div', 'overlay-dim');
     const card = el('div', 'panel modal-card');
+    const finishSettings = () => { dim.remove(); if (inGame && this.game) { this.game.paused = this.wasPaused; this.syncBuildPause(); } };
+    card.append(closeBtn(finishSettings));
     card.append(el('h2', '', 'Settings'));
     const s = this.save.settings;
 
@@ -767,6 +888,7 @@ export class UI {
       g.paused = true;
       const cdim = el('div', 'overlay-dim');
       const ccard = el('div', 'panel modal-card');
+      ccard.append(closeBtn(() => { g.paused = wasPaused; cdim.remove(); }));
       ccard.append(el('h2', '', 'Restart this level?'));
       ccard.append(el('div', 'tiny-note', 'This setting needs to regenerate the level. Progress in this level will be lost.'));
       const row = el('div', 'result-row');
@@ -928,7 +1050,7 @@ export class UI {
     card.append(guideRow);
 
     const close = el('button', 'btn primary', 'Done');
-    close.onclick = () => { audio.ui('click'); dim.remove(); if (inGame && this.game) { this.game.paused = this.wasPaused; this.syncBuildPause(); } };
+    close.onclick = () => { audio.ui('click'); finishSettings(); };
     card.append(close);
     dim.append(card);
     this.root.append(dim);
@@ -938,6 +1060,7 @@ export class UI {
   showSoundSettings(parentDim: HTMLElement) {
     const dim = el('div', 'overlay-dim');
     const card = el('div', 'panel modal-card');
+    card.append(closeBtn(() => dim.remove()));
     card.append(el('h2', '', 'Sound settings'));
     const s = this.save.settings;
 
@@ -979,6 +1102,7 @@ export class UI {
   showCodex(parentDim: HTMLElement) {
     const dim = el('div', 'overlay-dim');
     const card = el('div', 'panel modal-card codex-card');
+    card.append(closeBtn(() => dim.remove()));
     card.append(el('h2', '', 'Alien codex'));
     const list = el('div', 'codex-list');
     for (const spec of Object.values(ENEMIES)) {
@@ -1019,6 +1143,7 @@ export class UI {
   showTowerCodex(parentDim: HTMLElement) {
     const dim = el('div', 'overlay-dim');
     const card = el('div', 'panel modal-card codex-card');
+    card.append(closeBtn(() => dim.remove()));
     card.append(el('h2', '', 'Tower codex'));
     const list = el('div', 'codex-list');
     for (const spec of TOWERS) {
@@ -1071,6 +1196,7 @@ export class UI {
   showMapCodex(parentDim?: HTMLElement) {
     const dim = el('div', 'overlay-dim');
     const card = el('div', 'panel modal-card codex-card');
+    card.append(closeBtn(() => dim.remove()));
     card.append(el('h2', '', 'Map guide'));
     card.append(el('div', 'guide-lead', "What every cell and overlay on the battlefield means."));
     const list = el('div', 'codex-list');
@@ -1121,6 +1247,7 @@ export class UI {
   showGameCodex(parentDim?: HTMLElement) {
     const dim = el('div', 'overlay-dim');
     const card = el('div', 'panel modal-card codex-card guide-card');
+    card.append(closeBtn(() => dim.remove()));
     card.append(el('h2', '', 'How to play'));
     card.append(el('div', 'guide-lead', "Everything in Starhold, explained — from your first tower to what's waiting after you beat the campaign."));
     const mapLinkRow = el('div', 'result-row');
@@ -1354,22 +1481,32 @@ export class UI {
     if (level.tagline && !endless) identity.append(el('div', 'briefing-structural', level.tagline));
     body.append(identity);
 
-    // ---- roster strip ----
+    // ---- Alien Roster — same row layout as the alien codex (icon + inline description,
+    // no hover-only text) so the enemies you're about to face read at a glance. ----
     if (!endless) {
       const enemyIds = [...levelEnemyIds(level)].filter(id => ENEMIES[id]);
       if (enemyIds.length) {
         const rosterWrap = el('div', 'briefing-section');
-        rosterWrap.append(el('div', 'briefing-h', 'Roster'));
+        rosterWrap.append(el('div', 'briefing-h', 'Alien Roster'));
         const roster = el('div', 'briefing-roster');
         for (const id of enemyIds) {
           const spec = ENEMIES[id];
-          const tile = el('div', `briefing-enemy${level.newEnemy?.id === id ? ' new' : ''}`);
+          const isNew = level.newEnemy?.id === id;
+          const row = el('div', `codex-row briefing-enemy${isNew ? ' new' : ''}`);
           const mini = document.createElement('canvas');
-          mini.width = 48; mini.height = 48;
+          // Must match the alien codex's 96×96 buffer — drawMiniEnemy() hardcodes a
+          // scale(2,2)+translate(24,24) that assumes a 96×96 canvas; a smaller buffer here
+          // (the old bug) put that center far outside the canvas, leaving only a sliver visible.
+          mini.width = 96; mini.height = 96;
+          mini.className = 'codex-mini';
           this.drawMiniEnemy(mini, spec);
-          tile.append(mini);
-          tile.title = level.newEnemy?.id === id ? `${spec.name} — ${level.newEnemy.hint}` : spec.name;
-          roster.append(tile);
+          const info = el('div', 'codex-info');
+          info.append(
+            el('div', 'codex-name', spec.name),
+            el('div', 'codex-desc', isNew ? `${spec.desc} ${level.newEnemy!.hint}` : spec.desc),
+          );
+          row.append(mini, info);
+          roster.append(row);
         }
         rosterWrap.append(roster);
         if ((this.save.settings.difficulty ?? 2) >= 3 && !daily) rosterWrap.append(el('div', 'briefing-note', '+? extra enemy type on Hard and above.'));
@@ -1687,36 +1824,76 @@ export class UI {
   }
 
   killGame() {
+    if (this.pendingSelectTimer !== null) { clearTimeout(this.pendingSelectTimer); this.pendingSelectTimer = null; }
     this.mergeRunStats();
     if (this.game) { this.game.destroy(); this.game = null; }
   }
 
   // ============================================================
-  // HUD ZONE SYSTEM (Phase 6.1) — every top-level HUD element belongs to exactly one fixed
-  // screen zone, and nothing negotiates position at runtime (the old combo-vs-boss-bar
-  // collision this replaced is documented in PROGRESS-3.md). Zones:
-  //   #hud-vitals  (top-left)     — hull bar, credits (+interest), leak ledger, combo. Player-
-  //                                 state only; this is "am I about to die?" at a glance.
-  //   #boss-bar    (top-center)   — boss health/shield. THREAT only — critical banners and
-  //                                 meteor/ion warnings render via the existing .banner/toast
-  //                                 system, which already sits below this row (see Decisions).
-  //   #hud-right   (top-right)    — wave forecast (+threat readout chip), speed, Launch-wave
-  //                                 button, settings gear. Unchanged position (plan's own
-  //                                 "Do NOT move it" instruction).
+  // HUD ZONE SYSTEM — every top-level HUD element belongs to exactly one fixed screen zone,
+  // and nothing negotiates position at runtime. Above the playing field there are now two
+  // fixed rows:
+  //   Row 1 (#hud-top-row)  — left half #hud-left (sector menu, play/pause, speed, autolaunch,
+  //                           dev mode, settings); right half #hud-vitals, ALL of hull pips +
+  //                           hull number + money + wave count on one line.
+  //   Row 2 (#wave-row)     — centered next-wave forecast pill.
+  // #boss-bar sits below both rows, top-center, hidden until a boss is alive.
+  // The early-launch reward + button used to live in the top-right row (where it collided
+  // with the next-wave forecast pill) — it now lives at the bottom-middle of the screen
+  // (#wave-call-bottom), well clear of both HUD rows.
   //   #ability-stack (bottom-left)— abilities, NOVA, Overcharge pips. Player verbs only.
   //   .note-toast  (bottom-center)— low-tier guidance toasts. Unchanged.
   //   #side-panel / #build-menu   — tower panel / build menu (bottom sheet on mobile). Unchanged.
-  // #hud-left (the ☰⏸ speed ⏩ ⚑ row) is system chrome, not player-state — kept at its existing
-  // muscle-memory spot, with vitals stacking just below it rather than competing for the exact
-  // same pixels.
   // ============================================================
   buildHud() {
     const g = this.game!;
+
+    const topRow = el('div', '');
+    topRow.id = 'hud-top-row';
+
+    const left = el('div', '');
+    left.id = 'hud-left';
+    const menu = el('button', 'icon-btn', '☰<span class="hk">M</span>');
+    menu.title = 'Back to sector select [M]';
+    menu.onclick = () => { audio.ui('click'); this.confirmQuit(); };
+    this.hudRefs.menuBtn = menu;
+    const pause = el('button', 'icon-btn', '⏸<span class="hk">P</span>');
+    pause.title = 'Pause/Resume [P]';
+    pause.onclick = () => this.togglePause();
+    this.hudRefs.pause = pause;
+    const speed = el('button', 'icon-btn', `${g.speed}×<span class="hk">T</span>`);
+    speed.title = 'Game speed [T]';
+    speed.classList.toggle('active', g.speed > 1);
+    speed.onclick = () => {
+      audio.ui('click');
+      g.speed = g.speed === 1 ? 2 : g.speed === 2 ? 3 : 1;
+      speed.innerHTML = `${g.speed}×<span class="hk">T</span>`;
+      speed.classList.toggle('active', g.speed > 1);
+      this.save.lastSpeed = g.speed;
+      this.persist();
+    };
+    this.hudRefs.speedBtn = speed;
+    const auto = el('button', 'icon-btn', '⏩<span class="hk">A</span>');
+    auto.title = 'Auto-launch each wave the instant the last one clears — no early-call bonus, since there is no decision to reward. [A]';
+    auto.onclick = () => {
+      audio.ui('click');
+      g.autoWave = !g.autoWave;
+      auto.classList.toggle('active', g.autoWave);
+      if (g.autoWave && !g.waveActive) g.callWave(true, true);
+    };
+    this.hudRefs.autoBtn = auto;
+    const devBtn = el('button', 'icon-btn', '⚑');
+    devBtn.title = 'Developer Mode [Ctrl+Shift+D]';
+    devBtn.onclick = () => { audio.ui('click'); this.showDevModal(); };
+    const set = el('button', 'icon-btn', '⚙<span class="hk">O</span>');
+    set.title = 'Settings [O]';
+    set.onclick = () => { audio.ui('click'); this.showSettings(true); };
+    this.hudRefs.settingsBtn = set;
+    left.append(menu, pause, speed, auto, devBtn, set);
+
+    // Row 1 right half: hull pips + hull number + money + wave, all one line (Phase UI polish).
     const vitals = el('div', 'panel');
     vitals.id = 'hud-vitals';
-
-    // Hull pip bar (Phase 6.2) — one pip per hull point (maxLives tops out at 30, per the
-    // baseHp(20)+Hull-Plating(10) ceiling), wrapping to a second row above 24.
     const hullBar = el('div', '');
     hullBar.id = 'hull-bar';
     const pips = el('div', 'hull-pips');
@@ -1728,81 +1905,51 @@ export class UI {
 
     const credits = el('div', 'hud-stat credits', `<span class="ico">◆</span><span class="v"></span><span class="interest-preview"></span>`);
     const wave = el('div', 'hud-stat wave', `<span class="ico">≋</span><span class="v"></span>`);
-    const statRow = el('div', 'vitals-row');
-    statRow.append(credits, wave);
     this.hudRefs.credits = credits.querySelector('.v') as HTMLElement;
     this.hudRefs.interestPreview = credits.querySelector('.interest-preview') as HTMLElement;
     this.hudRefs.wave = wave.querySelector('.v') as HTMLElement;
     this.hudRefs.creditsWrap = credits;
+    vitals.append(hullBar, credits, wave);
 
-    // Leak ledger (Phase 6.3) — hidden (via :empty) until the first leak populates it.
+    topRow.append(left, vitals);
+    this.root.append(topRow);
+
+    // secondary read-outs (leak ledger, kill combo) — non-essential chrome, tucked just
+    // under the row-1 vitals cluster rather than crowding its single line.
+    const subVitals = el('div', '');
+    subVitals.id = 'hud-subvitals';
     const ledger = el('div', 'leak-ledger');
     this.hudRefs.leakLedger = ledger;
-
     const combo = el('div', '');
     combo.id = 'combo-hud';
     this.hudRefs.combo = combo;
+    subVitals.append(ledger, combo);
+    this.root.append(subVitals);
 
-    vitals.append(hullBar, statRow, ledger, combo);
-    this.root.append(vitals);
-
-    const left = el('div', '');
-    left.id = 'hud-left';
-    const menu = el('button', 'icon-btn', '☰');
-    menu.title = 'Back to sector select';
-    menu.onclick = () => { audio.ui('click'); this.confirmQuit(); };
-    const pause = el('button', 'icon-btn', '⏸');
-    pause.title = 'Pause (Space) — you can still build while paused';
-    pause.onclick = () => this.togglePause();
-    this.hudRefs.pause = pause;
-    const speed = el('button', 'icon-btn', `${g.speed}×`);
-    speed.title = 'Game speed';
-    speed.classList.toggle('active', g.speed > 1);
-    speed.onclick = () => {
-      audio.ui('click');
-      g.speed = g.speed === 1 ? 2 : g.speed === 2 ? 3 : 1;
-      speed.textContent = `${g.speed}×`;
-      speed.classList.toggle('active', g.speed > 1);
-      this.save.lastSpeed = g.speed;
-      this.persist();
-    };
-    const auto = el('button', 'icon-btn', '⏩');
-    auto.title = 'Auto-launch each wave the instant the last one clears — no early-call bonus, since there is no decision to reward.';
-    auto.onclick = () => {
-      audio.ui('click');
-      g.autoWave = !g.autoWave;
-      auto.classList.toggle('active', g.autoWave);
-      if (g.autoWave && !g.waveActive) g.callWave(true, true);
-    };
-    const devBtn = el('button', 'icon-btn', '⚑');
-    devBtn.title = 'Developer Mode';
-    devBtn.onclick = () => { audio.ui('click'); this.showDevModal(); };
-    left.append(menu, pause, speed, auto, devBtn);
-
-    const right = el('div', '');
-    right.id = 'hud-right';
+    // Row 2: the next-wave forecast pill, centered.
+    const waveRow = el('div', '');
+    waveRow.id = 'wave-row';
     const preview = el('div', 'wave-preview');
     preview.id = 'wave-preview';
-    const call = el('div', '');
-    call.id = 'wave-call';
-    const bonus = el('div', 'bonus', '');
-    const btn = el('button', 'btn primary', 'Launch wave');
-    btn.onclick = () => { audio.ui('click'); g.callWave(true); this.updateHud(); };
-    call.append(bonus, btn);
-    this.hudRefs.callWrap = call;
-    this.hudRefs.callBonus = bonus;
-    this.hudRefs.callBtn = btn;
     this.hudRefs.wavePreview = preview;
     this.lastPreviewKey = '';
-    const set = el('button', 'icon-btn', '⚙');
-    set.onclick = () => { audio.ui('click'); this.showSettings(true); };
-    // Order matters for wrapping (Phase 5.6): the settings gear and Launch-wave button are
-    // fixed-width and always belong on the top line; the forecast pill is the variable-width
-    // one, so it goes last — when the row runs out of room it wraps onto its own line below,
-    // rather than bumping the gear/launch button around unpredictably.
-    right.append(call, set, preview);
+    waveRow.append(preview);
+    this.root.append(waveRow);
 
-    // boss health bar — top-center, hidden until a boss is alive
+    // Early-launch reward + button — bottom-middle of the screen (used to collide with the
+    // next-wave forecast pill above when both shared the top-right corner).
+    const callBottom = el('div', '');
+    callBottom.id = 'wave-call-bottom';
+    const bonus = el('div', 'bonus', '');
+    const btn = el('button', 'btn primary', 'Launch wave <span class="hk">[L]</span>');
+    btn.onclick = () => { audio.ui('click'); g.callWave(true); this.updateHud(); };
+    callBottom.append(bonus, btn);
+    this.hudRefs.callWrap = callBottom;
+    this.hudRefs.callBonus = bonus;
+    this.hudRefs.callBtn = btn;
+    this.root.append(callBottom);
+
+    // boss health bar — top-center, below both HUD rows, hidden until a boss is alive
     const bossBar = el('div', '');
     bossBar.id = 'boss-bar';
     bossBar.innerHTML = `<div class="bb-name"></div><div class="bb-track"><div class="bb-shield"></div><div class="bb-fill"></div><div class="bb-tick"></div></div>`;
@@ -1816,8 +1963,8 @@ export class UI {
     if (isUnlocked('nova')) {
       const nova = el('button', 'nova-btn');
       nova.id = 'nova-btn';
-      nova.innerHTML = `<div class="nova-fill"></div><span class="nova-label">☀ NOVA</span>`;
-      nova.title = 'NOVA — charged by kills. Tears 30% of the health from everything on screen (8% from bosses) and stuns the survivors.';
+      nova.innerHTML = `<div class="nova-fill"></div><span class="nova-label">☀ NOVA <span class="hk">[N]</span></span>`;
+      nova.title = 'NOVA [N] — charged by kills. Tears 30% of the health from everything on screen (8% from bosses) and stuns the survivors.';
       nova.onclick = () => {
         if (g.startNova()) { audio.ui('click'); this.notify.low('NOVA CHARGING — brace!'); }
         else audio.ui('deny');
@@ -1835,9 +1982,10 @@ export class UI {
       const ab = ABILITIES[key];
       const has = key === 'orbital' ? g.hasOrbital : g.hasStasis;
       if (!has && !this.devMode) continue;
+      const key2 = key === 'orbital' ? 'Q' : 'W';
       const btn = el('button', 'ability-btn');
-      btn.innerHTML = `<span class="a-ico">${ab.ico}</span><span class="a-name">${ab.name}</span><div class="cd-mask" style="height:0"></div><div class="cd-num"></div>`;
-      btn.title = `${ab.name} (${key === 'orbital' ? 'Q' : 'W'}) — click, then click the map`;
+      btn.innerHTML = `<span class="a-ico">${ab.ico}</span><span class="a-name">${ab.name} <span class="hk">[${key2}]</span></span><div class="cd-mask" style="height:0"></div><div class="cd-num"></div>`;
+      btn.title = `${ab.name} [${key2}] — click, then click the map`;
       btn.onclick = () => this.armAbility(key);
       abil.append(btn);
       this.abilityBtns[key] = btn;
@@ -1858,7 +2006,7 @@ export class UI {
     hint.id = 'build-hint';
     setTimeout(() => hint.remove(), 9000);
 
-    this.root.append(left, right, abil, hint);
+    this.root.append(abil, hint);
     this.repositionPopups();
   }
 
@@ -1936,6 +2084,7 @@ export class UI {
 
     const menu = el('div', 'panel build-menu');
     menu.id = 'build-menu';
+    menu.append(closeBtn(() => this.closeBuildMenu()));
     menu.append(el('div', 'bm-title', 'Build'));
     const cellInfo = c.special ? CELL_TYPES[c.special] : null;
     if (cellInfo) menu.append(el('div', 'bm-cell-chip', `${cellInfo.icon} ${cellInfo.name}`));
@@ -1948,10 +2097,11 @@ export class UI {
       const poor = g.credits < cost;
       const favored = cellInfo?.bestFor.includes(spec.id);
       const item = el('button', `bm-item${poor ? ' poor' : ''}${favored ? ' cell-favored' : ''}`) as HTMLButtonElement;
+      item.dataset.hotkey = spec.hotkey;
       const mini = document.createElement('canvas');
       mini.width = 68; mini.height = 68;
       this.drawMiniTower(mini, spec);
-      item.append(mini, el('span', 'bm-name', spec.name), el('span', 'bm-cost', `◆ ${cost}`));
+      item.append(mini, el('span', 'bm-name', spec.name), el('span', 'bm-cost', `◆ ${cost}`), el('span', 'bm-hotkey hk', `[${spec.hotkey}]`));
       // Role chips (Phase 6.6): a compact "what does this tower do" tag pair.
       const rc = roleChips(spec);
       if (rc.air || rc.role) {
@@ -1968,7 +2118,7 @@ export class UI {
         }
         item.append(chipRow);
       }
-      item.title = spec.blurb;
+      item.title = `${spec.blurb} [${spec.hotkey}]`;
       item.disabled = poor;
       item.onmouseenter = () => { g.menuHover = spec; };
       item.onmouseleave = () => { if (g.menuHover === spec) g.menuHover = null; };
@@ -2013,7 +2163,7 @@ export class UI {
     box.append(el('div', 'pc-title', `Build ${spec.name}?`));
     box.append(el('div', 'pc-cost', `◆ ${cost}`));
     const row = el('div', 'result-row');
-    const cancel = el('button', 'btn', 'Cancel');
+    const cancel = el('button', 'btn', 'Cancel <span class="hk">[Esc]</span>');
     cancel.onclick = () => {
       audio.ui('click');
       g.cancelBuild();
@@ -2021,7 +2171,7 @@ export class UI {
       this.syncBuildPause();
     };
     const isFirstBuild = !this.save.seen['guide_confirm'];
-    const confirm = el('button', 'btn primary', 'Build');
+    const confirm = el('button', 'btn primary', 'Build <span class="hk">[Space]</span>');
     confirm.onclick = () => {
       audio.ui('click');
       g.confirmBuild();
@@ -2053,7 +2203,7 @@ export class UI {
     box.id = 'place-confirm';
     box.append(el('div', 'pc-title', `Move ${pm.tower.displayName}?`));
     const row = el('div', 'result-row');
-    const cancel = el('button', 'btn', 'Cancel');
+    const cancel = el('button', 'btn', 'Cancel <span class="hk">[Esc]</span>');
     cancel.onclick = () => {
       audio.ui('click');
       const t = pm.tower;
@@ -2062,7 +2212,7 @@ export class UI {
       box.remove();
       this.renderSidePanel();
     };
-    const confirm = el('button', 'btn primary', 'Move');
+    const confirm = el('button', 'btn primary', 'Move <span class="hk">[Space]</span>');
     confirm.onclick = () => {
       audio.ui('click');
       g.confirmMove();
@@ -2202,7 +2352,8 @@ export class UI {
     // preview above, since both are "recompute a live label from game.now" jobs.
     if (this.hudRefs.sellBtn && this.sellPanelTower) {
       const txt = this.sellLabel(this.sellPanelTower);
-      if (this.hudRefs.sellBtn.textContent !== txt) this.hudRefs.sellBtn.textContent = txt;
+      const span = this.hudRefs.sellBtn.querySelector('.sb-text');
+      if (span && span.textContent !== txt) span.textContent = txt;
     }
     // Counter highlighting (Phase 6.6): pulses the build-menu tile(s) that counter the worst
     // enemy currently on screen (highest remaining HP — bosses dominate naturally). Throttled
@@ -2335,7 +2486,7 @@ export class UI {
       const frac = Math.min(E.earlyCallCap, g.interT * E.earlyCallPerSec);
       const bonus = Math.round(g.pendingWaveBounty() * frac);
       this.hudRefs.callBonus.textContent = bonus > 0 ? `+${bonus} ◆ (+${Math.round(frac * 100)}%) if launched now` : '';
-      this.hudRefs.callBtn.textContent = `Launch wave (${secs}s)`;
+      this.hudRefs.callBtn.innerHTML = `Launch wave (${secs}s) <span class="hk">[L]</span>`;
     }
     // Overcharge pips: filled = charge available, empty = spent this wave.
     if (this.hudRefs.ocPips && g.overchargeLeft !== L.overcharge) {
@@ -2542,12 +2693,18 @@ export class UI {
   updateCellTip() {
     const g = this.game;
     let tip = document.getElementById('cell-tip');
-    if (this.pinnedCellIdx !== null && (!g || !g.cells[this.pinnedCellIdx]?.special)) this.pinnedCellIdx = null;
+    const tippable = (c?: { special: string | null; vein: boolean } | null) => !!c && (!!c.special || c.vein);
+    if (this.pinnedCellIdx !== null && (!g || !tippable(g.cells[this.pinnedCellIdx]))) this.pinnedCellIdx = null;
     const idx = this.pinnedCellIdx !== null ? this.pinnedCellIdx
       : (g && g.state === 'playing' && !g.moveArmed && !g.pendingMove && !g.pendingBuild && !g.enemyAt(g.mx, g.my) ? g.cellAt(g.mx, g.my) : -1);
-    const cell = g && idx >= 0 ? g.cells[idx] : null;
-    if (!cell || !cell.special) { tip?.remove(); return; }
-    const info = CELL_TYPES[cell.special];
+    const cellOrNull = g && idx >= 0 ? g.cells[idx] : null;
+    if (!tippable(cellOrNull)) { tip?.remove(); return; }
+    const cell = cellOrNull!;
+    // Rich Vein cells aren't a CELL_TYPES entry (they're a level-wide modifier, not a
+    // per-cell special type) — synthesize the same {icon,name,blurb,bestFor} shape from
+    // MODIFIER_INFO so they get an identical tooltip instead of none at all.
+    const info = cell.special ? CELL_TYPES[cell.special]
+      : { icon: MODIFIER_INFO['rich-veins'].icon, name: 'Rich Vein', blurb: MODIFIER_INFO['rich-veins'].blurb, bestFor: [] as string[] };
     if (!tip) {
       tip = el('div', 'panel');
       tip.id = 'cell-tip';
@@ -2661,6 +2818,25 @@ export class UI {
     return null;
   }
 
+  // Amp's stage/branch desc strings are static in data.ts and quote its BASE buff percentages
+  // (e.g. "Increases the damage bonus to 25%.") — but an Amp built on an Anchor cell doubles
+  // every buff it grants (TUNING.cells.anchor.ampMul), so the text alone reads as wrong once
+  // that bonus is live. Rewrites each percentage the desc quotes (damage/rate/crit — buffRange
+  // is always phrased as a flat "+N tile", never a %, so it's untouched) to "effective% (base%)".
+  private ampAwareDesc(t: Tower, desc: string): string {
+    if (t.spec.kind !== 'amp' || t.cellType !== 'anchor') return desc;
+    const mul = TUNING.cells.anchor.ampMul;
+    const raw: any = t.raw;
+    let out = desc;
+    for (const base of [raw.buffDmg, raw.buffRate, raw.crit]) {
+      if (!base) continue;
+      const basePct = Math.round(base * 100);
+      const effPct = Math.round(base * mul * 100);
+      out = out.replace(new RegExp(`(?<!\\d)${basePct}%`), `${effPct}% (${basePct}%)`);
+    }
+    return out;
+  }
+
   renderSidePanel() {
     this.closeSidePanel();
     const g = this.game;
@@ -2674,8 +2850,22 @@ export class UI {
     const base = t.baseStats(g);
 
     // ---------- Tier 1: always visible, zero-scroll target ----------
+    panel.append(closeBtn(() => this.closeSidePanel()));
+    // Duplicate: stamps a copy of this tower (same stage/branch/upgrades) priced at its full
+    // current investment (t.spent — base cost + every upgrade still active), then arms
+    // placement — closes this panel and shows a ghost + range preview following the cursor
+    // until the player taps a free cell (see Game.armDuplicate/tryDuplicateAt).
+    const dupBtn = el('button', 'dup-btn', `⧉ Duplicate <b>◆${t.spent}</b> <span class="hk">[D]</span>`) as HTMLButtonElement;
+    dupBtn.title = 'Duplicate this tower with its current upgrades, then place the copy [D]';
+    dupBtn.disabled = g.credits < t.spent;
+    dupBtn.onclick = () => {
+      audio.ui('click');
+      g.armDuplicate(t);
+      this.closeSidePanel();
+    };
+    panel.append(dupBtn);
     panel.append(el('h3', '', `<span style="color:${g.palTower(t.spec.id)[0]}">●</span> ${t.displayName}`));
-    panel.append(el('div', 'sp-desc', s.desc));
+    panel.append(el('div', 'sp-desc', this.ampAwareDesc(t, s.desc)));
     if (!!t.raw.groundOnly && t.pathCellsInRange === 0) {
       panel.append(el('div', 'sp-warn', "⚠ Can't reach the road from here."));
     }
@@ -2709,14 +2899,14 @@ export class UI {
     const next = t.spec.kind === 'amp' ? null : this.nextUpgradeInfo(g, t);
     if (next === 'choose') {
       const btn = el('button', 'next-upg-btn specialize') as HTMLButtonElement;
-      btn.innerHTML = `<span class="nu-name">Specialize ▾</span><span class="nu-sub">Choose a branch in Details</span>`;
+      btn.innerHTML = `<span class="nu-name">Specialize ▾</span><span class="nu-sub">Choose a branch in Details</span><span class="hk">[U]</span>`;
       btn.onclick = () => { this.detailsExpanded = true; this.renderSidePanel(); };
       panel.append(btn);
     } else if (next) {
       const btn = el('button', `next-upg-btn${next.afford ? '' : ' poor'}`) as HTMLButtonElement;
       btn.disabled = !next.afford;
-      btn.title = next.afford ? '' : 'Not enough credits yet.';
-      btn.innerHTML = `<span class="nu-name">↑ ${next.label}</span><span class="nu-cost">◆ ${next.cost}</span>`;
+      btn.title = next.afford ? '[U]' : 'Not enough credits yet. [U]';
+      btn.innerHTML = `<span class="nu-name">↑ ${next.label}</span><span class="nu-cost">◆ ${next.cost}</span><span class="hk">[U]</span>`;
       btn.onclick = next.onclick;
       panel.append(btn);
     }
@@ -2750,7 +2940,7 @@ export class UI {
 
     // Action row: Move / Overcharge / Sell folded into one row (Phase 6.5).
     const actionRow = el('div', 'panel-actions');
-    const move = el('button', 'move-btn', 'Move');
+    const move = el('button', 'move-btn', 'Move <span class="hk">[G]</span>');
     move.onclick = () => {
       audio.ui('click');
       g.armMove(t);
@@ -2762,7 +2952,7 @@ export class UI {
     if (isUnlocked('overcharge') && t.spec.kind !== 'amp') {
       const active = g.now < t.overchargedUntil;
       const oc = el('button', `oc-btn${active ? ' active' : ''}`,
-        active ? '⚡ Charged!' : `⚡ Overcharge (${g.overchargeLeft})`) as HTMLButtonElement;
+        (active ? '⚡ Charged!' : `⚡ Overcharge (${g.overchargeLeft})`) + ' <span class="hk">[C]</span>') as HTMLButtonElement;
       oc.disabled = !g.canOvercharge(t);
       oc.title = active ? 'Already overcharged.'
         : !g.waveActive ? 'Only usable while a wave is active.'
@@ -2771,7 +2961,8 @@ export class UI {
       oc.onclick = () => { g.activateOvercharge(t); this.renderSidePanel(); };
       actionRow.append(oc);
     }
-    const sell = el('button', 'sell-btn', this.sellLabel(t));
+    const sell = el('button', 'sell-btn') as HTMLButtonElement;
+    sell.innerHTML = `<span class="sb-text">${this.sellLabel(t)}</span><span class="hk">[X]</span>`;
     if (t.perk) sell.title = 'Selling forfeits this tower\'s veteran perk — it cannot be recovered.';
     sell.onclick = () => { g.sell(t); this.closeSidePanel(); };
     actionRow.append(sell);
@@ -2780,7 +2971,7 @@ export class UI {
     this.sellPanelTower = t;
 
     // ---------- Tier 2: "Details ▾" — full stats, targeting, tech tree, lifetime stats ----------
-    const detailsToggle = el('button', 'details-toggle', this.detailsExpanded ? 'Details ▴' : 'Details ▾') as HTMLButtonElement;
+    const detailsToggle = el('button', 'details-toggle', (this.detailsExpanded ? 'Details ▴' : 'Details ▾') + ' <span class="hk">[I]</span>') as HTMLButtonElement;
     detailsToggle.onclick = () => { this.detailsExpanded = !this.detailsExpanded; this.renderSidePanel(); };
     panel.append(detailsToggle);
 
@@ -2910,7 +3101,7 @@ export class UI {
       const cost = g.upgradeCost(nd.st);
       const afford = g.credits >= cost;
       const unavailable = nd.state === 'locked' || (nd.state === 'avail' && !afford);
-      const cls = `tree-node ${nd.state}${nd.state === 'avail' && !afford ? ' poor' : ''}${nd.wide ? ' wide' : ''}`;
+      const cls = `tree-node ${nd.state}${nd.state === 'avail' && !afford ? ' poor' : ''}${nd.wide ? ' wide' : ' branch'}`;
       const node = el('button', cls) as HTMLButtonElement;
       node.dataset.name = nd.st.name;
       const statBits: string[] = [];
@@ -3260,6 +3451,7 @@ export class UI {
     dim.id = 'dev-modal-dim';
     const card = el('div', 'panel modal-card dev-modal');
     const active = this.devMode;
+    card.append(closeBtn(() => { dim.remove(); if (g) g.paused = wasPaused; }));
     card.append(el('h2', '', `⚑ Developer mode`));
     card.append(el('div', 'tiny-note', active ? 'Active — cheats enabled and all levels open.' : 'Inactive — activate below to enable the tools.'));
 
