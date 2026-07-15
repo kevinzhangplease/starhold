@@ -1500,3 +1500,64 @@ UI-only state, never persisted).
 ### Ship
 Per the repo deploy override (CLAUDE.md), merged to `main` and pushed live to
 `https://starhold.vercel.app/`.
+
+---
+
+## Post-3.0 — UI/UX polish pass 2 [COMPLETE]
+Started: 2026-07-15 · Finished: 2026-07-15
+
+A follow-up round of 4 issues reported after the first UI polish pass shipped.
+
+### Shipped
+1. **Amp had no quick-upgrade button** — `renderSidePanel()` was hard-excluding Amp from the
+   headline best-next-upgrade button (`t.spec.kind === 'amp' ? null : this.nextUpgradeInfo(...)`
+   ), left over from excluding it from the *DPS* row (Amp has none) and the Overcharge button
+   (Amp has no rate/damage to double) — neither reason applies to upgrading, since Amp's
+   stages/branches use the exact same `buyUpgrade()`/cost path as every other tower. Removed
+   the exclusion; the DPS-row and Overcharge exclusions (which ARE correct) are untouched.
+2. **Ridge cell emblem still too subtle** even after the first pass's contrast boost — the
+   "lifted face" lighting read as "a slightly brighter tile," not specifically *ridge*, next to
+   sinkhole/anchor/conduit which all have an actual distinct shape. Added a two-peak
+   mountain-with-snowcap glyph (matches `CELL_TYPES.ridge`'s "⛰" icon) in a warm peach accent —
+   a deliberate one-off break from the "palette-neutral, never a new hue" terrain rule recorded
+   in 3.0, since a genuinely new, unambiguous shape was what visibility actually needed.
+3. **Briefing (level-launch) screen redesigned to need no scrolling**: body widened from a
+   900px column to ~1180px (uses the 1280-wide canvas instead of sitting in a narrow strip),
+   gaps tightened throughout. Alien Roster is now a 3-column grid (was a single stacked
+   column with its own internal scroll region — removed now that it doesn't need one). The
+   draft picker is a single 10-wide row (was 5-wide/2-row) with thinner tiles (28px icons,
+   8px names, role chips hidden — still in the tooltip) instead of the in-game build-menu's
+   full-size tiles. Verified against the actual worst case (L15: 3 modifiers + 5 cell-type
+   chips + 9-enemy roster + 2 challenges + full 10-tower draft + doctrine row) — fits with a
+   few px to spare at 1280×800, vs. mildly overflowing before the last round of gap trims.
+4. **Level-select cards redesigned as wide horizontal rows instead of tall stacked tiles** —
+   number on the left, name + stars on one line, an optional tagline line, and every badge
+   (modifiers, cell types, challenges, bring-hint, ascension crown) clustered into a single
+   wrapping row beneath — rather than each getting its own stacked line. Zone columns widened
+   160px → 400px (three columns + Endless/Daily now render at a consistent ~1232px width).
+   Confirmed via `scrollHeight`/`clientHeight` equality (no overflow) with every level at 3
+   stars and every challenge/cell/modifier badge showing (a fully "loaded" save, the worst
+   case for vertical space) — previously this was only verified with an early, sparse save.
+
+### Verification
+All 5 gates green: `tsc --noEmit`, `validate.ts`, the full 19-file test suite, the standard
+build, and the singlefile build. Headless smoke (real Chromium): confirmed via
+`scrollHeight === clientHeight` (no overflow, not just "looks OK in one screenshot") for the
+level-select screen and for the briefing screen at both a sparse (L1) and maximally "loaded"
+(L15, full progression + full stars + full challenge/cell data) state; screenshotted the Amp
+panel's new upgrade button, the ridge glyph zoomed in next to a live tooltip confirming cell
+identity, and the L15 briefing layout — zero console errors throughout. (The dev panel's
+"Unlock all levels"/"Grant 45 stars" cheats were found, in the course of this testing, to not
+refresh the module-level `isUnlocked()` cache — a pre-existing gap unrelated to this pass, not
+fixed here since it wasn't in scope and didn't affect any real player-facing path; the
+maximal-content verification instead seeded `localStorage` directly and reloaded, which goes
+through the normal `setUnlockedLevel()` path.)
+
+### Known issues
+None blocking from this pass. Noted-but-out-of-scope: the dev-modal unlock cheats not
+refreshing `isUnlocked()`'s module-level cache (see above) — a developer-tool-only gap, not a
+player-facing bug. No `RESUME_VERSION` change (no new serialized state).
+
+### Ship
+Per the repo deploy override (CLAUDE.md), merged to `main` and pushed live to
+`https://starhold.vercel.app/`.

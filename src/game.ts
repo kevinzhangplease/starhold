@@ -3592,6 +3592,27 @@ export class Game {
         g.strokeStyle = 'rgba(255,255,255,0.45)';
         g.lineWidth = 2.2;
         g.beginPath(); g.moveTo(c.x - s / 2 + rad, c.y - s / 2 - 2); g.lineTo(c.x + s / 2 - rad, c.y - s / 2 - 2); g.stroke();
+        // Mountain-peak glyph (matches CELL_TYPES.ridge's "⛰" icon): the raised-face lighting
+        // alone still read as "just a brighter tile," not specifically a ridge — an actual
+        // silhouette is unambiguous regardless of what's nearby, at a small deliberate break
+        // from the "never a new hue" rule below (a warm peach the game doesn't otherwise use
+        // for terrain, chosen so it can't be confused with any tower/enemy color on the board).
+        const my = c.y + s * 0.06;
+        g.fillStyle = 'rgba(20,21,42,0.4)';
+        g.beginPath();
+        g.moveTo(c.x - s * 0.32, my + s * 0.2); g.lineTo(c.x - s * 0.1, my - s * 0.24); g.lineTo(c.x + s * 0.1, my + s * 0.06);
+        g.lineTo(c.x + s * 0.2, my - s * 0.14); g.lineTo(c.x + s * 0.34, my + s * 0.2); g.closePath(); g.fill();
+        g.fillStyle = 'rgba(255,211,182,0.92)';
+        g.beginPath();
+        g.moveTo(c.x - s * 0.3, my + s * 0.18); g.lineTo(c.x - s * 0.1, my - s * 0.26); g.lineTo(c.x + s * 0.1, my + s * 0.04);
+        g.closePath(); g.fill();
+        g.beginPath();
+        g.moveTo(c.x + s * 0.02, my + s * 0.18); g.lineTo(c.x + s * 0.2, my - s * 0.16); g.lineTo(c.x + s * 0.34, my + s * 0.18);
+        g.closePath(); g.fill();
+        // snow-cap tips
+        g.fillStyle = 'rgba(255,255,255,0.95)';
+        g.beginPath(); g.moveTo(c.x - s * 0.16, my - s * 0.11); g.lineTo(c.x - s * 0.1, my - s * 0.26); g.lineTo(c.x - s * 0.04, my - s * 0.11); g.closePath(); g.fill();
+        g.beginPath(); g.moveTo(c.x + s * 0.13, my - s * 0.03); g.lineTo(c.x + s * 0.2, my - s * 0.16); g.lineTo(c.x + s * 0.27, my - s * 0.03); g.closePath(); g.fill();
       } else if (c.special === 'sinkhole') {
         // inset face: darker fill, inner shadow on the top edge, faint downward-triangle glyph.
         g.fillStyle = 'rgba(4,5,14,0.34)';

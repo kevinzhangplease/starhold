@@ -693,95 +693,111 @@ export class UI {
       body.append(ascRow);
     }
 
+    // Level cards (UI polish pass): wide horizontal rows instead of tall stacked tiles — the
+    // number, name/tagline, and stars sit in one line, with every optional badge (modifiers,
+    // cells, challenges, bring-hint, crown) clustered to the right, so 5 levels per zone fit
+    // in a fraction of the vertical space the old vertical-stack card needed.
+    const ZONE_COL_W = 400;
     const row = el('div', 'zone-row');
     for (let z = 0; z < 3; z++) {
       const col = el('div', 'zone-col');
+      col.style.width = `${ZONE_COL_W}px`;
       col.append(el('div', 'zone-name', ZONES[z].name));
       for (const lv of LEVELS.filter(l => l.zone === z)) {
         const locked = lv.id > this.save.unlocked && !this.devMode;
         const stars = this.save.stars[lv.id] || 0;
-        const card = el('div', `level-card${locked ? ' locked' : ''}`);
-        const modIcons = (lv.modifiers || [])
-          .map(m => MODIFIER_INFO[m])
-          .filter(Boolean)
-          .map(info => `<span class="lv-mod" title="${info.name} — ${info.blurb}">${info.icon}</span>`)
-          .join('');
-        const cellLine = isUnlocked('cells') && lv.cellPlan
-          ? ([['ridge', lv.cellPlan.ridge], ['sinkhole', lv.cellPlan.sinkhole], ['conduit', lv.cellPlan.conduitPairs], ['anchor', lv.cellPlan.anchor], ['nullcell', lv.cellPlan.nullcell]] as [string, number | undefined][])
-              .filter(([, n]) => (n || 0) > 0)
-              .map(([id, n]) => `<span class="lv-cell" title="${CELL_TYPES[id].name} — ${CELL_TYPES[id].blurb}">${CELL_TYPES[id].icon}${n}</span>`)
-              .join('')
-          : '';
         const chDone = this.save.challenges[lv.id] || [];
-        const chBadges = isUnlocked('challenges') ? (lv.challenges || []).map((c, i) => {
-          const def = CHALLENGE_POOL[c.id];
-          const earned = !!chDone[i];
-          return `<span class="lv-ch${earned ? ' earned' : ''}" title="${def.name}${earned ? ' — complete!' : ' — not yet earned'}">${def.icon}</span>`;
-        }).join('') : '';
         const bothEarned = chDone.length && chDone.every(Boolean);
-        card.append(
-          el('div', 'lv-num', `${lv.id}`),
-          el('div', 'lv-name', `${lv.name}${modIcons ? ` <span class="lv-mods">${modIcons}</span>` : ''}`),
-          el('div', 'lv-stars', [1, 2, 3].map(i => `<span class="${i <= stars ? 'star-on' : 'star-off'}">★</span>`).join('')),
+        const card = el('div', `level-card${locked ? ' locked' : ''}${bothEarned ? ' all-challenges' : ''}`);
+
+        const num = el('div', 'lv-num', `${lv.id}`);
+        num.style.color = ZONES[z].accent;
+
+        const main = el('div', 'lv-main');
+        const nameRow = el('div', 'lv-name-row');
+        nameRow.append(
+          el('span', 'lv-name', lv.name),
+          el('span', 'lv-stars', [1, 2, 3].map(i => `<span class="${i <= stars ? 'star-on' : 'star-off'}">★</span>`).join('')),
         );
-        if (chBadges) card.append(el('div', 'lv-challenges', chBadges));
-        if (cellLine) card.append(el('div', 'lv-cells', cellLine));
-        // "Bring: ✈ + splash" (Phase 8.4) — a cheap bus-thinking hint, derived from the same
+        main.append(nameRow);
+        if (lv.tagline) { const tg = el('div', 'lv-tagline', lv.tagline); tg.title = lv.tagline; main.append(tg); }
+
+        const badges = el('div', 'lv-badges');
+        for (const m of lv.modifiers || []) {
+          const info = MODIFIER_INFO[m];
+          if (info) badges.append(el('span', 'lv-mod', `<span title="${info.name} — ${info.blurb}">${info.icon}</span>`));
+        }
+        if (isUnlocked('cells') && lv.cellPlan) {
+          for (const [id, n] of [['ridge', lv.cellPlan.ridge], ['sinkhole', lv.cellPlan.sinkhole], ['conduit', lv.cellPlan.conduitPairs], ['anchor', lv.cellPlan.anchor], ['nullcell', lv.cellPlan.nullcell]] as [string, number | undefined][]) {
+            if (!n) continue;
+            const c = CELL_TYPES[id];
+            badges.append(el('span', 'lv-cell', `<span title="${c.name} — ${c.blurb}">${c.icon}${n}</span>`));
+          }
+        }
+        if (isUnlocked('challenges')) {
+          (lv.challenges || []).forEach((c, i) => {
+            const def = CHALLENGE_POOL[c.id];
+            const earned = !!chDone[i];
+            badges.append(el('span', `lv-ch${earned ? ' earned' : ''}`, `<span title="${def.name}${earned ? ' — complete!' : ' — not yet earned'}">${def.icon}</span>`));
+          });
+        }
+        // "Bring: air/splash" (Phase 8.4) — a cheap bus-thinking hint, derived from the same
         // must-include rules the Suggested draft uses, so it's never inconsistent with it.
         if (isUnlocked('draft')) {
           const enemyIds = new Set(lv.waves.flat().map(g => g.e));
           const swarmCount = lv.waves.flat().filter(g => g.e === 'swarmling' || g.e === 'splitter').reduce((a, g) => a + g.n, 0);
-          const bringBits: string[] = [];
-          if ([...enemyIds].some(id => ENEMIES[id]?.flying)) bringBits.push('✈');
-          if (swarmCount >= 15) bringBits.push('💥');
-          if (bringBits.length) card.append(el('div', 'lv-bring', `Bring: ${bringBits.join(' + ')}`));
+          if ([...enemyIds].some(id => ENEMIES[id]?.flying)) badges.append(el('span', 'lv-bring', '<span title="Bring air coverage">✈</span>'));
+          if (swarmCount >= 15) badges.append(el('span', 'lv-bring', '<span title="Bring splash/chain coverage">💥</span>'));
         }
-        if (lv.tagline) card.append(el('div', 'lv-tagline', lv.tagline));
-        if (bothEarned) card.classList.add('all-challenges');
+        if (badges.children.length) main.append(badges);
+        card.append(num, main);
+
         const bestAsc = this.save.ascension.bestPerLevel[lv.id] || 0;
         if (bestAsc > 0) {
           const crown = el('div', 'lv-crown', `👑${['', 'I', 'II', 'III', 'IV', 'V'][bestAsc]}`);
           crown.title = `Best beaten at Ascension ${['', 'I', 'II', 'III', 'IV', 'V'][bestAsc]}`;
           card.append(crown);
         }
-        (card.querySelector('.lv-num') as HTMLElement).style.color = ZONES[z].accent;
         if (!locked) card.onclick = () => { audio.ui('click'); this.showBriefing(lv, false); };
         col.append(card);
       }
       row.append(col);
     }
 
+    const wideW = ZONE_COL_W * 3 + 16 * 2; // matches the zone-row's total rendered width
+
     const endlessOpen = this.save.unlocked > 5 || this.devMode;
-    const eCard = el('div', `level-card${endlessOpen ? '' : ' locked'}`);
-    eCard.style.width = '540px';
-    eCard.append(
-      el('div', 'lv-num', '∞'),
-      el('div', 'lv-name', endlessOpen ? `Endless Drift — survive as long as you can. Best: wave ${this.save.endlessBest[this.save.settings.difficulty ?? 2] || 0}` : 'Endless Drift — clear level 5 to unlock'),
-    );
-    (eCard.querySelector('.lv-num') as HTMLElement).style.color = '#c5b3f6';
+    const eCard = el('div', `level-card wide${endlessOpen ? '' : ' locked'}`);
+    eCard.style.width = `${wideW}px`;
+    const eNum = el('div', 'lv-num', '∞'); eNum.style.color = '#c5b3f6';
+    const eMain = el('div', 'lv-main');
+    eMain.append(el('div', 'lv-name-row', endlessOpen
+      ? `<span class="lv-name">Endless Drift — survive as long as you can.</span><span class="lv-stars">Best: wave ${this.save.endlessBest[this.save.settings.difficulty ?? 2] || 0}</span>`
+      : `<span class="lv-name">Endless Drift — clear level 5 to unlock</span>`));
+    eCard.append(eNum, eMain);
     if (endlessOpen) eCard.onclick = () => { audio.ui('click'); this.showBriefing(ENDLESS_LEVEL, true); };
 
     const beatenIds = Object.keys(this.save.stars).map(Number).filter(id => (this.save.stars[id] || 0) > 0);
     const today = todayStr();
     const op = beatenIds.length ? computeDailyOp(today, beatenIds) : null;
-    const dCard = el('div', `level-card${op ? '' : ' locked'}`);
-    dCard.style.width = '540px';
+    const dCard = el('div', `level-card wide${op ? '' : ' locked'}`);
+    dCard.style.width = `${wideW}px`;
+    const dNum = el('div', 'lv-num', '☀'); dNum.style.color = '#ffd97a';
+    const dMain = el('div', 'lv-main');
     if (op) {
       const lv = LEVELS.find(l => l.id === op.levelId)!;
       const modNames = op.modifiers.map(m => MODIFIER_INFO[m]?.icon).filter(Boolean).join(' ');
       const gap = this.save.daily.lastDate ? daysBetween(this.save.daily.lastDate, today) : null;
       const streak = gap === 0 || gap === 1 ? this.save.daily.streak : 0;
       const wonToday = this.save.daily.lastDate === today && this.save.daily.lastWon;
-      dCard.append(
-        el('div', 'lv-num', '☀'),
-        el('div', 'lv-name', `Daily Op — ${lv.name} (mirrored)  ${modNames}  ·  Hard difficulty${wonToday ? '  ✓ solved' : ''}`),
-        el('div', 'lv-stars', `🔥 Streak: ${streak}${this.save.daily.bestStreak > streak ? ` (best ${this.save.daily.bestStreak})` : ''}`),
-      );
-      (dCard.querySelector('.lv-num') as HTMLElement).style.color = '#ffd97a';
+      dMain.append(el('div', 'lv-name-row',
+        `<span class="lv-name">Daily Op — ${lv.name} (mirrored) ${modNames} · Hard difficulty${wonToday ? ' ✓ solved' : ''}</span>` +
+        `<span class="lv-stars">🔥 Streak: ${streak}${this.save.daily.bestStreak > streak ? ` (best ${this.save.daily.bestStreak})` : ''}</span>`));
       dCard.onclick = () => { audio.ui('click'); this.startDailyOp(op); };
     } else {
-      dCard.append(el('div', 'lv-num', '☀'), el('div', 'lv-name', 'Daily Op — beat any level to unlock'));
+      dMain.append(el('div', 'lv-name-row', `<span class="lv-name">Daily Op — beat any level to unlock</span>`));
     }
+    dCard.append(dNum, dMain);
 
     body.append(row, eCard, dCard);
     sc.append(body);
@@ -2896,7 +2912,8 @@ export class UI {
     }
 
     // One resolved best-next-upgrade button — no menu, no scanning the tech tree first.
-    const next = t.spec.kind === 'amp' ? null : this.nextUpgradeInfo(g, t);
+    // Amp gets one too: its stages/branches are upgraded the same way as any other tower's.
+    const next = this.nextUpgradeInfo(g, t);
     if (next === 'choose') {
       const btn = el('button', 'next-upg-btn specialize') as HTMLButtonElement;
       btn.innerHTML = `<span class="nu-name">Specialize ▾</span><span class="nu-sub">Choose a branch in Details</span><span class="hk">[U]</span>`;
